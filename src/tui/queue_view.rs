@@ -11,7 +11,7 @@ use super::widgets;
 
 /// Key binding hints displayed at the bottom of the queue view.
 const KEY_HINTS: &str =
-    " j/↓ Down  k/↑ Up  Enter Review  t Tail  p Prompt  x Cancel  r Retry  o Open  q Quit ";
+    " j/↓ Down  k/↑ Up  Enter Open  t Tail  p Prompt  x Cancel  r Retry  o PR  q Quit ";
 
 /// Render the queue view.
 pub fn render(f: &mut Frame, app: &App, area: Rect) {

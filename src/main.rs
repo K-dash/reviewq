@@ -87,7 +87,7 @@ async fn run(cli: Cli) -> reviewq::error::Result<()> {
         }
         Some(Commands::Tui) => {
             let db = reviewq::db::Database::open(&config.state.sqlite_path)?;
-            reviewq::tui::run(&db)
+            reviewq::tui::run(&db, &config.output.dir)
         }
         None => run_daemon(config).await,
     }
