@@ -74,6 +74,9 @@ pub trait JobStore: Send + Sync {
 
     /// Store review output for a completed job.
     fn store_review_output(&self, id: i64, markdown: &str) -> Result<()>;
+
+    /// Re-queue a stale leased job for retry (increment retry_count, reset to queued).
+    fn requeue_stale(&self, id: i64) -> Result<()>;
 }
 
 // ---------------------------------------------------------------------------

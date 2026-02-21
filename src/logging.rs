@@ -4,11 +4,12 @@ use std::path::Path;
 
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::writer::MakeWriterExt;
 
 /// Initialize the tracing subscriber.
 ///
 /// - Console output is always enabled.
-/// - If `log_dir` is provided, a file appender is also set up.
+/// - If `log_dir` is provided, a file appender is added alongside console.
 ///
 /// Returns a [`WorkerGuard`] that must be held for the lifetime of the
 /// program to ensure buffered logs are flushed on shutdown.
@@ -20,10 +21,12 @@ pub fn init(log_dir: Option<&Path>) -> Option<WorkerGuard> {
         let file_appender = tracing_appender::rolling::daily(dir, "reviewq.log");
         let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
+        // Console (stderr) + file writer combined.
+        let writer = std::io::stderr.and(non_blocking);
+
         tracing_subscriber::fmt()
             .with_env_filter(env_filter)
-            .with_writer(non_blocking)
-            .with_ansi(false)
+            .with_writer(writer)
             .init();
 
         Some(guard)

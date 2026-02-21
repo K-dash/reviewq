@@ -106,6 +106,9 @@ pub struct ExecutionConfig {
 
     #[serde(default = "default_max_concurrency")]
     pub max_concurrency: usize,
+
+    #[serde(default = "default_lease_minutes")]
+    pub lease_minutes: i64,
 }
 
 impl Default for ExecutionConfig {
@@ -114,12 +117,17 @@ impl Default for ExecutionConfig {
             base_repo_path: None,
             worktree_root: None,
             max_concurrency: default_max_concurrency(),
+            lease_minutes: default_lease_minutes(),
         }
     }
 }
 
 fn default_max_concurrency() -> usize {
     10
+}
+
+fn default_lease_minutes() -> i64 {
+    5
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

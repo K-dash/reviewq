@@ -3,7 +3,8 @@
 //! Provides single-instance enforcement via PID files and signal-based
 //! shutdown / config-reload notification channels.
 
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use tokio::signal::unix::{SignalKind, signal};
@@ -34,7 +35,14 @@ impl PidFile {
     pub fn acquire(dir: &Path) -> Result<Self> {
         let path = dir.join("reviewq.pid");
 
-        // Check for an existing PID file
+        // Ensure the parent directory exists.
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| {
+                ReviewqError::Process(format!("failed to create PID directory: {e}"))
+            })?;
+        }
+
+        // Check for an existing PID file before attempting exclusive create.
         if path.exists() {
             if let Ok(contents) = fs::read_to_string(&path)
                 && let Ok(pid) = contents.trim().parse::<u32>()
@@ -44,19 +52,27 @@ impl PidFile {
                     "another reviewq instance is running (PID {pid})"
                 )));
             }
-            // Stale PID file — remove it before writing a new one
+            // Stale PID file — remove it before writing a new one.
             let _ = fs::remove_file(&path);
         }
 
-        // Ensure the parent directory exists
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| {
-                ReviewqError::Process(format!("failed to create PID directory: {e}"))
+        // Atomic create: O_CREAT | O_EXCL prevents TOCTOU between the
+        // stale-check above and writing the new PID.
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    ReviewqError::Process(
+                        "another reviewq instance acquired the PID file concurrently".into(),
+                    )
+                } else {
+                    ReviewqError::Process(format!("failed to create PID file: {e}"))
+                }
             })?;
-        }
 
-        // Write the current PID
-        fs::write(&path, std::process::id().to_string())
+        file.write_all(std::process::id().to_string().as_bytes())
             .map_err(|e| ReviewqError::Process(format!("failed to write PID file: {e}")))?;
 
         Ok(Self { path })

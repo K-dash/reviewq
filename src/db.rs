@@ -319,6 +319,20 @@ impl JobStore for Database {
         )?;
         Ok(())
     }
+
+    fn requeue_stale(&self, id: i64) -> Result<()> {
+        let conn = self.lock_conn();
+        let rows = conn.execute(
+            "UPDATE jobs SET status = 'queued', leased_at = NULL, lease_expires = NULL,
+                    retry_count = retry_count + 1, updated_at = datetime('now')
+             WHERE id = ?1 AND status = 'leased'",
+            params![id],
+        )?;
+        if rows == 0 {
+            return Err(ReviewqError::Database(rusqlite::Error::QueryReturnedNoRows));
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
