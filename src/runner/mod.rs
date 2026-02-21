@@ -6,7 +6,8 @@ pub mod process;
 use std::path::Path;
 use std::sync::Arc;
 
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, watch};
+use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 
 use crate::config::Config;
@@ -16,13 +17,17 @@ use crate::types::{Job, JobStatus};
 
 /// Run the job execution loop.
 ///
-/// Continuously polls for leased jobs and spawns each as an independent
-/// tokio task with bounded concurrency via a semaphore.
+/// Continuously polls for leased jobs and spawns each as a tracked tokio
+/// task (via [`JoinSet`]) with bounded concurrency via a semaphore.
+///
+/// When `shutdown_rx` fires, the loop stops accepting new jobs and waits
+/// for all in-flight jobs to complete before returning.
 pub async fn run<S, E, C>(
     store: Arc<S>,
     executor: Arc<E>,
     _clock: &C,
     config: &Config,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()>
 where
     S: JobStore + 'static,
@@ -30,6 +35,7 @@ where
     C: Clock,
 {
     let semaphore = Arc::new(Semaphore::new(config.execution.max_concurrency));
+    let mut job_tasks: JoinSet<()> = JoinSet::new();
 
     let base_repo = config
         .execution
@@ -43,28 +49,50 @@ where
         .unwrap_or_else(|| base_repo.join(".worktrees"));
 
     loop {
+        // Drain completed tasks so JoinSet doesn't grow unboundedly.
+        while job_tasks.try_join_next().is_some() {}
+
+        // Check for shutdown before leasing new work.
+        if *shutdown_rx.borrow() {
+            break;
+        }
+
         // Recover stale leases before polling for new work.
         recover_stale_leases(&*store);
 
-        let permit =
-            semaphore.clone().acquire_owned().await.map_err(|e| {
-                crate::error::ReviewqError::Runner(format!("semaphore closed: {e}"))
-            })?;
+        // Acquire concurrency permit, but also listen for shutdown so we
+        // don't block here indefinitely when a shutdown is requested.
+        let permit = tokio::select! {
+            result = semaphore.clone().acquire_owned() => {
+                result.map_err(|e| {
+                    crate::error::ReviewqError::Runner(format!("semaphore closed: {e}"))
+                })?
+            }
+            _ = shutdown_rx.changed() => {
+                break;
+            }
+        };
 
         let job = match store.lease_next() {
             Ok(Some(job)) => job,
             Ok(None) => {
                 drop(permit);
-                tokio::time::sleep(std::time::Duration::from_secs(
-                    config.polling.interval_seconds,
-                ))
-                .await;
+                // Wait for either shutdown or poll interval.
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(
+                        config.polling.interval_seconds,
+                    )) => {}
+                    _ = shutdown_rx.changed() => {}
+                }
                 continue;
             }
             Err(e) => {
                 drop(permit);
                 error!(error = %e, "failed to lease next job");
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                    _ = shutdown_rx.changed() => {}
+                }
                 continue;
             }
         };
@@ -82,11 +110,21 @@ where
         let base_repo = base_repo.clone();
         let worktree_root = worktree_root.clone();
 
-        tokio::spawn(async move {
+        job_tasks.spawn(async move {
             execute_job(&*store, &*executor, job, &base_repo, &worktree_root).await;
             drop(permit);
         });
     }
+
+    // Graceful shutdown: wait for all in-flight jobs to finish.
+    info!(
+        in_flight = job_tasks.len(),
+        "waiting for in-flight jobs to complete"
+    );
+    while job_tasks.join_next().await.is_some() {}
+    info!("all in-flight jobs completed");
+
+    Ok(())
 }
 
 /// Execute a single job: mark running → create worktree → run review → complete → cleanup.

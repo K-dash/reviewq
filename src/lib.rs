@@ -10,6 +10,7 @@ pub mod daemon;
 pub mod db;
 pub mod detector;
 pub mod error;
+pub mod executor;
 pub mod github;
 pub mod idempotency;
 pub mod logging;
