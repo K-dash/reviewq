@@ -9,8 +9,8 @@ use tracing::{error, info, warn};
 #[command(name = "reviewq", version, about)]
 struct Cli {
     /// Path to the configuration file.
-    #[arg(short, long, default_value = "reviewq.yml")]
-    config: PathBuf,
+    #[arg(short, long)]
+    config: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -55,8 +55,21 @@ async fn main() {
     }
 }
 
+/// Resolve the configuration file path.
+///
+/// Priority: `--config` flag > `~/.reviewq/config.yml` default.
+fn resolve_config_path(explicit: Option<PathBuf>) -> PathBuf {
+    if let Some(p) = explicit {
+        return p;
+    }
+    dirs::home_dir()
+        .map(|h| h.join(".reviewq").join("config.yml"))
+        .unwrap_or_else(|| PathBuf::from("reviewq.yml"))
+}
+
 async fn run(cli: Cli) -> reviewq::error::Result<()> {
-    let mut config = reviewq::config::Config::load(&cli.config)?;
+    let config_path = resolve_config_path(cli.config);
+    let mut config = reviewq::config::Config::load(&config_path)?;
     config.expand_paths();
 
     match cli.command {
