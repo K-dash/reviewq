@@ -234,11 +234,14 @@ impl JobStore for Database {
 
     fn is_processed(&self, key: &IdempotencyKey) -> Result<bool> {
         let conn = self.lock_conn();
+        // Only succeeded/running/leased/queued jobs block re-enqueueing.
+        // Failed and canceled jobs are eligible for retry.
         let exists: bool = conn.query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM jobs
                 WHERE repo_owner = ?1 AND repo_name = ?2
                   AND pr_number = ?3 AND head_sha = ?4 AND agent_kind = ?5
+                  AND status NOT IN ('failed', 'canceled')
             )",
             params![
                 key.repo.owner,

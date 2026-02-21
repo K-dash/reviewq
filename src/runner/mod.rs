@@ -37,7 +37,7 @@ where
     let semaphore = Arc::new(Semaphore::new(config.execution.max_concurrency));
     let mut job_tasks: JoinSet<()> = JoinSet::new();
 
-    let base_repo = config
+    let global_base_repo = config
         .execution
         .base_repo_path
         .clone()
@@ -46,7 +46,8 @@ where
         .execution
         .worktree_root
         .clone()
-        .unwrap_or_else(|| base_repo.join(".worktrees"));
+        .unwrap_or_else(|| global_base_repo.join(".worktrees"));
+    let policies = config.repo_policies();
 
     loop {
         // Drain completed tasks so JoinSet doesn't grow unboundedly.
@@ -104,10 +105,16 @@ where
             "leased job for execution"
         );
 
+        // Resolve per-repo base path, falling back to global.
+        let base_repo = policies
+            .iter()
+            .find(|p| p.id == job.repo)
+            .and_then(|p| p.base_repo_path.clone())
+            .unwrap_or_else(|| global_base_repo.clone());
+
         // Clone Arcs and paths for the spawned task.
         let store = Arc::clone(&store);
         let executor = Arc::clone(&executor);
-        let base_repo = base_repo.clone();
         let worktree_root = worktree_root.clone();
 
         job_tasks.spawn(async move {

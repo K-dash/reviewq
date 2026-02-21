@@ -49,7 +49,35 @@ where
     G: GitHubClient,
     S: JobStore,
 {
-    let prs = github.search_review_requested(repo_ids).await?;
+    // Split repos into two groups based on reviewer check policy:
+    // - reviewed_repos: use Search API with review-requested:{username} filter
+    // - unfiltered_repos: use per-repo PR listing (no reviewer filter)
+    let (reviewed_repos, unfiltered_repos): (Vec<RepoId>, Vec<RepoId>) =
+        repo_ids.iter().cloned().partition(|id| {
+            policies
+                .iter()
+                .find(|p| &p.id == id)
+                .is_none_or(|p| !p.skip_reviewer_check)
+        });
+
+    let mut prs = Vec::new();
+
+    // Fetch PRs where the user is a requested reviewer.
+    if !reviewed_repos.is_empty() {
+        let searched = github.search_review_requested(&reviewed_repos).await?;
+        prs.extend(searched);
+    }
+
+    // Fetch all open PRs for repos that skip the reviewer check.
+    for repo_id in &unfiltered_repos {
+        match github.list_open_prs(repo_id).await {
+            Ok(listed) => prs.extend(listed),
+            Err(e) => {
+                warn!(repo = %repo_id, error = %e, "failed to list open PRs");
+            }
+        }
+    }
+
     info!(pr_count = prs.len(), "fetched PRs from GitHub");
 
     let agent_kind = AgentKind::default();
@@ -139,6 +167,15 @@ mod tests {
     impl GitHubClient for MockGitHub {
         async fn search_review_requested(&self, _repos: &[RepoId]) -> Result<Vec<PullRequest>> {
             Ok(self.prs.clone())
+        }
+
+        async fn list_open_prs(&self, repo: &RepoId) -> Result<Vec<PullRequest>> {
+            Ok(self
+                .prs
+                .iter()
+                .filter(|pr| &pr.repo == repo)
+                .cloned()
+                .collect())
         }
 
         async fn requested_reviewers(
@@ -405,5 +442,47 @@ polling:
             .await
             .expect("should succeed");
         assert_eq!(count, 0);
+    }
+
+    fn test_config_skip_reviewer_check() -> Config {
+        Config::from_yaml(
+            r#"
+repos:
+  allowlist:
+    - repo: org/repo
+      skip_self_authored: false
+      skip_reviewer_check: true
+polling:
+  interval_seconds: 60
+"#,
+        )
+        .expect("config should parse")
+    }
+
+    #[tokio::test]
+    async fn enqueues_via_list_open_prs_when_skip_reviewer_check() {
+        // Self-authored PR with no reviewer assignment — should be
+        // fetched via list_open_prs and enqueued when skip_reviewer_check is true.
+        let mut pr = make_pr(1, "sha1");
+        pr.author = "alice".into();
+        pr.requested_reviewers.clear();
+
+        let github = MockGitHub {
+            username: "alice".into(),
+            prs: vec![pr],
+        };
+        let db = Database::open_in_memory().expect("db");
+        let config = test_config_skip_reviewer_check();
+        let policies = config.repo_policies();
+        let repo_ids = config.repo_ids();
+
+        let count = detect_once(&github, &db, &config, "alice", &repo_ids, &policies)
+            .await
+            .expect("should succeed");
+        assert_eq!(count, 1);
+
+        let jobs = db.list_jobs(&JobFilter::default()).expect("list");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].pr_number, 1);
     }
 }

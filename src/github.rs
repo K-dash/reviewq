@@ -131,6 +131,18 @@ struct PrHead {
     sha: String,
 }
 
+/// Response item from `/repos/{owner}/{name}/pulls` endpoint.
+#[derive(Deserialize)]
+struct PrListItem {
+    number: u64,
+    html_url: String,
+    state: String,
+    draft: Option<bool>,
+    user: User,
+    head: PrHead,
+    requested_reviewers: Vec<User>,
+}
+
 #[derive(Deserialize)]
 struct RequestedReviewersResponse {
     users: Vec<User>,
@@ -228,6 +240,60 @@ impl GitHubClient for GitHubApi {
 
             // Check if there are more pages
             if search.items.len() < 100 {
+                break;
+            }
+            page += 1;
+        }
+
+        Ok(all_prs)
+    }
+
+    async fn list_open_prs(&self, repo: &RepoId) -> Result<Vec<PullRequest>> {
+        let mut all_prs = Vec::new();
+        let mut page = 1u32;
+
+        loop {
+            let resp = self
+                .request(&format!("/repos/{}/{}/pulls", repo.owner, repo.name))
+                .query(&[
+                    ("state", "open"),
+                    ("per_page", "100"),
+                    ("page", &page.to_string()),
+                ])
+                .send()
+                .await?;
+
+            let resp = self.check_response(resp).await?;
+            let items: Vec<PrListItem> = resp.json().await?;
+
+            if items.is_empty() {
+                break;
+            }
+
+            for item in &items {
+                let state = match item.state.as_str() {
+                    "open" => PrState::Open,
+                    "closed" => PrState::Closed,
+                    _ => PrState::Closed,
+                };
+
+                all_prs.push(PullRequest {
+                    repo: repo.clone(),
+                    number: item.number,
+                    url: item.html_url.clone(),
+                    head_sha: item.head.sha.clone(),
+                    author: item.user.login.clone(),
+                    requested_reviewers: item
+                        .requested_reviewers
+                        .iter()
+                        .map(|u| u.login.clone())
+                        .collect(),
+                    state,
+                    draft: item.draft.unwrap_or(false),
+                });
+            }
+
+            if items.len() < 100 {
                 break;
             }
             page += 1;
@@ -347,6 +413,68 @@ mod tests {
             .await
             .expect("should succeed");
         assert_eq!(reviewers, vec!["reviewer1", "reviewer2"]);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn list_open_prs_success() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/repos/owner/repo/pulls")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("state".into(), "open".into()),
+                mockito::Matcher::UrlEncoded("per_page".into(), "100".into()),
+                mockito::Matcher::UrlEncoded("page".into(), "1".into()),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"[
+                    {
+                        "number": 42,
+                        "html_url": "https://github.com/owner/repo/pull/42",
+                        "state": "open",
+                        "draft": false,
+                        "user": {"login": "alice"},
+                        "head": {"sha": "abc123"},
+                        "requested_reviewers": [{"login": "bob"}]
+                    }
+                ]"#,
+            )
+            .create_async()
+            .await;
+
+        let api = GitHubApi::with_base_url("token".into(), server.url());
+        let repo = RepoId::new("owner", "repo");
+        let prs = api.list_open_prs(&repo).await.expect("should succeed");
+        assert_eq!(prs.len(), 1);
+        assert_eq!(prs[0].number, 42);
+        assert_eq!(prs[0].head_sha, "abc123");
+        assert_eq!(prs[0].author, "alice");
+        assert_eq!(prs[0].requested_reviewers, vec!["bob"]);
+        assert!(!prs[0].draft);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn list_open_prs_empty() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/repos/owner/repo/pulls")
+            .match_query(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
+                "state".into(),
+                "open".into(),
+            )]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("[]")
+            .create_async()
+            .await;
+
+        let api = GitHubApi::with_base_url("token".into(), server.url());
+        let repo = RepoId::new("owner", "repo");
+        let prs = api.list_open_prs(&repo).await.expect("should succeed");
+        assert!(prs.is_empty());
         mock.assert_async().await;
     }
 

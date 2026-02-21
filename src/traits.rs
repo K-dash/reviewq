@@ -25,6 +25,15 @@ pub trait GitHubClient: Send + Sync {
         repos: &[RepoId],
     ) -> impl std::future::Future<Output = Result<Vec<PullRequest>>> + Send;
 
+    /// List all open PRs for a specific repository (no reviewer filter).
+    ///
+    /// Used for repos with `skip_reviewer_check: true` where the GitHub
+    /// Search API's `review-requested:{user}` filter would be too restrictive.
+    fn list_open_prs(
+        &self,
+        repo: &RepoId,
+    ) -> impl std::future::Future<Output = Result<Vec<PullRequest>>> + Send;
+
     /// Get the requested reviewers for a specific PR (the Source of Truth).
     fn requested_reviewers(
         &self,
