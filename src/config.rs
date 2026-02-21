@@ -49,7 +49,51 @@ pub struct Config {
 #[serde(deny_unknown_fields)]
 pub struct ReposConfig {
     #[serde(default)]
-    pub allowlist: Vec<String>,
+    pub allowlist: Vec<RepoEntry>,
+}
+
+/// Per-repository configuration entry in the YAML allowlist.
+///
+/// ```yaml
+/// repos:
+///   allowlist:
+///     - repo: "owner/name"
+///       skip_self_authored: false
+///       command: "claude code review"
+///       max_concurrency: 3
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepoEntry {
+    /// Repository in `"owner/name"` format.
+    pub repo: String,
+
+    /// Skip PRs authored by the authenticated user. Default: true.
+    #[serde(default = "default_true")]
+    pub skip_self_authored: bool,
+
+    /// Override the global `runner.command` for this repo.
+    #[serde(default)]
+    pub command: Option<String>,
+
+    /// Override the global `execution.max_concurrency` for this repo.
+    /// Reserved for future use; not yet wired into the runner.
+    #[serde(default)]
+    pub max_concurrency: Option<usize>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Parsed per-repository policy with a resolved `RepoId`.
+#[derive(Debug, Clone)]
+pub struct RepoPolicy {
+    pub id: crate::types::RepoId,
+    pub skip_self_authored: bool,
+    pub command: Option<String>,
+    /// Reserved for future use; not yet wired into the runner.
+    pub max_concurrency: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -287,10 +331,18 @@ impl Config {
             ));
         }
 
-        for repo in &self.repos.allowlist {
-            if !repo.contains('/') {
+        let mut seen = std::collections::HashSet::new();
+        for entry in &self.repos.allowlist {
+            if !entry.repo.contains('/') {
                 return Err(ReviewqError::Config(format!(
-                    "invalid repo format '{repo}': expected 'owner/name'"
+                    "invalid repo format '{}': expected 'owner/name'",
+                    entry.repo
+                )));
+            }
+            if !seen.insert(&entry.repo) {
+                return Err(ReviewqError::Config(format!(
+                    "duplicate repo '{}' in allowlist",
+                    entry.repo
                 )));
             }
         }
@@ -312,16 +364,26 @@ impl Config {
         }
     }
 
-    /// Parse a repo string from the allowlist into a `RepoId`.
-    pub fn parse_allowlist(&self) -> Vec<crate::types::RepoId> {
+    /// Parse the allowlist into per-repository policies.
+    pub fn repo_policies(&self) -> Vec<RepoPolicy> {
         self.repos
             .allowlist
             .iter()
-            .filter_map(|s| {
-                let (owner, name) = s.split_once('/')?;
-                Some(crate::types::RepoId::new(owner, name))
+            .filter_map(|entry| {
+                let (owner, name) = entry.repo.split_once('/')?;
+                Some(RepoPolicy {
+                    id: crate::types::RepoId::new(owner, name),
+                    skip_self_authored: entry.skip_self_authored,
+                    command: entry.command.clone(),
+                    max_concurrency: entry.max_concurrency,
+                })
             })
             .collect()
+    }
+
+    /// Extract just the repo IDs from the allowlist.
+    pub fn repo_ids(&self) -> Vec<crate::types::RepoId> {
+        self.repo_policies().into_iter().map(|p| p.id).collect()
     }
 }
 
@@ -345,12 +407,77 @@ mod tests {
         let yaml = r#"
 repos:
   allowlist:
-    - owner/repo
+    - repo: owner/repo
 "#;
         let config = Config::from_yaml(yaml).expect("should parse");
-        assert_eq!(config.repos.allowlist, vec!["owner/repo"]);
+        assert_eq!(config.repos.allowlist.len(), 1);
+        assert_eq!(config.repos.allowlist[0].repo, "owner/repo");
+        assert!(config.repos.allowlist[0].skip_self_authored);
+        assert!(config.repos.allowlist[0].command.is_none());
+        assert!(config.repos.allowlist[0].max_concurrency.is_none());
         assert_eq!(config.polling.interval_seconds, 300);
         assert_eq!(config.execution.max_concurrency, 10);
+    }
+
+    #[test]
+    fn parse_per_repo_overrides() {
+        let yaml = r#"
+repos:
+  allowlist:
+    - repo: org/repo1
+      skip_self_authored: false
+      command: "claude review"
+      max_concurrency: 3
+    - repo: org/repo2
+"#;
+        let config = Config::from_yaml(yaml).expect("should parse");
+        assert_eq!(config.repos.allowlist.len(), 2);
+
+        let e0 = &config.repos.allowlist[0];
+        assert_eq!(e0.repo, "org/repo1");
+        assert!(!e0.skip_self_authored);
+        assert_eq!(e0.command.as_deref(), Some("claude review"));
+        assert_eq!(e0.max_concurrency, Some(3));
+
+        let e1 = &config.repos.allowlist[1];
+        assert_eq!(e1.repo, "org/repo2");
+        assert!(e1.skip_self_authored);
+        assert!(e1.command.is_none());
+        assert!(e1.max_concurrency.is_none());
+    }
+
+    #[test]
+    fn repo_policies_returns_parsed_entries() {
+        let yaml = r#"
+repos:
+  allowlist:
+    - repo: org/repo
+      skip_self_authored: false
+      command: "echo review"
+      max_concurrency: 2
+"#;
+        let config = Config::from_yaml(yaml).expect("should parse");
+        let policies = config.repo_policies();
+        assert_eq!(policies.len(), 1);
+        assert_eq!(policies[0].id, crate::types::RepoId::new("org", "repo"));
+        assert!(!policies[0].skip_self_authored);
+        assert_eq!(policies[0].command.as_deref(), Some("echo review"));
+        assert_eq!(policies[0].max_concurrency, Some(2));
+    }
+
+    #[test]
+    fn repo_ids_extracts_ids() {
+        let yaml = r#"
+repos:
+  allowlist:
+    - repo: org/repo1
+    - repo: org/repo2
+"#;
+        let config = Config::from_yaml(yaml).expect("should parse");
+        let ids = config.repo_ids();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0], crate::types::RepoId::new("org", "repo1"));
+        assert_eq!(ids[1], crate::types::RepoId::new("org", "repo2"));
     }
 
     #[test]
@@ -368,10 +495,22 @@ repos:
         let yaml = r#"
 repos:
   allowlist:
-    - just-a-name
+    - repo: just-a-name
 "#;
         let err = Config::from_yaml(yaml).unwrap_err();
         assert!(err.to_string().contains("owner/name"));
+    }
+
+    #[test]
+    fn reject_duplicate_repo() {
+        let yaml = r#"
+repos:
+  allowlist:
+    - repo: org/repo
+    - repo: org/repo
+"#;
+        let err = Config::from_yaml(yaml).unwrap_err();
+        assert!(err.to_string().contains("duplicate repo"));
     }
 
     #[test]
@@ -379,8 +518,8 @@ repos:
         let yaml = r#"
 repos:
   allowlist:
-    - org/repo1
-    - org/repo2
+    - repo: org/repo1
+    - repo: org/repo2
 polling:
   interval_seconds: 60
 auth:

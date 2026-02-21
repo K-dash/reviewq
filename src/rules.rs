@@ -5,11 +5,18 @@
 use crate::types::{PrState, PullRequest, RepoId};
 
 /// Check if a PR passes all filtering rules.
-pub fn should_process(pr: &PullRequest, username: &str, allowlist: &[RepoId]) -> bool {
+///
+/// `skip_self_authored` is resolved per-repo from the configuration.
+pub fn should_process(
+    pr: &PullRequest,
+    username: &str,
+    allowlist: &[RepoId],
+    skip_self_authored: bool,
+) -> bool {
     is_in_allowlist(pr, allowlist)
         && is_open(pr)
         && !is_draft(pr)
-        && !is_self_authored(pr, username)
+        && (!skip_self_authored || !is_self_authored(pr, username))
         && is_review_requested(pr, username)
 }
 
@@ -57,54 +64,61 @@ mod tests {
     #[test]
     fn passes_all_rules() {
         let pr = make_pr();
-        assert!(should_process(&pr, "bob", &allowlist()));
+        assert!(should_process(&pr, "bob", &allowlist(), true));
     }
 
     #[test]
     fn rejects_repo_not_in_allowlist() {
         let mut pr = make_pr();
         pr.repo = RepoId::new("other", "repo");
-        assert!(!should_process(&pr, "bob", &allowlist()));
+        assert!(!should_process(&pr, "bob", &allowlist(), true));
     }
 
     #[test]
     fn rejects_closed_pr() {
         let mut pr = make_pr();
         pr.state = PrState::Closed;
-        assert!(!should_process(&pr, "bob", &allowlist()));
+        assert!(!should_process(&pr, "bob", &allowlist(), true));
     }
 
     #[test]
     fn rejects_merged_pr() {
         let mut pr = make_pr();
         pr.state = PrState::Merged;
-        assert!(!should_process(&pr, "bob", &allowlist()));
+        assert!(!should_process(&pr, "bob", &allowlist(), true));
     }
 
     #[test]
     fn rejects_draft_pr() {
         let mut pr = make_pr();
         pr.draft = true;
-        assert!(!should_process(&pr, "bob", &allowlist()));
+        assert!(!should_process(&pr, "bob", &allowlist(), true));
     }
 
     #[test]
     fn rejects_self_authored_pr() {
         let pr = make_pr();
-        assert!(!should_process(&pr, "alice", &allowlist()));
+        assert!(!should_process(&pr, "alice", &allowlist(), true));
+    }
+
+    #[test]
+    fn accepts_self_authored_when_skip_disabled() {
+        let mut pr = make_pr();
+        pr.requested_reviewers.push("alice".into());
+        assert!(should_process(&pr, "alice", &allowlist(), false));
     }
 
     #[test]
     fn rejects_no_review_requested() {
         let mut pr = make_pr();
         pr.requested_reviewers.clear();
-        assert!(!should_process(&pr, "bob", &allowlist()));
+        assert!(!should_process(&pr, "bob", &allowlist(), true));
     }
 
     #[test]
     fn rejects_review_requested_for_different_user() {
         let pr = make_pr();
-        assert!(!should_process(&pr, "charlie", &allowlist()));
+        assert!(!should_process(&pr, "charlie", &allowlist(), true));
     }
 
     #[test]

@@ -6,7 +6,7 @@
 use tokio::time::{Duration, sleep};
 use tracing::{error, info, warn};
 
-use crate::config::Config;
+use crate::config::{Config, RepoPolicy};
 use crate::error::Result;
 use crate::traits::{GitHubClient, JobStore};
 use crate::types::{AgentKind, NewJob, RepoId};
@@ -18,10 +18,11 @@ where
     S: JobStore,
 {
     let username = github.authenticated_user().await?;
-    let repos = config.parse_allowlist();
+    let policies = config.repo_policies();
+    let repo_ids: Vec<RepoId> = policies.iter().map(|p| p.id.clone()).collect();
 
     loop {
-        match detect_once(github, store, config, &username, &repos).await {
+        match detect_once(github, store, config, &username, &repo_ids, &policies).await {
             Ok(count) => info!(new_jobs = count, "detection cycle complete"),
             Err(e) => {
                 if e.is_retryable() {
@@ -41,21 +42,26 @@ async fn detect_once<G, S>(
     store: &S,
     config: &Config,
     username: &str,
-    repos: &[RepoId],
+    repo_ids: &[RepoId],
+    policies: &[RepoPolicy],
 ) -> Result<usize>
 where
     G: GitHubClient,
     S: JobStore,
 {
-    let prs = github.search_review_requested(repos).await?;
+    let prs = github.search_review_requested(repo_ids).await?;
     info!(pr_count = prs.len(), "fetched PRs from GitHub");
 
     let agent_kind = AgentKind::default();
     let mut enqueued = 0;
 
     for pr in &prs {
+        // Look up per-repo policy (default: skip_self_authored = true).
+        let policy = policies.iter().find(|p| p.id == pr.repo);
+        let skip_self = policy.is_none_or(|p| p.skip_self_authored);
+
         // Apply filtering rules
-        if !crate::rules::should_process(pr, username, repos) {
+        if !crate::rules::should_process(pr, username, repo_ids, skip_self) {
             continue;
         }
 
@@ -76,13 +82,18 @@ where
             continue;
         }
 
+        // Resolve command: per-repo override > global runner.command.
+        let command = policy
+            .and_then(|p| p.command.clone())
+            .or_else(|| config.runner.command.clone());
+
         // Enqueue new job
         let new_job = NewJob {
             repo: pr.repo.clone(),
             pr_number: pr.number,
             head_sha: pr.head_sha.clone(),
             agent_kind: agent_kind.clone(),
-            command: config.runner.command.clone(),
+            command,
             max_retries: 3,
         };
 
@@ -147,7 +158,21 @@ mod tests {
             r#"
 repos:
   allowlist:
-    - org/repo
+    - repo: org/repo
+polling:
+  interval_seconds: 60
+"#,
+        )
+        .expect("config should parse")
+    }
+
+    fn test_config_skip_self_disabled() -> Config {
+        Config::from_yaml(
+            r#"
+repos:
+  allowlist:
+    - repo: org/repo
+      skip_self_authored: false
 polling:
   interval_seconds: 60
 "#,
@@ -176,9 +201,10 @@ polling:
         };
         let db = Database::open_in_memory().expect("db");
         let config = test_config();
-        let repos = config.parse_allowlist();
+        let policies = config.repo_policies();
+        let repo_ids = config.repo_ids();
 
-        let count = detect_once(&github, &db, &config, "bob", &repos)
+        let count = detect_once(&github, &db, &config, "bob", &repo_ids, &policies)
             .await
             .expect("should succeed");
         assert_eq!(count, 1);
@@ -197,16 +223,17 @@ polling:
         };
         let db = Database::open_in_memory().expect("db");
         let config = test_config();
-        let repos = config.parse_allowlist();
+        let policies = config.repo_policies();
+        let repo_ids = config.repo_ids();
 
         // First cycle should enqueue
-        let count1 = detect_once(&github, &db, &config, "bob", &repos)
+        let count1 = detect_once(&github, &db, &config, "bob", &repo_ids, &policies)
             .await
             .expect("should succeed");
         assert_eq!(count1, 1);
 
         // Second cycle should skip (idempotent)
-        let count2 = detect_once(&github, &db, &config, "bob", &repos)
+        let count2 = detect_once(&github, &db, &config, "bob", &repo_ids, &policies)
             .await
             .expect("should succeed");
         assert_eq!(count2, 0);
@@ -220,12 +247,95 @@ polling:
         };
         let db = Database::open_in_memory().expect("db");
         let config = test_config();
-        let repos = config.parse_allowlist();
+        let policies = config.repo_policies();
+        let repo_ids = config.repo_ids();
 
-        let count = detect_once(&github, &db, &config, "alice", &repos)
+        let count = detect_once(&github, &db, &config, "alice", &repo_ids, &policies)
             .await
             .expect("should succeed");
         assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn accepts_self_authored_when_skip_disabled() {
+        let mut pr = make_pr(1, "sha1");
+        pr.requested_reviewers.push("alice".into());
+        let github = MockGitHub {
+            username: "alice".into(),
+            prs: vec![pr],
+        };
+        let db = Database::open_in_memory().expect("db");
+        let config = test_config_skip_self_disabled();
+        let policies = config.repo_policies();
+        let repo_ids = config.repo_ids();
+
+        let count = detect_once(&github, &db, &config, "alice", &repo_ids, &policies)
+            .await
+            .expect("should succeed");
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn per_repo_command_overrides_global() {
+        let github = MockGitHub {
+            username: "bob".into(),
+            prs: vec![make_pr(1, "sha1")],
+        };
+        let db = Database::open_in_memory().expect("db");
+        let config = Config::from_yaml(
+            r#"
+repos:
+  allowlist:
+    - repo: org/repo
+      command: "per-repo-cmd"
+runner:
+  command: "global-cmd"
+polling:
+  interval_seconds: 60
+"#,
+        )
+        .expect("config");
+        let policies = config.repo_policies();
+        let repo_ids = config.repo_ids();
+
+        let count = detect_once(&github, &db, &config, "bob", &repo_ids, &policies)
+            .await
+            .expect("should succeed");
+        assert_eq!(count, 1);
+
+        let jobs = db.list_jobs(&JobFilter::default()).expect("list");
+        assert_eq!(jobs[0].command.as_deref(), Some("per-repo-cmd"));
+    }
+
+    #[tokio::test]
+    async fn global_command_used_when_no_per_repo_override() {
+        let github = MockGitHub {
+            username: "bob".into(),
+            prs: vec![make_pr(1, "sha1")],
+        };
+        let db = Database::open_in_memory().expect("db");
+        let config = Config::from_yaml(
+            r#"
+repos:
+  allowlist:
+    - repo: org/repo
+runner:
+  command: "global-cmd"
+polling:
+  interval_seconds: 60
+"#,
+        )
+        .expect("config");
+        let policies = config.repo_policies();
+        let repo_ids = config.repo_ids();
+
+        let count = detect_once(&github, &db, &config, "bob", &repo_ids, &policies)
+            .await
+            .expect("should succeed");
+        assert_eq!(count, 1);
+
+        let jobs = db.list_jobs(&JobFilter::default()).expect("list");
+        assert_eq!(jobs[0].command.as_deref(), Some("global-cmd"));
     }
 
     #[tokio::test]
@@ -238,9 +348,10 @@ polling:
         };
         let db = Database::open_in_memory().expect("db");
         let config = test_config();
-        let repos = config.parse_allowlist();
+        let policies = config.repo_policies();
+        let repo_ids = config.repo_ids();
 
-        let count = detect_once(&github, &db, &config, "bob", &repos)
+        let count = detect_once(&github, &db, &config, "bob", &repo_ids, &policies)
             .await
             .expect("should succeed");
         assert_eq!(count, 0);
@@ -250,14 +361,15 @@ polling:
     async fn requeues_on_sha_change() {
         let db = Database::open_in_memory().expect("db");
         let config = test_config();
-        let repos = config.parse_allowlist();
+        let policies = config.repo_policies();
+        let repo_ids = config.repo_ids();
 
         // First cycle with old SHA
         let github1 = MockGitHub {
             username: "bob".into(),
             prs: vec![make_pr(1, "old_sha")],
         };
-        let count1 = detect_once(&github1, &db, &config, "bob", &repos)
+        let count1 = detect_once(&github1, &db, &config, "bob", &repo_ids, &policies)
             .await
             .expect("should succeed");
         assert_eq!(count1, 1);
@@ -267,7 +379,7 @@ polling:
             username: "bob".into(),
             prs: vec![make_pr(1, "new_sha")],
         };
-        let count2 = detect_once(&github2, &db, &config, "bob", &repos)
+        let count2 = detect_once(&github2, &db, &config, "bob", &repo_ids, &policies)
             .await
             .expect("should succeed");
         assert_eq!(count2, 1);
@@ -285,9 +397,10 @@ polling:
         };
         let db = Database::open_in_memory().expect("db");
         let config = test_config();
-        let repos = config.parse_allowlist();
+        let policies = config.repo_policies();
+        let repo_ids = config.repo_ids();
 
-        let count = detect_once(&github, &db, &config, "bob", &repos)
+        let count = detect_once(&github, &db, &config, "bob", &repo_ids, &policies)
             .await
             .expect("should succeed");
         assert_eq!(count, 0);
