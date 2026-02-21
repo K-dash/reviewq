@@ -56,12 +56,13 @@ where
     let mut enqueued = 0;
 
     for pr in &prs {
-        // Look up per-repo policy (default: skip_self_authored = true).
+        // Look up per-repo policy.
         let policy = policies.iter().find(|p| p.id == pr.repo);
         let skip_self = policy.is_none_or(|p| p.skip_self_authored);
+        let skip_reviewer = policy.is_some_and(|p| p.skip_reviewer_check);
 
         // Apply filtering rules
-        if !crate::rules::should_process(pr, username, repo_ids, skip_self) {
+        if !crate::rules::should_process(pr, username, repo_ids, skip_self, skip_reviewer) {
             continue;
         }
 

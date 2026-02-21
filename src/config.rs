@@ -59,6 +59,7 @@ pub struct ReposConfig {
 ///   allowlist:
 ///     - repo: "owner/name"
 ///       skip_self_authored: false
+///       skip_reviewer_check: true
 ///       command: "claude code review"
 ///       max_concurrency: 3
 /// ```
@@ -71,6 +72,12 @@ pub struct RepoEntry {
     /// Skip PRs authored by the authenticated user. Default: true.
     #[serde(default = "default_true")]
     pub skip_self_authored: bool,
+
+    /// Process all open PRs regardless of reviewer assignment. Default: false.
+    /// When true, PRs are picked up even if the authenticated user is not
+    /// in the `requested_reviewers` list. Useful for self-review workflows.
+    #[serde(default)]
+    pub skip_reviewer_check: bool,
 
     /// Override the global `runner.command` for this repo.
     #[serde(default)]
@@ -91,6 +98,7 @@ fn default_true() -> bool {
 pub struct RepoPolicy {
     pub id: crate::types::RepoId,
     pub skip_self_authored: bool,
+    pub skip_reviewer_check: bool,
     pub command: Option<String>,
     /// Reserved for future use; not yet wired into the runner.
     pub max_concurrency: Option<usize>,
@@ -374,6 +382,7 @@ impl Config {
                 Some(RepoPolicy {
                     id: crate::types::RepoId::new(owner, name),
                     skip_self_authored: entry.skip_self_authored,
+                    skip_reviewer_check: entry.skip_reviewer_check,
                     command: entry.command.clone(),
                     max_concurrency: entry.max_concurrency,
                 })
