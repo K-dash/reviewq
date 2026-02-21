@@ -8,6 +8,7 @@ pub mod tail_view;
 pub mod widgets;
 
 use std::io;
+use std::path::Path;
 
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::execute;
@@ -21,7 +22,7 @@ use crate::traits::JobStore;
 use crate::types::JobFilter;
 
 /// Run the TUI application.
-pub fn run<S: JobStore>(store: &S) -> Result<()> {
+pub fn run<S: JobStore>(store: &S, output_dir: &Path) -> Result<()> {
     // Setup terminal
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -37,7 +38,7 @@ pub fn run<S: JobStore>(store: &S) -> Result<()> {
         original_hook(panic_info);
     }));
 
-    let mut app = App::new();
+    let mut app = App::new(output_dir.to_path_buf());
 
     // Initial load
     app.update_jobs(store.list_jobs(&JobFilter::default())?);
@@ -51,6 +52,19 @@ pub fn run<S: JobStore>(store: &S) -> Result<()> {
             && let Some(action) = map_key(key, &app)
         {
             app.dispatch(action);
+        }
+
+        // Open browser if dispatch requested it.
+        if let Some(path) = app.pending_open.take()
+            && open::that(&path).is_err()
+        {
+            // Browser open failed — fall back to TUI review view.
+            app.review_text = format!(
+                "[Failed to open browser: {}]\n\n{}",
+                path.display(),
+                app.review_text
+            );
+            app.view = View::Review;
         }
 
         if app.should_quit {

@@ -14,6 +14,7 @@ pub mod executor;
 pub mod github;
 pub mod idempotency;
 pub mod logging;
+pub mod review_html;
 pub mod rules;
 pub mod runner;
 pub mod traits;
