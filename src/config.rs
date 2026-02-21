@@ -62,6 +62,7 @@ pub struct ReposConfig {
 ///       skip_reviewer_check: true
 ///       command: "claude code review"
 ///       max_concurrency: 3
+///       base_repo_path: "/path/to/local/clone"
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -87,6 +88,11 @@ pub struct RepoEntry {
     /// Reserved for future use; not yet wired into the runner.
     #[serde(default)]
     pub max_concurrency: Option<usize>,
+
+    /// Path to the local clone of this repository.
+    /// Overrides the global `execution.base_repo_path` for worktree creation.
+    #[serde(default)]
+    pub base_repo_path: Option<PathBuf>,
 }
 
 fn default_true() -> bool {
@@ -102,6 +108,8 @@ pub struct RepoPolicy {
     pub command: Option<String>,
     /// Reserved for future use; not yet wired into the runner.
     pub max_concurrency: Option<usize>,
+    /// Path to the local clone of this repository.
+    pub base_repo_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -305,7 +313,7 @@ impl Default for OutputConfig {
 }
 
 fn default_output_dir() -> PathBuf {
-    PathBuf::from("./output")
+    PathBuf::from("~/.reviewq/output")
 }
 
 // ---------------------------------------------------------------------------
@@ -369,6 +377,7 @@ impl Config {
         if let Some(home) = dirs::home_dir() {
             expand_tilde(&mut self.logging.dir, &home);
             expand_tilde(&mut self.state.sqlite_path, &home);
+            expand_tilde(&mut self.output.dir, &home);
         }
     }
 
@@ -385,6 +394,7 @@ impl Config {
                     skip_reviewer_check: entry.skip_reviewer_check,
                     command: entry.command.clone(),
                     max_concurrency: entry.max_concurrency,
+                    base_repo_path: entry.base_repo_path.clone(),
                 })
             })
             .collect()
@@ -393,6 +403,17 @@ impl Config {
     /// Extract just the repo IDs from the allowlist.
     pub fn repo_ids(&self) -> Vec<crate::types::RepoId> {
         self.repo_policies().into_iter().map(|p| p.id).collect()
+    }
+
+    /// Resolve the local clone path for a given repository.
+    ///
+    /// Priority: per-repo `base_repo_path` > global `execution.base_repo_path`.
+    pub fn base_repo_for(&self, repo: &crate::types::RepoId) -> Option<PathBuf> {
+        self.repo_policies()
+            .iter()
+            .find(|p| &p.id == repo)
+            .and_then(|p| p.base_repo_path.clone())
+            .or_else(|| self.execution.base_repo_path.clone())
     }
 }
 

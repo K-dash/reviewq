@@ -10,7 +10,8 @@ use crate::error::{Result, ReviewqError};
 
 /// Create a new git worktree for a job.
 ///
-/// Creates a detached HEAD worktree at `{worktree_root}/reviewq-{job_id}`
+/// Fetches latest refs from origin first (so PR head SHAs are available),
+/// then creates a detached HEAD worktree at `{worktree_root}/reviewq-{job_id}`
 /// checked out to `head_sha`.
 pub fn create(
     base_repo: &Path,
@@ -18,6 +19,18 @@ pub fn create(
     job_id: i64,
     head_sha: &str,
 ) -> Result<PathBuf> {
+    // Fetch latest refs so the PR's head SHA is available locally.
+    let fetch_output = Command::new("git")
+        .args(["fetch", "origin"])
+        .current_dir(base_repo)
+        .output()
+        .map_err(|e| ReviewqError::Process(format!("failed to spawn git fetch: {e}")))?;
+
+    if !fetch_output.status.success() {
+        let stderr = String::from_utf8_lossy(&fetch_output.stderr);
+        warn!(%stderr, "git fetch origin failed, proceeding anyway");
+    }
+
     let worktree_path = worktree_root.join(format!("reviewq-{job_id}"));
 
     let output = Command::new("git")
