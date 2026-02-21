@@ -19,6 +19,7 @@ pub async fn spawn_in_group(
     workdir: &Path,
     stdout_path: &Path,
     stderr_path: &Path,
+    env_vars: &[(String, String)],
 ) -> Result<(tokio::process::Child, u32)> {
     let stdout_file = std::fs::File::create(stdout_path).map_err(|e| {
         ReviewqError::Process(format!(
@@ -41,6 +42,7 @@ pub async fn spawn_in_group(
         Command::new("sh")
             .args(["-c", command])
             .current_dir(workdir)
+            .envs(env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdout(stdout_file)
             .stderr(stderr_file)
             .pre_exec(|| {

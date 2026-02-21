@@ -19,6 +19,88 @@ use crate::types::{Job, ReviewResult};
 /// Well-known filename that review agents write their output to.
 const REVIEW_OUTPUT_FILE: &str = "REVIEW.md";
 
+// ---------------------------------------------------------------------------
+// Template variable interpolation
+// ---------------------------------------------------------------------------
+
+/// Holds all values available for template variable interpolation and
+/// environment variable injection.
+struct TemplateContext {
+    pr_url: String,
+    repo: String,
+    pr_number: String,
+    head_sha: String,
+    worktree_path: String,
+    job_id: String,
+    output_path: String,
+}
+
+impl TemplateContext {
+    /// Build a context from a [`Job`] and its worktree path.
+    fn new(job: &Job, worktree: &Path) -> Self {
+        let repo = job.repo.full_name();
+        let pr_number = job.pr_number.to_string();
+        let pr_url = format!("https://github.com/{}/pull/{}", repo, pr_number);
+        Self {
+            pr_url,
+            repo,
+            pr_number,
+            head_sha: job.head_sha.clone(),
+            worktree_path: worktree.display().to_string(),
+            job_id: job.id.to_string(),
+            output_path: worktree.join(REVIEW_OUTPUT_FILE).display().to_string(),
+        }
+    }
+
+    /// Replace all known `{variable}` placeholders in a command template.
+    fn interpolate(&self, template: &str) -> String {
+        template
+            .replace("{pr_url}", &self.pr_url)
+            .replace("{repo}", &self.repo)
+            .replace("{pr_number}", &self.pr_number)
+            .replace("{head_sha}", &self.head_sha)
+            .replace("{worktree_path}", &self.worktree_path)
+            .replace("{job_id}", &self.job_id)
+            .replace("{output_path}", &self.output_path)
+    }
+
+    /// Return `REVIEWQ_*` environment variable pairs for the child process.
+    fn env_vars(&self) -> Vec<(String, String)> {
+        vec![
+            ("REVIEWQ_PR_URL".into(), self.pr_url.clone()),
+            ("REVIEWQ_REPO".into(), self.repo.clone()),
+            ("REVIEWQ_PR_NUMBER".into(), self.pr_number.clone()),
+            ("REVIEWQ_HEAD_SHA".into(), self.head_sha.clone()),
+            ("REVIEWQ_WORKTREE_PATH".into(), self.worktree_path.clone()),
+            ("REVIEWQ_JOB_ID".into(), self.job_id.clone()),
+            ("REVIEWQ_OUTPUT_PATH".into(), self.output_path.clone()),
+        ]
+    }
+}
+
+/// Log a warning for any remaining `{identifier}` patterns in a command after
+/// interpolation. Shell constructs like `${VAR}` are intentionally ignored.
+fn warn_unknown_variables(command: &str) {
+    let mut rest = command;
+    while let Some(start) = rest.find('{') {
+        let after_brace = &rest[start + 1..];
+        if let Some(end) = after_brace.find('}') {
+            let name = &after_brace[..end];
+            // Only warn for simple identifiers (non-empty, ASCII alphanumeric + underscore).
+            // Skip shell constructs like ${VAR} (contains $) or empty braces {}.
+            if !name.is_empty()
+                && !name.contains('$')
+                && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            {
+                warn!(variable = name, "unknown template variable in command");
+            }
+            rest = &after_brace[end + 1..];
+        } else {
+            break;
+        }
+    }
+}
+
 /// Command-based review executor.
 ///
 /// Spawns a shell command in a new process group within the job's worktree.
@@ -73,15 +155,19 @@ impl ReviewExecutor for CommandExecutor {
         let stderr_path = self.output_dir.join(format!("job-{}-stderr.log", job.id));
 
         // Use job-specific command if set, otherwise the default.
-        let cmd = job.command.as_deref().unwrap_or(&self.command);
+        let raw_cmd = job.command.as_deref().unwrap_or(&self.command);
+        let ctx = TemplateContext::new(job, worktree);
+        let cmd = ctx.interpolate(raw_cmd);
+        warn_unknown_variables(&cmd);
+        let env_vars = ctx.env_vars();
 
         let (mut child, pid) =
-            process::spawn_in_group(cmd, worktree, &stdout_path, &stderr_path).await?;
+            process::spawn_in_group(&cmd, worktree, &stdout_path, &stderr_path, &env_vars).await?;
 
         info!(
             job_id = job.id,
             pid,
-            command = cmd,
+            command = %cmd,
             "spawned review process"
         );
 
@@ -161,6 +247,119 @@ mod tests {
             updated_at: Utc::now(),
         }
     }
+
+    // -- TemplateContext unit tests ----------------------------------------
+
+    #[test]
+    fn interpolate_replaces_all_variables() {
+        let job = make_job(1, None);
+        let worktree = Path::new("/tmp/worktree");
+        let ctx = TemplateContext::new(&job, worktree);
+
+        let cmd = ctx.interpolate(
+            "{pr_url} {repo} {pr_number} {head_sha} {worktree_path} {job_id} {output_path}",
+        );
+        assert_eq!(
+            cmd,
+            format!(
+                "https://github.com/owner/repo/pull/1 owner/repo 1 abc123 /tmp/worktree 1 {}",
+                worktree.join("REVIEW.md").display()
+            )
+        );
+    }
+
+    #[test]
+    fn interpolate_no_variables_passthrough() {
+        let job = make_job(1, None);
+        let worktree = Path::new("/tmp/worktree");
+        let ctx = TemplateContext::new(&job, worktree);
+
+        let cmd = ctx.interpolate("echo hello");
+        assert_eq!(cmd, "echo hello");
+    }
+
+    #[test]
+    fn interpolate_unknown_variables_left_intact() {
+        let job = make_job(1, None);
+        let worktree = Path::new("/tmp/worktree");
+        let ctx = TemplateContext::new(&job, worktree);
+
+        let cmd = ctx.interpolate("echo {unknown_var}");
+        assert_eq!(cmd, "echo {unknown_var}");
+    }
+
+    #[test]
+    fn interpolate_partial_variables() {
+        let job = make_job(1, None);
+        let worktree = Path::new("/tmp/worktree");
+        let ctx = TemplateContext::new(&job, worktree);
+
+        let cmd = ctx.interpolate("review --pr {pr_number} --sha {head_sha}");
+        assert_eq!(cmd, "review --pr 1 --sha abc123");
+    }
+
+    #[test]
+    fn interpolate_repeated_variables() {
+        let job = make_job(1, None);
+        let worktree = Path::new("/tmp/worktree");
+        let ctx = TemplateContext::new(&job, worktree);
+
+        let cmd = ctx.interpolate("{job_id}-{job_id}");
+        assert_eq!(cmd, "1-1");
+    }
+
+    #[test]
+    fn env_vars_all_present() {
+        let job = make_job(1, None);
+        let worktree = Path::new("/tmp/worktree");
+        let ctx = TemplateContext::new(&job, worktree);
+
+        let env_vars = ctx.env_vars();
+        assert_eq!(env_vars.len(), 7);
+
+        let find = |key: &str| -> String {
+            env_vars
+                .iter()
+                .find(|(k, _)| k == key)
+                .unwrap_or_else(|| panic!("{key} not found"))
+                .1
+                .clone()
+        };
+
+        assert_eq!(
+            find("REVIEWQ_PR_URL"),
+            "https://github.com/owner/repo/pull/1"
+        );
+        assert_eq!(find("REVIEWQ_REPO"), "owner/repo");
+        assert_eq!(find("REVIEWQ_PR_NUMBER"), "1");
+        assert_eq!(find("REVIEWQ_HEAD_SHA"), "abc123");
+        assert_eq!(find("REVIEWQ_WORKTREE_PATH"), "/tmp/worktree");
+        assert_eq!(find("REVIEWQ_JOB_ID"), "1");
+        assert_eq!(
+            find("REVIEWQ_OUTPUT_PATH"),
+            worktree.join("REVIEW.md").display().to_string()
+        );
+    }
+
+    #[test]
+    fn interpolate_with_job_specific_command() {
+        let job = make_job(1, Some("custom-review {pr_url} --out {output_path}"));
+        let worktree = Path::new("/tmp/worktree");
+        let ctx = TemplateContext::new(&job, worktree);
+
+        // Job-level command should also be interpolated.
+        let raw_cmd = job.command.as_deref().unwrap();
+        let cmd = ctx.interpolate(raw_cmd);
+        assert_eq!(
+            cmd,
+            format!(
+                "custom-review https://github.com/owner/repo/pull/1 --out {}",
+                worktree.join("REVIEW.md").display()
+            )
+        );
+    }
+
+    // -- CommandExecutor integration tests ----------------------------------
 
     #[tokio::test]
     async fn execute_echo_command() {

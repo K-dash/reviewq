@@ -168,6 +168,67 @@ async fn executor_runs_command_and_captures_output() {
 }
 
 #[tokio::test]
+async fn executor_interpolates_template_variables() {
+    let tmp = TempDir::new().expect("temp dir");
+    let output_dir = tmp.path().join("output");
+    let worktree = tmp.path().join("worktree");
+    std::fs::create_dir_all(&worktree).expect("create worktree dir");
+
+    // Command writes interpolated template values into REVIEW.md.
+    let cmd =
+        r#"printf '%s\n%s\n%s\n%s' '{pr_url}' '{repo}' '{pr_number}' '{head_sha}' > REVIEW.md"#;
+    let executor = CommandExecutor::new(cmd.into(), CancelConfig::default(), output_dir);
+
+    let job = make_test_job(7, None);
+    let result = executor.execute(&job, &worktree).await.expect("execute");
+
+    assert_eq!(result.exit_code, 0);
+    let content = result.review_markdown.expect("REVIEW.md should exist");
+    assert!(
+        content.contains("https://github.com/owner/repo/pull/1"),
+        "pr_url not interpolated: {content}"
+    );
+    assert!(
+        content.contains("owner/repo"),
+        "repo not interpolated: {content}"
+    );
+    assert!(
+        content.contains("abc123"),
+        "head_sha not interpolated: {content}"
+    );
+}
+
+#[tokio::test]
+async fn executor_sets_environment_variables() {
+    let tmp = TempDir::new().expect("temp dir");
+    let output_dir = tmp.path().join("output");
+    let worktree = tmp.path().join("worktree");
+    std::fs::create_dir_all(&worktree).expect("create worktree dir");
+
+    // Command echoes REVIEWQ_* env vars into REVIEW.md.
+    let cmd = r#"printf '%s\n%s\n%s\n%s' "$REVIEWQ_PR_URL" "$REVIEWQ_REPO" "$REVIEWQ_PR_NUMBER" "$REVIEWQ_HEAD_SHA" > REVIEW.md"#;
+    let executor = CommandExecutor::new(cmd.into(), CancelConfig::default(), output_dir);
+
+    let job = make_test_job(8, None);
+    let result = executor.execute(&job, &worktree).await.expect("execute");
+
+    assert_eq!(result.exit_code, 0);
+    let content = result.review_markdown.expect("REVIEW.md should exist");
+    assert!(
+        content.contains("https://github.com/owner/repo/pull/1"),
+        "REVIEWQ_PR_URL not set: {content}"
+    );
+    assert!(
+        content.contains("owner/repo"),
+        "REVIEWQ_REPO not set: {content}"
+    );
+    assert!(
+        content.contains("abc123"),
+        "REVIEWQ_HEAD_SHA not set: {content}"
+    );
+}
+
+#[tokio::test]
 async fn executor_reads_review_md_from_worktree() {
     let tmp = TempDir::new().expect("temp dir");
     let output_dir = tmp.path().join("output");
