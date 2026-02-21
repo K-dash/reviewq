@@ -1,0 +1,10 @@
+{
+  "enabledPlugins": {
+    "rust-skills@rust-skills": true
+  },
+  "permissions": {
+    "allow": [
+      "Bash(agent-browser *)"
+    ]
+  }
+}
