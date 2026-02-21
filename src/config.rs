@@ -313,7 +313,7 @@ impl Default for OutputConfig {
 }
 
 fn default_output_dir() -> PathBuf {
-    PathBuf::from("./output")
+    PathBuf::from("~/.reviewq/output")
 }
 
 // ---------------------------------------------------------------------------
@@ -377,6 +377,7 @@ impl Config {
         if let Some(home) = dirs::home_dir() {
             expand_tilde(&mut self.logging.dir, &home);
             expand_tilde(&mut self.state.sqlite_path, &home);
+            expand_tilde(&mut self.output.dir, &home);
         }
     }
 
