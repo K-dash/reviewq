@@ -7,3 +7,26 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/K-dash/reviewq"
 
 [dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+comrak = "0.34"
+crossterm = { version = "0.28", features = ["event-stream"] }
+dirs = "6"
+nix = { version = "0.29", features = ["signal", "process"] }
+open = "5"
+ratatui = "0.29"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yml = "0.0.12"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+assert_cmd = "2"
+mockito = "1"
+tempfile = "3"
