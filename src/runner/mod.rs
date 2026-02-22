@@ -26,7 +26,7 @@ pub async fn run<S, E, C>(
     store: Arc<S>,
     executor: Arc<E>,
     _clock: &C,
-    config: &Config,
+    mut config_rx: watch::Receiver<Arc<Config>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()>
 where
@@ -34,22 +34,26 @@ where
     E: ReviewExecutor + 'static,
     C: Clock,
 {
-    let semaphore = Arc::new(Semaphore::new(config.execution.max_concurrency));
+    // Semaphore is created once from the initial config; changing
+    // max_concurrency requires a restart.
+    let initial_config = config_rx.borrow().clone();
+    let semaphore = Arc::new(Semaphore::new(initial_config.execution.max_concurrency));
     let mut job_tasks: JoinSet<()> = JoinSet::new();
 
-    let global_base_repo = config
-        .execution
-        .base_repo_path
-        .clone()
-        .unwrap_or_else(|| std::env::current_dir().expect("current directory is accessible"));
-    let worktree_root = config
-        .execution
-        .worktree_root
-        .clone()
-        .unwrap_or_else(|| global_base_repo.join(".worktrees"));
-    let policies = config.repo_policies();
-
     loop {
+        // Re-read config at each iteration so hot-reloaded values take effect.
+        let config = config_rx.borrow_and_update().clone();
+        let global_base_repo =
+            config.execution.base_repo_path.clone().unwrap_or_else(|| {
+                std::env::current_dir().expect("current directory is accessible")
+            });
+        let worktree_root = config
+            .execution
+            .worktree_root
+            .clone()
+            .unwrap_or_else(|| global_base_repo.join(".worktrees"));
+        let policies = config.repo_policies();
+
         // Drain completed tasks so JoinSet doesn't grow unboundedly.
         while job_tasks.try_join_next().is_some() {}
 
