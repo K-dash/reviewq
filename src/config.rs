@@ -7,7 +7,7 @@ use serde::Deserialize;
 use crate::error::{Result, ReviewqError};
 
 /// Top-level configuration for reviewq.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
@@ -45,7 +45,7 @@ pub struct Config {
 // Sub-configs
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReposConfig {
     #[serde(default)]
@@ -64,7 +64,7 @@ pub struct ReposConfig {
 ///       max_concurrency: 3
 ///       base_repo_path: "/path/to/local/clone"
 /// ```
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RepoEntry {
     /// Repository in `"owner/name"` format.
@@ -117,7 +117,7 @@ pub struct RepoPolicy {
     pub base_repo_path: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PollingConfig {
     #[serde(default = "default_polling_interval")]
@@ -136,7 +136,7 @@ fn default_polling_interval() -> u64 {
     300
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthConfig {
     #[serde(default = "default_auth_method")]
@@ -163,7 +163,7 @@ fn default_fallback_env() -> String {
     "GITHUB_TOKEN".to_owned()
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionConfig {
     pub base_repo_path: Option<PathBuf>,
@@ -195,7 +195,7 @@ fn default_lease_minutes() -> i64 {
     5
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunnerConfig {
     #[serde(default)]
@@ -208,7 +208,7 @@ pub struct RunnerConfig {
     pub prompt_template: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CancelConfig {
     #[serde(default = "default_sigint_timeout")]
@@ -243,7 +243,7 @@ fn default_sigkill_timeout() -> u64 {
     5
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CleanupConfig {
     #[serde(default = "default_cleanup_ttl")]
@@ -270,7 +270,7 @@ fn default_cleanup_interval() -> u64 {
     30
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
     #[serde(default = "default_log_dir")]
@@ -289,7 +289,7 @@ fn default_log_dir() -> PathBuf {
     PathBuf::from("~/.reviewq/logs")
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StateConfig {
     #[serde(default = "default_sqlite_path")]
@@ -308,7 +308,7 @@ fn default_sqlite_path() -> PathBuf {
     PathBuf::from("~/.reviewq/state.db")
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OutputConfig {
     #[serde(default = "default_output_dir")]
@@ -410,6 +410,109 @@ impl Config {
                 })
             })
             .collect()
+    }
+
+    /// Compare two configs and return human-readable change descriptions.
+    ///
+    /// Also flags fields that require a restart to take effect.
+    pub fn diff_summary(old: &Config, new: &Config) -> Vec<String> {
+        let mut changes = Vec::new();
+
+        if old.repos != new.repos {
+            let old_repos: Vec<&str> = old
+                .repos
+                .allowlist
+                .iter()
+                .map(|e| e.repo.as_str())
+                .collect();
+            let new_repos: Vec<&str> = new
+                .repos
+                .allowlist
+                .iter()
+                .map(|e| e.repo.as_str())
+                .collect();
+            changes.push(format!(
+                "repos.allowlist changed: {:?} -> {:?}",
+                old_repos, new_repos
+            ));
+        }
+
+        if old.polling != new.polling {
+            changes.push(format!(
+                "polling.interval_seconds changed: {} -> {}",
+                old.polling.interval_seconds, new.polling.interval_seconds
+            ));
+        }
+
+        if old.auth != new.auth {
+            changes.push("auth changed (restart required)".to_string());
+        }
+
+        if old.execution.max_concurrency != new.execution.max_concurrency {
+            changes.push(format!(
+                "execution.max_concurrency changed: {} -> {} (restart required)",
+                old.execution.max_concurrency, new.execution.max_concurrency
+            ));
+        }
+
+        if old.execution.base_repo_path != new.execution.base_repo_path {
+            changes.push(format!(
+                "execution.base_repo_path changed: {:?} -> {:?}",
+                old.execution.base_repo_path, new.execution.base_repo_path
+            ));
+        }
+
+        if old.execution.worktree_root != new.execution.worktree_root {
+            changes.push(format!(
+                "execution.worktree_root changed: {:?} -> {:?}",
+                old.execution.worktree_root, new.execution.worktree_root
+            ));
+        }
+
+        if old.runner.command != new.runner.command {
+            changes.push(format!(
+                "runner.command changed: {:?} -> {:?}",
+                old.runner.command, new.runner.command
+            ));
+        }
+
+        if old.runner.prompt_template != new.runner.prompt_template {
+            changes.push(format!(
+                "runner.prompt_template changed: {:?} -> {:?}",
+                old.runner.prompt_template, new.runner.prompt_template
+            ));
+        }
+
+        if old.cancel != new.cancel {
+            changes.push("cancel changed (restart required)".to_string());
+        }
+
+        if old.cleanup != new.cleanup {
+            changes.push(format!(
+                "cleanup changed: ttl={}->{}min, interval={}->{}min",
+                old.cleanup.ttl_minutes,
+                new.cleanup.ttl_minutes,
+                old.cleanup.interval_minutes,
+                new.cleanup.interval_minutes
+            ));
+        }
+
+        if old.logging != new.logging {
+            changes.push("logging changed (restart required)".to_string());
+        }
+
+        if old.state != new.state {
+            changes.push("state changed (restart required)".to_string());
+        }
+
+        if old.output != new.output {
+            changes.push(format!(
+                "output.dir changed: {:?} -> {:?}",
+                old.output.dir, new.output.dir
+            ));
+        }
+
+        changes
     }
 
     /// Extract just the repo IDs from the allowlist.
@@ -617,5 +720,134 @@ cleanup:
         assert_eq!(config.execution.max_concurrency, 5);
         assert_eq!(config.cancel.sigint_timeout_seconds, 3);
         assert_eq!(config.cleanup.ttl_minutes, 720);
+    }
+
+    #[test]
+    fn diff_summary_no_changes() {
+        let yaml = r#"
+repos:
+  allowlist:
+    - repo: org/repo
+polling:
+  interval_seconds: 60
+"#;
+        let config = Config::from_yaml(yaml).expect("parse");
+        let changes = Config::diff_summary(&config, &config);
+        assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn diff_summary_detects_polling_change() {
+        let old = Config::from_yaml(
+            r#"
+repos:
+  allowlist:
+    - repo: org/repo
+polling:
+  interval_seconds: 60
+"#,
+        )
+        .expect("parse");
+        let new = Config::from_yaml(
+            r#"
+repos:
+  allowlist:
+    - repo: org/repo
+polling:
+  interval_seconds: 120
+"#,
+        )
+        .expect("parse");
+        let changes = Config::diff_summary(&old, &new);
+        assert_eq!(changes.len(), 1);
+        assert!(changes[0].contains("polling.interval_seconds"));
+        assert!(changes[0].contains("60"));
+        assert!(changes[0].contains("120"));
+    }
+
+    #[test]
+    fn diff_summary_detects_restart_required() {
+        let old = Config::from_yaml(
+            r#"
+repos:
+  allowlist:
+    - repo: org/repo
+execution:
+  max_concurrency: 5
+"#,
+        )
+        .expect("parse");
+        let new = Config::from_yaml(
+            r#"
+repos:
+  allowlist:
+    - repo: org/repo
+execution:
+  max_concurrency: 20
+"#,
+        )
+        .expect("parse");
+        let changes = Config::diff_summary(&old, &new);
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.contains("max_concurrency") && c.contains("restart required"))
+        );
+    }
+
+    #[test]
+    fn diff_summary_detects_repo_change() {
+        let old = Config::from_yaml(
+            r#"
+repos:
+  allowlist:
+    - repo: org/repo1
+"#,
+        )
+        .expect("parse");
+        let new = Config::from_yaml(
+            r#"
+repos:
+  allowlist:
+    - repo: org/repo2
+"#,
+        )
+        .expect("parse");
+        let changes = Config::diff_summary(&old, &new);
+        assert!(changes.iter().any(|c| c.contains("repos.allowlist")));
+    }
+
+    #[test]
+    fn diff_summary_multiple_changes() {
+        let old = Config::from_yaml(
+            r#"
+repos:
+  allowlist:
+    - repo: org/repo
+polling:
+  interval_seconds: 60
+cleanup:
+  ttl_minutes: 1440
+  interval_minutes: 30
+"#,
+        )
+        .expect("parse");
+        let new = Config::from_yaml(
+            r#"
+repos:
+  allowlist:
+    - repo: org/repo
+polling:
+  interval_seconds: 120
+cleanup:
+  ttl_minutes: 720
+  interval_minutes: 15
+"#,
+        )
+        .expect("parse");
+        let changes = Config::diff_summary(&old, &new);
+        assert_eq!(changes.len(), 2);
+        assert!(changes.iter().any(|c| c.contains("polling")));
+        assert!(changes.iter().any(|c| c.contains("cleanup")));
     }
 }

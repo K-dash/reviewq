@@ -3,6 +3,9 @@
 //! Calls GitHub API, filters via rule engine, checks idempotency,
 //! and submits new jobs to the database.
 
+use std::sync::Arc;
+
+use tokio::sync::watch;
 use tokio::time::{Duration, sleep};
 use tracing::{error, info, warn};
 
@@ -12,17 +15,26 @@ use crate::traits::{GitHubClient, JobStore};
 use crate::types::{AgentKind, NewJob, RepoId};
 
 /// Run the detector loop.
-pub async fn run<G, S>(github: &G, store: &S, config: &Config) -> Result<()>
+///
+/// Re-reads configuration from `config_rx` at each iteration so that
+/// changes broadcast via SIGHUP take effect without restarting.
+pub async fn run<G, S>(
+    github: &G,
+    store: &S,
+    mut config_rx: watch::Receiver<Arc<Config>>,
+) -> Result<()>
 where
     G: GitHubClient,
     S: JobStore,
 {
     let username = github.authenticated_user().await?;
-    let policies = config.repo_policies();
-    let repo_ids: Vec<RepoId> = policies.iter().map(|p| p.id.clone()).collect();
 
     loop {
-        match detect_once(github, store, config, &username, &repo_ids, &policies).await {
+        let config = config_rx.borrow_and_update().clone();
+        let policies = config.repo_policies();
+        let repo_ids: Vec<RepoId> = policies.iter().map(|p| p.id.clone()).collect();
+
+        match detect_once(github, store, &config, &username, &repo_ids, &policies).await {
             Ok(count) => info!(new_jobs = count, "detection cycle complete"),
             Err(e) => {
                 if e.is_retryable() {
