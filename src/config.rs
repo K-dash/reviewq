@@ -84,6 +84,10 @@ pub struct RepoEntry {
     #[serde(default)]
     pub command: Option<String>,
 
+    /// Override the global `runner.prompt_template` for this repo.
+    #[serde(default)]
+    pub prompt_template: Option<String>,
+
     /// Override the global `execution.max_concurrency` for this repo.
     /// Reserved for future use; not yet wired into the runner.
     #[serde(default)]
@@ -106,6 +110,7 @@ pub struct RepoPolicy {
     pub skip_self_authored: bool,
     pub skip_reviewer_check: bool,
     pub command: Option<String>,
+    pub prompt_template: Option<String>,
     /// Reserved for future use; not yet wired into the runner.
     pub max_concurrency: Option<usize>,
     /// Path to the local clone of this repository.
@@ -195,6 +200,12 @@ fn default_lease_minutes() -> i64 {
 pub struct RunnerConfig {
     #[serde(default)]
     pub command: Option<String>,
+
+    /// Prompt template for the AI review agent.
+    /// Supports the same template variables as `command`.
+    /// The rendered prompt is available as `{prompt}` and `{prompt_file}` in the command.
+    #[serde(default)]
+    pub prompt_template: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -393,6 +404,7 @@ impl Config {
                     skip_self_authored: entry.skip_self_authored,
                     skip_reviewer_check: entry.skip_reviewer_check,
                     command: entry.command.clone(),
+                    prompt_template: entry.prompt_template.clone(),
                     max_concurrency: entry.max_concurrency,
                     base_repo_path: entry.base_repo_path.clone(),
                 })
@@ -541,6 +553,41 @@ repos:
 "#;
         let err = Config::from_yaml(yaml).unwrap_err();
         assert!(err.to_string().contains("duplicate repo"));
+    }
+
+    #[test]
+    fn parse_prompt_template_in_runner() {
+        let yaml = r#"
+repos:
+  allowlist:
+    - repo: owner/repo
+runner:
+  command: "claude -p '{prompt}'"
+  prompt_template: "Review {pr_url}"
+"#;
+        let config = Config::from_yaml(yaml).expect("should parse");
+        assert_eq!(
+            config.runner.prompt_template.as_deref(),
+            Some("Review {pr_url}")
+        );
+    }
+
+    #[test]
+    fn parse_per_repo_prompt_template() {
+        let yaml = r#"
+repos:
+  allowlist:
+    - repo: org/repo1
+      prompt_template: "Custom prompt for repo1"
+    - repo: org/repo2
+"#;
+        let config = Config::from_yaml(yaml).expect("should parse");
+        let policies = config.repo_policies();
+        assert_eq!(
+            policies[0].prompt_template.as_deref(),
+            Some("Custom prompt for repo1")
+        );
+        assert!(policies[1].prompt_template.is_none());
     }
 
     #[test]

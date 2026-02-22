@@ -35,6 +35,11 @@ pub async fn spawn_in_group(
         ))
     })?;
 
+    // Redirect stdin from /dev/null so child processes don't attempt to
+    // read from the parent's terminal (which would cause SIGTTIN / stop).
+    let stdin_null = std::fs::File::open("/dev/null")
+        .map_err(|e| ReviewqError::Process(format!("failed to open /dev/null: {e}")))?;
+
     // SAFETY: setpgid(0, 0) is async-signal-safe and only affects the
     // forked child process before exec. This is the standard idiom for
     // creating a new process group.
@@ -43,6 +48,7 @@ pub async fn spawn_in_group(
             .args(["-c", command])
             .current_dir(workdir)
             .envs(env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .stdin(stdin_null)
             .stdout(stdout_file)
             .stderr(stderr_file)
             .pre_exec(|| {

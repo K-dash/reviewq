@@ -24,6 +24,7 @@ fn sample_job() -> NewJob {
         head_sha: "aabbccdd11223344".into(),
         agent_kind: AgentKind::Claude,
         command: Some("echo review".into()),
+        prompt_template: None,
         max_retries: 3,
     }
 }
@@ -132,6 +133,7 @@ fn make_test_job(id: i64, command: Option<&str>) -> reviewq::types::Job {
         retry_count: 0,
         max_retries: 3,
         command: command.map(String::from),
+        prompt_template: None,
         pid: None,
         exit_code: None,
         stdout_path: None,

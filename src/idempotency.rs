@@ -48,6 +48,7 @@ mod tests {
             head_sha: "sha1".into(),
             agent_kind: AgentKind::Claude,
             command: None,
+            prompt_template: None,
             max_retries: 3,
         })
         .expect("enqueue should succeed");
@@ -66,6 +67,7 @@ mod tests {
             head_sha: "sha1".into(),
             agent_kind: AgentKind::Claude,
             command: None,
+            prompt_template: None,
             max_retries: 3,
         })
         .expect("enqueue should succeed");
@@ -85,6 +87,7 @@ mod tests {
                 head_sha: "sha1".into(),
                 agent_kind: AgentKind::Claude,
                 command: None,
+                prompt_template: None,
                 max_retries: 3,
             })
             .expect("enqueue should succeed");
@@ -108,6 +111,7 @@ mod tests {
                 head_sha: "sha1".into(),
                 agent_kind: AgentKind::Claude,
                 command: None,
+                prompt_template: None,
                 max_retries: 3,
             })
             .expect("enqueue should succeed");
@@ -131,6 +135,7 @@ mod tests {
                 head_sha: "sha1".into(),
                 agent_kind: AgentKind::Claude,
                 command: None,
+                prompt_template: None,
                 max_retries: 3,
             })
             .expect("enqueue should succeed");
