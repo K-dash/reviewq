@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     retry_count   INTEGER NOT NULL DEFAULT 0,
     max_retries   INTEGER NOT NULL DEFAULT 3,
     command       TEXT,
+    prompt_template TEXT,
     pid           INTEGER,
     exit_code     INTEGER,
     stdout_path   TEXT,
@@ -101,6 +102,21 @@ impl Database {
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")?;
         conn.execute_batch(SCHEMA)?;
+        Self::migrate(&conn)?;
+        Ok(())
+    }
+
+    /// Run idempotent migrations for schema evolution.
+    fn migrate(conn: &Connection) -> Result<()> {
+        // Add prompt_template column if it doesn't exist (added in v0.x).
+        let has_prompt_template: bool = conn
+            .prepare("PRAGMA table_info(jobs)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .any(|name| name.as_deref() == Ok("prompt_template"));
+
+        if !has_prompt_template {
+            conn.execute_batch("ALTER TABLE jobs ADD COLUMN prompt_template TEXT;")?;
+        }
         Ok(())
     }
 
@@ -145,6 +161,7 @@ fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
         retry_count: row.get("retry_count")?,
         max_retries: row.get("max_retries")?,
         command: row.get("command")?,
+        prompt_template: row.get("prompt_template")?,
         pid: row.get::<_, Option<i64>>("pid")?.map(|p| p as u32),
         exit_code: row.get("exit_code")?,
         stdout_path: stdout_path.map(Into::into),
@@ -164,8 +181,8 @@ impl JobStore for Database {
     fn enqueue(&self, job: NewJob) -> Result<Job> {
         let conn = self.lock_conn();
         conn.execute(
-            "INSERT INTO jobs (repo_owner, repo_name, pr_number, head_sha, agent_kind, command, max_retries)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO jobs (repo_owner, repo_name, pr_number, head_sha, agent_kind, command, prompt_template, max_retries)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 job.repo.owner,
                 job.repo.name,
@@ -173,6 +190,7 @@ impl JobStore for Database {
                 job.head_sha,
                 job.agent_kind.as_db_str(),
                 job.command,
+                job.prompt_template,
                 job.max_retries,
             ],
         )?;
@@ -358,6 +376,7 @@ mod tests {
             head_sha: "abc123".into(),
             agent_kind: AgentKind::Claude,
             command: Some("echo review".into()),
+            prompt_template: None,
             max_retries: 3,
         }
     }
@@ -493,6 +512,28 @@ mod tests {
 
         let jobs = db.list_jobs(&JobFilter::default()).expect("list");
         assert_eq!(jobs[0].review_output.as_deref(), Some("# Review\nLGTM"));
+    }
+
+    #[test]
+    fn enqueue_with_prompt_template() {
+        let db = test_db();
+        let mut job = sample_job();
+        job.prompt_template = Some("Review {pr_url} for {repo}".into());
+        let stored = db.enqueue(job).expect("enqueue should succeed");
+        assert_eq!(
+            stored.prompt_template.as_deref(),
+            Some("Review {pr_url} for {repo}")
+        );
+    }
+
+    #[test]
+    fn migration_idempotency() {
+        // Opening the database twice should not fail — the migration is idempotent.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("test.db");
+        let _db1 = Database::open(&db_path).expect("first open");
+        drop(_db1);
+        let _db2 = Database::open(&db_path).expect("second open should not fail");
     }
 
     #[test]

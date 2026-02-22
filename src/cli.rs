@@ -201,6 +201,7 @@ mod tests {
             head_sha: sha.into(),
             agent_kind: AgentKind::Claude,
             command: Some("echo review".into()),
+            prompt_template: None,
             max_retries: 3,
         }
     }

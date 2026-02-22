@@ -116,6 +116,11 @@ where
             .and_then(|p| p.command.clone())
             .or_else(|| config.runner.command.clone());
 
+        // Resolve prompt_template: per-repo override > global runner.prompt_template.
+        let prompt_template = policy
+            .and_then(|p| p.prompt_template.clone())
+            .or_else(|| config.runner.prompt_template.clone());
+
         // Enqueue new job
         let new_job = NewJob {
             repo: pr.repo.clone(),
@@ -123,6 +128,7 @@ where
             head_sha: pr.head_sha.clone(),
             agent_kind: agent_kind.clone(),
             command,
+            prompt_template,
             max_retries: 3,
         };
 
@@ -374,6 +380,89 @@ polling:
 
         let jobs = db.list_jobs(&JobFilter::default()).expect("list");
         assert_eq!(jobs[0].command.as_deref(), Some("global-cmd"));
+    }
+
+    #[tokio::test]
+    async fn per_repo_prompt_template_overrides_global() {
+        let github = MockGitHub {
+            username: "bob".into(),
+            prs: vec![make_pr(1, "sha1")],
+        };
+        let db = Database::open_in_memory().expect("db");
+        let config = Config::from_yaml(
+            r#"
+repos:
+  allowlist:
+    - repo: org/repo
+      prompt_template: "per-repo-prompt"
+runner:
+  prompt_template: "global-prompt"
+polling:
+  interval_seconds: 60
+"#,
+        )
+        .expect("config");
+        let policies = config.repo_policies();
+        let repo_ids = config.repo_ids();
+
+        let count = detect_once(&github, &db, &config, "bob", &repo_ids, &policies)
+            .await
+            .expect("should succeed");
+        assert_eq!(count, 1);
+
+        let jobs = db.list_jobs(&JobFilter::default()).expect("list");
+        assert_eq!(jobs[0].prompt_template.as_deref(), Some("per-repo-prompt"));
+    }
+
+    #[tokio::test]
+    async fn global_prompt_template_used_when_no_per_repo_override() {
+        let github = MockGitHub {
+            username: "bob".into(),
+            prs: vec![make_pr(1, "sha1")],
+        };
+        let db = Database::open_in_memory().expect("db");
+        let config = Config::from_yaml(
+            r#"
+repos:
+  allowlist:
+    - repo: org/repo
+runner:
+  prompt_template: "global-prompt"
+polling:
+  interval_seconds: 60
+"#,
+        )
+        .expect("config");
+        let policies = config.repo_policies();
+        let repo_ids = config.repo_ids();
+
+        let count = detect_once(&github, &db, &config, "bob", &repo_ids, &policies)
+            .await
+            .expect("should succeed");
+        assert_eq!(count, 1);
+
+        let jobs = db.list_jobs(&JobFilter::default()).expect("list");
+        assert_eq!(jobs[0].prompt_template.as_deref(), Some("global-prompt"));
+    }
+
+    #[tokio::test]
+    async fn no_prompt_template_when_both_none() {
+        let github = MockGitHub {
+            username: "bob".into(),
+            prs: vec![make_pr(1, "sha1")],
+        };
+        let db = Database::open_in_memory().expect("db");
+        let config = test_config();
+        let policies = config.repo_policies();
+        let repo_ids = config.repo_ids();
+
+        let count = detect_once(&github, &db, &config, "bob", &repo_ids, &policies)
+            .await
+            .expect("should succeed");
+        assert_eq!(count, 1);
+
+        let jobs = db.list_jobs(&JobFilter::default()).expect("list");
+        assert!(jobs[0].prompt_template.is_none());
     }
 
     #[tokio::test]
