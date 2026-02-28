@@ -23,9 +23,30 @@ const REVIEW_OUTPUT_FILE: &str = "REVIEW.md";
 /// Prompts larger than this are only available via the prompt file.
 const MAX_PROMPT_ENV_SIZE: usize = 128 * 1024;
 
-/// Default prompt template used when no `prompt_template` is configured.
-/// Stored as a separate Markdown file for maintainability and loaded at compile time.
-const DEFAULT_PROMPT_TEMPLATE: &str = include_str!("prompts/default_review.md");
+/// Builtin PR info header that is always prepended to every prompt.
+/// Ensures the review agent always knows which PR to review and outputs Markdown.
+const BUILTIN_HEADER: &str = "\
+Review the following pull request. Your output MUST be valid Markdown.
+- PR URL: {pr_url}
+- Repo: {repo}
+- PR Number: {pr_number}
+- Head SHA: {head_sha}";
+
+/// Default review body used when no `prompt_template` is configured.
+const DEFAULT_REVIEW_BODY: &str = "\
+Constraints:
+- Each finding must start with `- [SEV:HIGH|MED|LOW]`
+- Include `file:` and `line:` where possible
+- Use ```diff blocks for suggested patches
+
+## Output Template
+# Summary
+# Major Findings
+# Minor Findings
+# Questions
+# Suggested patches
+# Risk & Rollout
+# Checklist";
 
 // ---------------------------------------------------------------------------
 // Template variable interpolation
@@ -199,12 +220,14 @@ impl ReviewExecutor for CommandExecutor {
 
         let ctx = TemplateContext::new(job, worktree);
 
-        // Phase 1: Interpolate prompt template with base variables.
-        let raw_prompt = job
+        // Phase 1: Assemble prompt = builtin header (always) + body (custom or default).
+        let header = ctx.interpolate(BUILTIN_HEADER);
+        let body = job
             .prompt_template
             .as_deref()
-            .unwrap_or(DEFAULT_PROMPT_TEMPLATE);
-        let rendered_prompt = ctx.interpolate(raw_prompt);
+            .unwrap_or(DEFAULT_REVIEW_BODY);
+        let body_rendered = ctx.interpolate(body);
+        let rendered_prompt = format!("{header}\n\n{body_rendered}");
         warn_unknown_variables(&rendered_prompt, "prompt");
 
         // Write rendered prompt to a file (always available regardless of size).
@@ -600,7 +623,7 @@ mod tests {
         let content = result.review_markdown.expect("REVIEW.md should exist");
         // Default prompt should contain the spec's structured template
         assert!(
-            content.contains("Review the following PR"),
+            content.contains("Review the following pull request"),
             "default prompt not rendered: {content}"
         );
         assert!(
@@ -624,7 +647,15 @@ mod tests {
 
         assert_eq!(result.exit_code, 0);
         let content = result.review_markdown.expect("REVIEW.md should exist");
-        assert_eq!(content, "Custom review for owner/repo PR #1");
+        // Builtin header is always prepended.
+        assert!(
+            content.contains("Review the following pull request"),
+            "builtin header missing: {content}"
+        );
+        assert!(
+            content.contains("Custom review for owner/repo PR #1"),
+            "custom template not appended: {content}"
+        );
     }
 
     #[tokio::test]
@@ -644,7 +675,15 @@ mod tests {
         let prompt_file = output_dir.join("job-42-prompt.txt");
         assert!(prompt_file.exists(), "prompt file should be created");
         let content = std::fs::read_to_string(prompt_file).expect("read prompt file");
-        assert_eq!(content, "Prompt for owner/repo");
+        // Prompt file contains builtin header + custom body.
+        assert!(
+            content.contains("Review the following pull request"),
+            "builtin header missing in prompt file: {content}"
+        );
+        assert!(
+            content.contains("Prompt for owner/repo"),
+            "custom body missing in prompt file: {content}"
+        );
     }
 
     #[tokio::test]
@@ -702,8 +741,9 @@ mod tests {
         let worktree = tmp.path().join("worktree");
         std::fs::create_dir_all(&worktree).expect("create worktree dir");
 
-        // Create a prompt template that expands to > 128KB
-        let large_template = "x".repeat(MAX_PROMPT_ENV_SIZE + 1);
+        // Create a prompt template that, combined with builtin header, exceeds 128KB.
+        let header_len = BUILTIN_HEADER.len() + 2; // +2 for "\n\n"
+        let large_template = "x".repeat(MAX_PROMPT_ENV_SIZE + 1 - header_len);
         let cmd = r#"printf '%s\n%s' "$REVIEWQ_PROMPT" "$REVIEWQ_PROMPT_FILE" > REVIEW.md"#;
         let executor =
             CommandExecutor::new(cmd.into(), CancelConfig::default(), output_dir.clone());
@@ -724,10 +764,14 @@ mod tests {
             "REVIEWQ_PROMPT_FILE should always be set"
         );
 
-        // The prompt file should still contain the full content
+        // The prompt file should still contain the full content (header + body > 128KB).
         let prompt_file = output_dir.join("job-1-prompt.txt");
         let file_content = std::fs::read_to_string(prompt_file).expect("read prompt file");
-        assert_eq!(file_content.len(), MAX_PROMPT_ENV_SIZE + 1);
+        assert!(
+            file_content.len() > MAX_PROMPT_ENV_SIZE,
+            "prompt file should exceed 128KB, got {}",
+            file_content.len()
+        );
     }
 
     #[test]
