@@ -124,7 +124,11 @@ impl App {
                             }
                         }
                     } else {
-                        self.status_message = Some("No review output available".to_owned());
+                        // No review output yet — fall back to tail view so the
+                        // user can see logs (useful for running / queued jobs).
+                        let content = load_log_content(job);
+                        self.log_content = content;
+                        self.view = View::Tail;
                     }
                 }
             }
@@ -334,18 +338,12 @@ mod tests {
     }
 
     #[test]
-    fn select_job_without_review_output_shows_message() {
+    fn select_job_without_review_output_shows_tail() {
         let (mut app, _tmp) = make_app();
         app.update_jobs(vec![make_job(1, JobStatus::Succeeded)]);
 
         app.dispatch(Action::SelectJob);
-        assert_eq!(app.view, View::Queue);
-        assert!(
-            app.status_message
-                .as_deref()
-                .unwrap()
-                .contains("No review output")
-        );
+        assert_eq!(app.view, View::Tail);
     }
 
     #[test]
