@@ -88,7 +88,7 @@ async fn run(cli: Cli) -> reviewq::error::Result<()> {
         }
         Some(Commands::Tui) => {
             let db = reviewq::db::Database::open(&config.state.sqlite_path)?;
-            reviewq::tui::run(&db, &config.output.dir)
+            reviewq::tui::run(&db, &config.output.dir, &config.logging.dir)
         }
         None => run_daemon(config, config_path).await,
     }
@@ -130,7 +130,7 @@ async fn run_daemon(
     ));
 
     // Set up signal handlers for graceful shutdown.
-    let (mut shutdown_rx, mut reload_rx) = reviewq::daemon::setup_signals().await?;
+    let (mut shutdown_rx, mut reload_rx, wake_notify) = reviewq::daemon::setup_signals().await?;
 
     // Config broadcast channel: tasks re-read at each loop iteration.
     let (config_tx, config_rx) = watch::channel(Arc::new(config));
@@ -155,6 +155,7 @@ async fn run_daemon(
             &clock,
             runner_config_rx,
             runner_shutdown_rx,
+            wake_notify,
         )
         .await
     });

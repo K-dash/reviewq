@@ -6,9 +6,10 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 use tracing::info;
 
 use crate::error::{Result, ReviewqError};
@@ -111,12 +112,14 @@ fn is_process_alive(pid: u32) -> bool {
 ///
 /// - **SIGINT / SIGTERM** trigger a shutdown notification.
 /// - **SIGHUP** triggers a config-reload notification.
+/// - **SIGUSR1** wakes the runner loop to check for queued jobs immediately.
 ///
-/// Returns `(shutdown_rx, reload_rx)` — watch receivers that flip to `true`
-/// when the corresponding event fires.
-pub async fn setup_signals() -> Result<(watch::Receiver<bool>, watch::Receiver<bool>)> {
+/// Returns `(shutdown_rx, reload_rx, wake_notify)`.
+pub async fn setup_signals() -> Result<(watch::Receiver<bool>, watch::Receiver<bool>, Arc<Notify>)>
+{
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (reload_tx, reload_rx) = watch::channel(false);
+    let wake_notify = Arc::new(Notify::new());
 
     let mut sigint = signal(SignalKind::interrupt())
         .map_err(|e| ReviewqError::Process(format!("failed to register SIGINT handler: {e}")))?;
@@ -124,7 +127,10 @@ pub async fn setup_signals() -> Result<(watch::Receiver<bool>, watch::Receiver<b
         .map_err(|e| ReviewqError::Process(format!("failed to register SIGTERM handler: {e}")))?;
     let mut sighup = signal(SignalKind::hangup())
         .map_err(|e| ReviewqError::Process(format!("failed to register SIGHUP handler: {e}")))?;
+    let mut sigusr1 = signal(SignalKind::user_defined1())
+        .map_err(|e| ReviewqError::Process(format!("failed to register SIGUSR1 handler: {e}")))?;
 
+    let wake = Arc::clone(&wake_notify);
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -142,11 +148,15 @@ pub async fn setup_signals() -> Result<(watch::Receiver<bool>, watch::Receiver<b
                     info!("received SIGHUP, requesting config reload");
                     let _ = reload_tx.send(true);
                 }
+                _ = sigusr1.recv() => {
+                    info!("received SIGUSR1, waking runner");
+                    wake.notify_one();
+                }
             }
         }
     });
 
-    Ok((shutdown_rx, reload_rx))
+    Ok((shutdown_rx, reload_rx, wake_notify))
 }
 
 // ---------------------------------------------------------------------------
