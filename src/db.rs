@@ -354,6 +354,21 @@ impl JobStore for Database {
         }
         Ok(())
     }
+
+    fn is_pr_reviewed(&self, repo: &RepoId, pr_number: u64, agent: &AgentKind) -> Result<bool> {
+        let conn = self.lock_conn();
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM jobs
+                WHERE repo_owner = ?1 AND repo_name = ?2
+                  AND pr_number = ?3 AND agent_kind = ?4
+                  AND status NOT IN ('failed', 'canceled')
+            )",
+            params![repo.owner, repo.name, pr_number as i64, agent.as_db_str(),],
+            |row| row.get(0),
+        )?;
+        Ok(exists)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -544,6 +559,83 @@ mod tests {
         assert!(
             result.is_err(),
             "duplicate should be rejected by UNIQUE constraint"
+        );
+    }
+
+    #[test]
+    fn is_pr_reviewed_false_when_no_jobs() {
+        let db = test_db();
+        let repo = RepoId::new("owner", "repo");
+        assert!(
+            !db.is_pr_reviewed(&repo, 42, &AgentKind::Claude)
+                .expect("should succeed")
+        );
+    }
+
+    #[test]
+    fn is_pr_reviewed_true_for_succeeded_job() {
+        let db = test_db();
+        let repo = RepoId::new("owner", "repo");
+        let job = db.enqueue(sample_job()).expect("enqueue");
+        db.complete(job.id, JobStatus::Succeeded, Some(0))
+            .expect("complete");
+        assert!(
+            db.is_pr_reviewed(&repo, 42, &AgentKind::Claude)
+                .expect("should succeed")
+        );
+    }
+
+    #[test]
+    fn is_pr_reviewed_true_for_queued_job() {
+        let db = test_db();
+        let repo = RepoId::new("owner", "repo");
+        db.enqueue(sample_job()).expect("enqueue");
+        // Queued jobs should also block (review in progress).
+        assert!(
+            db.is_pr_reviewed(&repo, 42, &AgentKind::Claude)
+                .expect("should succeed")
+        );
+    }
+
+    #[test]
+    fn is_pr_reviewed_false_for_failed_job() {
+        let db = test_db();
+        let repo = RepoId::new("owner", "repo");
+        let job = db.enqueue(sample_job()).expect("enqueue");
+        db.complete(job.id, JobStatus::Failed, Some(1))
+            .expect("complete");
+        assert!(
+            !db.is_pr_reviewed(&repo, 42, &AgentKind::Claude)
+                .expect("should succeed")
+        );
+    }
+
+    #[test]
+    fn is_pr_reviewed_false_for_canceled_job() {
+        let db = test_db();
+        let repo = RepoId::new("owner", "repo");
+        let job = db.enqueue(sample_job()).expect("enqueue");
+        db.cancel(job.id).expect("cancel");
+        assert!(
+            !db.is_pr_reviewed(&repo, 42, &AgentKind::Claude)
+                .expect("should succeed")
+        );
+    }
+
+    #[test]
+    fn is_pr_reviewed_true_across_different_shas() {
+        let db = test_db();
+        let repo = RepoId::new("owner", "repo");
+        let mut job = sample_job();
+        job.head_sha = "sha_old".into();
+        let stored = db.enqueue(job).expect("enqueue");
+        db.complete(stored.id, JobStatus::Succeeded, Some(0))
+            .expect("complete");
+
+        // Different SHA should still be considered reviewed (PR-level check).
+        assert!(
+            db.is_pr_reviewed(&repo, 42, &AgentKind::Claude)
+                .expect("should succeed")
         );
     }
 }

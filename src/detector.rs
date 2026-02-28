@@ -100,13 +100,15 @@ where
         let policy = policies.iter().find(|p| p.id == pr.repo);
         let skip_self = policy.is_none_or(|p| p.skip_self_authored);
         let skip_reviewer = policy.is_some_and(|p| p.skip_reviewer_check);
+        let review_on_push = policy.is_none_or(|p| p.review_on_push);
 
         // Apply filtering rules
         if !crate::rules::should_process(pr, username, repo_ids, skip_self, skip_reviewer) {
             continue;
         }
 
-        // Handle SHA changes (cancel stale jobs)
+        // Handle SHA changes (cancel stale jobs) — always runs regardless
+        // of review_on_push to prevent stale reviews from completing.
         let sha_changed = crate::update::handle_sha_change(store, pr, &agent_kind)?;
         if sha_changed {
             info!(
@@ -117,9 +119,14 @@ where
             );
         }
 
-        // Check idempotency
-        if crate::idempotency::is_duplicate(store, &pr.repo, pr.number, &pr.head_sha, &agent_kind)?
-        {
+        // Check idempotency: when review_on_push is false, use PR-level
+        // dedup (ignores SHA) so succeeded reviews block re-queue.
+        let is_dup = if review_on_push {
+            crate::idempotency::is_duplicate(store, &pr.repo, pr.number, &pr.head_sha, &agent_kind)?
+        } else {
+            crate::idempotency::is_duplicate_for_pr(store, &pr.repo, pr.number, &agent_kind)?
+        };
+        if is_dup {
             continue;
         }
 
@@ -585,5 +592,248 @@ polling:
         let jobs = db.list_jobs(&JobFilter::default()).expect("list");
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].pr_number, 1);
+    }
+
+    fn test_config_review_on_push_false() -> Config {
+        Config::from_yaml(
+            r#"
+repos:
+  allowlist:
+    - repo: org/repo
+      review_on_push: false
+polling:
+  interval_seconds: 60
+"#,
+        )
+        .expect("config should parse")
+    }
+
+    #[tokio::test]
+    async fn review_on_push_false_does_not_requeue_after_success() {
+        let db = Database::open_in_memory().expect("db");
+        let config = test_config_review_on_push_false();
+        let policies = config.repo_policies();
+        let repo_ids = config.repo_ids();
+
+        // First cycle: enqueue and succeed
+        let github1 = MockGitHub {
+            username: "bob".into(),
+            prs: vec![make_pr(1, "old_sha")],
+        };
+        let count1 = detect_once(&github1, &db, &config, "bob", &repo_ids, &policies)
+            .await
+            .expect("should succeed");
+        assert_eq!(count1, 1);
+
+        // Mark the job as succeeded
+        let jobs = db.list_jobs(&JobFilter::default()).expect("list");
+        db.complete(jobs[0].id, crate::types::JobStatus::Succeeded, Some(0))
+            .expect("complete");
+
+        // Second cycle with new SHA — should NOT re-queue
+        let github2 = MockGitHub {
+            username: "bob".into(),
+            prs: vec![make_pr(1, "new_sha")],
+        };
+        let count2 = detect_once(&github2, &db, &config, "bob", &repo_ids, &policies)
+            .await
+            .expect("should succeed");
+        assert_eq!(count2, 0, "succeeded PR should not be re-queued");
+    }
+
+    #[tokio::test]
+    async fn review_on_push_false_cancels_stale_and_queues_first_review() {
+        let db = Database::open_in_memory().expect("db");
+        let config = test_config_review_on_push_false();
+        let policies = config.repo_policies();
+        let repo_ids = config.repo_ids();
+
+        // First cycle: enqueue with old SHA (still queued, not succeeded)
+        let github1 = MockGitHub {
+            username: "bob".into(),
+            prs: vec![make_pr(1, "old_sha")],
+        };
+        let count1 = detect_once(&github1, &db, &config, "bob", &repo_ids, &policies)
+            .await
+            .expect("should succeed");
+        assert_eq!(count1, 1);
+
+        // Second cycle with new SHA — old job should be canceled, new one queued
+        let github2 = MockGitHub {
+            username: "bob".into(),
+            prs: vec![make_pr(1, "new_sha")],
+        };
+        let count2 = detect_once(&github2, &db, &config, "bob", &repo_ids, &policies)
+            .await
+            .expect("should succeed");
+        assert_eq!(
+            count2, 1,
+            "first review should still be queued on SHA change"
+        );
+
+        // Verify: old job canceled, new job queued
+        let all_jobs = db.list_jobs(&JobFilter::default()).expect("list");
+        assert_eq!(all_jobs.len(), 2);
+        let canceled = db
+            .list_jobs(&JobFilter {
+                status: Some(crate::types::JobStatus::Canceled),
+                ..Default::default()
+            })
+            .expect("list");
+        assert_eq!(canceled.len(), 1);
+        assert_eq!(canceled[0].head_sha, "old_sha");
+    }
+
+    #[tokio::test]
+    async fn review_on_push_false_allows_retry_after_failure() {
+        let db = Database::open_in_memory().expect("db");
+        let config = test_config_review_on_push_false();
+        let policies = config.repo_policies();
+        let repo_ids = config.repo_ids();
+
+        // First cycle: enqueue and fail
+        let github1 = MockGitHub {
+            username: "bob".into(),
+            prs: vec![make_pr(1, "old_sha")],
+        };
+        let count1 = detect_once(&github1, &db, &config, "bob", &repo_ids, &policies)
+            .await
+            .expect("should succeed");
+        assert_eq!(count1, 1);
+
+        let jobs = db.list_jobs(&JobFilter::default()).expect("list");
+        db.complete(jobs[0].id, crate::types::JobStatus::Failed, Some(1))
+            .expect("complete");
+
+        // Second cycle with new SHA — should re-queue (failed is retryable)
+        let github2 = MockGitHub {
+            username: "bob".into(),
+            prs: vec![make_pr(1, "new_sha")],
+        };
+        let count2 = detect_once(&github2, &db, &config, "bob", &repo_ids, &policies)
+            .await
+            .expect("should succeed");
+        assert_eq!(count2, 1, "failed job should allow retry");
+    }
+
+    #[tokio::test]
+    async fn review_on_push_true_requeues_on_sha_change() {
+        // Verify default behavior (review_on_push: true) is unchanged.
+        let db = Database::open_in_memory().expect("db");
+        let config = test_config();
+        let policies = config.repo_policies();
+        let repo_ids = config.repo_ids();
+
+        // First cycle
+        let github1 = MockGitHub {
+            username: "bob".into(),
+            prs: vec![make_pr(1, "old_sha")],
+        };
+        let count1 = detect_once(&github1, &db, &config, "bob", &repo_ids, &policies)
+            .await
+            .expect("should succeed");
+        assert_eq!(count1, 1);
+
+        let jobs = db.list_jobs(&JobFilter::default()).expect("list");
+        db.complete(jobs[0].id, crate::types::JobStatus::Succeeded, Some(0))
+            .expect("complete");
+
+        // Second cycle with new SHA — should re-queue (default behavior)
+        let github2 = MockGitHub {
+            username: "bob".into(),
+            prs: vec![make_pr(1, "new_sha")],
+        };
+        let count2 = detect_once(&github2, &db, &config, "bob", &repo_ids, &policies)
+            .await
+            .expect("should succeed");
+        assert_eq!(count2, 1, "default behavior should re-queue on SHA change");
+    }
+
+    #[tokio::test]
+    async fn review_on_push_false_cancels_leased_and_queues_new() {
+        let db = Database::open_in_memory().expect("db");
+        let config = test_config_review_on_push_false();
+        let policies = config.repo_policies();
+        let repo_ids = config.repo_ids();
+
+        // First cycle: enqueue with old SHA
+        let github1 = MockGitHub {
+            username: "bob".into(),
+            prs: vec![make_pr(1, "old_sha")],
+        };
+        let count1 = detect_once(&github1, &db, &config, "bob", &repo_ids, &policies)
+            .await
+            .expect("should succeed");
+        assert_eq!(count1, 1);
+
+        // Simulate the job being leased (in-flight)
+        let leased = db.lease_next().expect("lease").expect("should have job");
+        assert_eq!(leased.status, crate::types::JobStatus::Leased);
+
+        // Second cycle with new SHA — leased job should be canceled, new one queued
+        let github2 = MockGitHub {
+            username: "bob".into(),
+            prs: vec![make_pr(1, "new_sha")],
+        };
+        let count2 = detect_once(&github2, &db, &config, "bob", &repo_ids, &policies)
+            .await
+            .expect("should succeed");
+        assert_eq!(
+            count2, 1,
+            "leased job on old SHA should be canceled and new job queued"
+        );
+
+        let canceled = db
+            .list_jobs(&JobFilter {
+                status: Some(crate::types::JobStatus::Canceled),
+                ..Default::default()
+            })
+            .expect("list");
+        assert_eq!(canceled.len(), 1);
+        assert_eq!(canceled[0].head_sha, "old_sha");
+    }
+
+    #[tokio::test]
+    async fn review_on_push_false_cancels_running_and_queues_new() {
+        let db = Database::open_in_memory().expect("db");
+        let config = test_config_review_on_push_false();
+        let policies = config.repo_policies();
+        let repo_ids = config.repo_ids();
+
+        // First cycle: enqueue with old SHA
+        let github1 = MockGitHub {
+            username: "bob".into(),
+            prs: vec![make_pr(1, "old_sha")],
+        };
+        let count1 = detect_once(&github1, &db, &config, "bob", &repo_ids, &policies)
+            .await
+            .expect("should succeed");
+        assert_eq!(count1, 1);
+
+        // Simulate the job being leased then running
+        let leased = db.lease_next().expect("lease").expect("should have job");
+        db.mark_running(leased.id, 12345).expect("mark running");
+
+        // Second cycle with new SHA — running job should be canceled, new one queued
+        let github2 = MockGitHub {
+            username: "bob".into(),
+            prs: vec![make_pr(1, "new_sha")],
+        };
+        let count2 = detect_once(&github2, &db, &config, "bob", &repo_ids, &policies)
+            .await
+            .expect("should succeed");
+        assert_eq!(
+            count2, 1,
+            "running job on old SHA should be canceled and new job queued"
+        );
+
+        let canceled = db
+            .list_jobs(&JobFilter {
+                status: Some(crate::types::JobStatus::Canceled),
+                ..Default::default()
+            })
+            .expect("list");
+        assert_eq!(canceled.len(), 1);
+        assert_eq!(canceled[0].head_sha, "old_sha");
     }
 }
