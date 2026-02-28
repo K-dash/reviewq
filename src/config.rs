@@ -84,6 +84,10 @@ pub struct RepoEntry {
     #[serde(default)]
     pub command: Option<String>,
 
+    /// Override the global `runner.prompt_template` for this repo.
+    #[serde(default)]
+    pub prompt_template: Option<String>,
+
     /// Override the global `execution.max_concurrency` for this repo.
     /// Reserved for future use; not yet wired into the runner.
     #[serde(default)]
@@ -106,6 +110,7 @@ pub struct RepoPolicy {
     pub skip_self_authored: bool,
     pub skip_reviewer_check: bool,
     pub command: Option<String>,
+    pub prompt_template: Option<String>,
     /// Reserved for future use; not yet wired into the runner.
     pub max_concurrency: Option<usize>,
     /// Path to the local clone of this repository.
@@ -195,6 +200,11 @@ fn default_lease_minutes() -> i64 {
 pub struct RunnerConfig {
     #[serde(default)]
     pub command: Option<String>,
+
+    /// Global prompt template appended after the builtin PR info header.
+    /// Supports the same `{variable}` interpolation as `command`.
+    #[serde(default)]
+    pub prompt_template: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -393,6 +403,7 @@ impl Config {
                     skip_self_authored: entry.skip_self_authored,
                     skip_reviewer_check: entry.skip_reviewer_check,
                     command: entry.command.clone(),
+                    prompt_template: entry.prompt_template.clone(),
                     max_concurrency: entry.max_concurrency,
                     base_repo_path: entry.base_repo_path.clone(),
                 })

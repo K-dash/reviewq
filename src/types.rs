@@ -183,6 +183,7 @@ pub struct Job {
     pub retry_count: i32,
     pub max_retries: i32,
     pub command: Option<String>,
+    pub prompt_template: Option<String>,
     pub pid: Option<u32>,
     pub exit_code: Option<i32>,
     pub stdout_path: Option<PathBuf>,
@@ -201,6 +202,7 @@ pub struct NewJob {
     pub head_sha: String,
     pub agent_kind: AgentKind,
     pub command: Option<String>,
+    pub prompt_template: Option<String>,
     pub max_retries: i32,
 }
 

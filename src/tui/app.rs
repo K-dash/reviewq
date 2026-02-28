@@ -260,6 +260,7 @@ mod tests {
             retry_count: 0,
             max_retries: 3,
             command: Some("echo test".into()),
+            prompt_template: None,
             pid: None,
             exit_code: None,
             stdout_path: None,

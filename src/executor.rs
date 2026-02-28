@@ -19,6 +19,22 @@ use crate::types::{Job, ReviewResult};
 /// Well-known filename that review agents write their output to.
 const REVIEW_OUTPUT_FILE: &str = "REVIEW.md";
 
+/// Prompt file path relative to the worktree (namespaced to avoid collision).
+const PROMPT_FILE_REL: &str = ".reviewq/prompt.md";
+
+/// Maximum prompt size (in bytes) for the `REVIEWQ_PROMPT` environment variable.
+/// Prompts exceeding this size are only available via `REVIEWQ_PROMPT_FILE`.
+const MAX_PROMPT_ENV_SIZE: usize = 128 * 1024;
+
+/// Builtin PR info header that is always prepended to every prompt.
+/// Ensures the review agent always knows which PR to review and outputs Markdown.
+const BUILTIN_HEADER: &str = "\
+Review the following pull request. Your output MUST be valid Markdown.
+- PR URL: {pr_url}
+- Repo: {repo}
+- PR Number: {pr_number}
+- Head SHA: {head_sha}";
+
 // ---------------------------------------------------------------------------
 // Template variable interpolation
 // ---------------------------------------------------------------------------
@@ -33,22 +49,55 @@ struct TemplateContext {
     worktree_path: String,
     job_id: String,
     output_path: String,
+    prompt_file: String,
+    prompt: String,
 }
 
 impl TemplateContext {
     /// Build a context from a [`Job`] and its worktree path.
+    ///
+    /// The prompt is assembled as: builtin header (interpolated) + user template (interpolated).
+    /// The prompt file is written to `{worktree}/.reviewq/prompt.md`.
     fn new(job: &Job, worktree: &Path) -> Self {
         let repo = job.repo.full_name();
         let pr_number = job.pr_number.to_string();
         let pr_url = format!("https://github.com/{}/pull/{}", repo, pr_number);
+        let worktree_str = worktree.display().to_string();
+        let output_path = worktree.join(REVIEW_OUTPUT_FILE).display().to_string();
+        let job_id = job.id.to_string();
+        let prompt_file = worktree.join(PROMPT_FILE_REL).display().to_string();
+
+        // Build a temporary interpolator for the prompt (without prompt_file/prompt yet).
+        let interpolate_basic = |template: &str| -> String {
+            template
+                .replace("{pr_url}", &pr_url)
+                .replace("{repo}", &repo)
+                .replace("{pr_number}", &pr_number)
+                .replace("{head_sha}", &job.head_sha)
+                .replace("{worktree_path}", &worktree_str)
+                .replace("{job_id}", &job_id)
+                .replace("{output_path}", &output_path)
+        };
+
+        // Always start with the builtin header.
+        let mut prompt = interpolate_basic(BUILTIN_HEADER);
+
+        // Append user-supplied prompt template if present.
+        if let Some(ref user_template) = job.prompt_template {
+            prompt.push_str("\n\n");
+            prompt.push_str(&interpolate_basic(user_template));
+        }
+
         Self {
             pr_url,
             repo,
             pr_number,
             head_sha: job.head_sha.clone(),
-            worktree_path: worktree.display().to_string(),
-            job_id: job.id.to_string(),
-            output_path: worktree.join(REVIEW_OUTPUT_FILE).display().to_string(),
+            worktree_path: worktree_str,
+            job_id,
+            output_path,
+            prompt_file,
+            prompt,
         }
     }
 
@@ -62,11 +111,13 @@ impl TemplateContext {
             .replace("{worktree_path}", &self.worktree_path)
             .replace("{job_id}", &self.job_id)
             .replace("{output_path}", &self.output_path)
+            .replace("{prompt_file}", &self.prompt_file)
+            .replace("{prompt}", &self.prompt)
     }
 
     /// Return `REVIEWQ_*` environment variable pairs for the child process.
     fn env_vars(&self) -> Vec<(String, String)> {
-        vec![
+        let mut vars = vec![
             ("REVIEWQ_PR_URL".into(), self.pr_url.clone()),
             ("REVIEWQ_REPO".into(), self.repo.clone()),
             ("REVIEWQ_PR_NUMBER".into(), self.pr_number.clone()),
@@ -74,7 +125,15 @@ impl TemplateContext {
             ("REVIEWQ_WORKTREE_PATH".into(), self.worktree_path.clone()),
             ("REVIEWQ_JOB_ID".into(), self.job_id.clone()),
             ("REVIEWQ_OUTPUT_PATH".into(), self.output_path.clone()),
-        ]
+            ("REVIEWQ_PROMPT_FILE".into(), self.prompt_file.clone()),
+        ];
+
+        // Only set REVIEWQ_PROMPT if content is within size limit.
+        if self.prompt.len() <= MAX_PROMPT_ENV_SIZE {
+            vars.push(("REVIEWQ_PROMPT".into(), self.prompt.clone()));
+        }
+
+        vars
     }
 }
 
@@ -154,9 +213,38 @@ impl ReviewExecutor for CommandExecutor {
         let stdout_path = self.output_dir.join(format!("job-{}-stdout.log", job.id));
         let stderr_path = self.output_dir.join(format!("job-{}-stderr.log", job.id));
 
+        // Build template context (assembles prompt from builtin header + user template).
+        let ctx = TemplateContext::new(job, worktree);
+
+        // Write prompt file to worktree.
+        let prompt_file_path = worktree.join(PROMPT_FILE_REL);
+        if let Some(parent) = prompt_file_path.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                ReviewqError::Process(format!(
+                    "failed to create prompt directory {}: {e}",
+                    parent.display()
+                ))
+            })?;
+        }
+        tokio::fs::write(&prompt_file_path, &ctx.prompt)
+            .await
+            .map_err(|e| {
+                ReviewqError::Process(format!(
+                    "failed to write prompt file {}: {e}",
+                    prompt_file_path.display()
+                ))
+            })?;
+
+        if ctx.prompt.len() > MAX_PROMPT_ENV_SIZE {
+            warn!(
+                job_id = job.id,
+                size = ctx.prompt.len(),
+                "prompt exceeds 128KB; REVIEWQ_PROMPT env var will not be set"
+            );
+        }
+
         // Use job-specific command if set, otherwise the default.
         let raw_cmd = job.command.as_deref().unwrap_or(&self.command);
-        let ctx = TemplateContext::new(job, worktree);
         let cmd = ctx.interpolate(raw_cmd);
         warn_unknown_variables(&cmd);
         let env_vars = ctx.env_vars();
@@ -237,6 +325,7 @@ mod tests {
             retry_count: 0,
             max_retries: 3,
             command: command.map(String::from),
+            prompt_template: None,
             pid: None,
             exit_code: None,
             stdout_path: None,
@@ -257,13 +346,14 @@ mod tests {
         let ctx = TemplateContext::new(&job, worktree);
 
         let cmd = ctx.interpolate(
-            "{pr_url} {repo} {pr_number} {head_sha} {worktree_path} {job_id} {output_path}",
+            "{pr_url} {repo} {pr_number} {head_sha} {worktree_path} {job_id} {output_path} {prompt_file}",
         );
         assert_eq!(
             cmd,
             format!(
-                "https://github.com/owner/repo/pull/1 owner/repo 1 abc123 /tmp/worktree 1 {}",
-                worktree.join("REVIEW.md").display()
+                "https://github.com/owner/repo/pull/1 owner/repo 1 abc123 /tmp/worktree 1 {} {}",
+                worktree.join("REVIEW.md").display(),
+                worktree.join(PROMPT_FILE_REL).display(),
             )
         );
     }
@@ -315,7 +405,8 @@ mod tests {
         let ctx = TemplateContext::new(&job, worktree);
 
         let env_vars = ctx.env_vars();
-        assert_eq!(env_vars.len(), 7);
+        // 7 original + REVIEWQ_PROMPT_FILE + REVIEWQ_PROMPT = 9
+        assert_eq!(env_vars.len(), 9);
 
         let find = |key: &str| -> String {
             env_vars
@@ -339,6 +430,14 @@ mod tests {
             find("REVIEWQ_OUTPUT_PATH"),
             worktree.join("REVIEW.md").display().to_string()
         );
+        assert_eq!(
+            find("REVIEWQ_PROMPT_FILE"),
+            worktree.join(PROMPT_FILE_REL).display().to_string()
+        );
+        // REVIEWQ_PROMPT should be present (builtin header is small)
+        let prompt = find("REVIEWQ_PROMPT");
+        assert!(prompt.contains("Review the following pull request"));
+        assert!(prompt.contains("owner/repo"));
     }
 
     #[test]

@@ -116,6 +116,11 @@ where
             .and_then(|p| p.command.clone())
             .or_else(|| config.runner.command.clone());
 
+        // Resolve prompt_template: per-repo override > global runner.prompt_template.
+        let prompt_template = policy
+            .and_then(|p| p.prompt_template.clone())
+            .or_else(|| config.runner.prompt_template.clone());
+
         // Enqueue new job
         let new_job = NewJob {
             repo: pr.repo.clone(),
@@ -123,6 +128,7 @@ where
             head_sha: pr.head_sha.clone(),
             agent_kind: agent_kind.clone(),
             command,
+            prompt_template,
             max_retries: 3,
         };
 

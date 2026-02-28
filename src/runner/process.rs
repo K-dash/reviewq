@@ -43,6 +43,7 @@ pub async fn spawn_in_group(
             .args(["-c", command])
             .current_dir(workdir)
             .envs(env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .stdin(std::process::Stdio::null())
             .stdout(stdout_file)
             .stderr(stderr_file)
             .pre_exec(|| {
