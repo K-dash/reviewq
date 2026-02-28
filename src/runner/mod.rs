@@ -6,7 +6,7 @@ pub mod process;
 use std::path::Path;
 use std::sync::Arc;
 
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{Notify, Semaphore, watch};
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 
@@ -28,6 +28,7 @@ pub async fn run<S, E, C>(
     _clock: &C,
     mut config_rx: watch::Receiver<Arc<Config>>,
     mut shutdown_rx: watch::Receiver<bool>,
+    wake: Arc<Notify>,
 ) -> Result<()>
 where
     S: JobStore + 'static,
@@ -82,12 +83,15 @@ where
             Ok(Some(job)) => job,
             Ok(None) => {
                 drop(permit);
-                // Wait for either shutdown or poll interval.
+                // Wait for either shutdown, wake signal, or poll interval.
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(
                         config.polling.interval_seconds,
                     )) => {}
                     _ = shutdown_rx.changed() => {}
+                    _ = wake.notified() => {
+                        info!("wake signal received, checking for queued jobs");
+                    }
                 }
                 continue;
             }
@@ -97,6 +101,9 @@ where
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
                     _ = shutdown_rx.changed() => {}
+                    _ = wake.notified() => {
+                        info!("wake signal received, retrying after error");
+                    }
                 }
                 continue;
             }

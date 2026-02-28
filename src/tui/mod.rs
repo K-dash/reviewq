@@ -13,6 +13,8 @@ use std::path::Path;
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
+use nix::sys::signal::{self, Signal};
+use nix::unistd::Pid;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
@@ -21,8 +23,37 @@ use crate::error::Result;
 use crate::traits::JobStore;
 use crate::types::JobFilter;
 
+/// Errors from nudging the daemon via SIGUSR1.
+enum NudgeError {
+    /// Daemon process is not running (ESRCH).
+    NotRunning,
+    /// Insufficient permissions to signal the daemon (EPERM).
+    PermissionDenied,
+    /// PID file is missing or contains invalid data.
+    InvalidPidFile(String),
+}
+
+/// Send SIGUSR1 to the daemon to wake the runner loop.
+fn nudge_daemon(pid_file: &Path) -> std::result::Result<(), NudgeError> {
+    let contents = std::fs::read_to_string(pid_file)
+        .map_err(|e| NudgeError::InvalidPidFile(format!("{e}")))?;
+    let pid: i32 = contents
+        .trim()
+        .parse()
+        .map_err(|e| NudgeError::InvalidPidFile(format!("bad PID value: {e}")))?;
+    if pid <= 0 {
+        return Err(NudgeError::InvalidPidFile(format!("invalid PID: {pid}")));
+    }
+    signal::kill(Pid::from_raw(pid), Signal::SIGUSR1).map_err(|e| match e {
+        nix::errno::Errno::ESRCH => NudgeError::NotRunning,
+        nix::errno::Errno::EPERM => NudgeError::PermissionDenied,
+        other => NudgeError::InvalidPidFile(format!("kill failed: {other}")),
+    })
+}
+
 /// Run the TUI application.
-pub fn run<S: JobStore>(store: &S, output_dir: &Path) -> Result<()> {
+pub fn run<S: JobStore>(store: &S, output_dir: &Path, logging_dir: &Path) -> Result<()> {
+    let pid_file = logging_dir.join("reviewq.pid");
     // Setup terminal
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -65,6 +96,26 @@ pub fn run<S: JobStore>(store: &S, output_dir: &Path) -> Result<()> {
                 app.review_text
             );
             app.view = View::Review;
+        }
+
+        // Nudge daemon if dispatch requested it.
+        if app.pending_nudge {
+            app.pending_nudge = false;
+            match nudge_daemon(&pid_file) {
+                Ok(()) => {
+                    app.status_message = Some("Nudged daemon to start review".to_owned());
+                }
+                Err(NudgeError::NotRunning) => {
+                    app.status_message = Some("Daemon is not running".to_owned());
+                }
+                Err(NudgeError::PermissionDenied) => {
+                    app.status_message = Some("Permission denied: cannot signal daemon".to_owned());
+                }
+                Err(NudgeError::InvalidPidFile(detail)) => {
+                    app.status_message =
+                        Some(format!("Daemon is not running (PID file: {detail})"));
+                }
+            }
         }
 
         if app.should_quit {
@@ -111,6 +162,7 @@ fn map_key(key: event::KeyEvent, app: &App) -> Option<Action> {
             KeyCode::Char('p') => Some(Action::ShowPrompt),
             KeyCode::Char('x') => Some(Action::CancelJob),
             KeyCode::Char('r') => Some(Action::RetryJob),
+            KeyCode::Char('s') => Some(Action::StartReview),
             KeyCode::Char('R') => Some(Action::Refresh),
             KeyCode::Char('o') => Some(Action::OpenInBrowser),
             _ => None,

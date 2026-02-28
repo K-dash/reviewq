@@ -24,6 +24,7 @@ pub enum Action {
     ShowPrompt,
     CancelJob,
     RetryJob,
+    StartReview,
     OpenInBrowser,
     GoBack,
     Refresh,
@@ -47,6 +48,8 @@ pub struct App {
     /// Path to open in the browser after dispatch completes.
     /// The event loop in `tui/mod.rs` drains this to call `open::that`.
     pub pending_open: Option<PathBuf>,
+    /// Whether to nudge the daemon to wake up and process queued jobs.
+    pub pending_nudge: bool,
 }
 
 impl App {
@@ -62,6 +65,7 @@ impl App {
             command_text: String::new(),
             output_dir,
             pending_open: None,
+            pending_nudge: false,
         }
     }
 
@@ -165,6 +169,17 @@ impl App {
                     } else {
                         self.status_message =
                             Some(format!("Job {} is not in a retriable state", job.id));
+                    }
+                }
+            }
+            Action::StartReview => {
+                if let Some(job) = self.selected_job() {
+                    if job.status == JobStatus::Queued {
+                        self.pending_nudge = true;
+                        self.status_message = Some("Nudging daemon to start review...".to_owned());
+                    } else {
+                        self.status_message =
+                            Some(format!("Job {} is not in queued state", job.id));
                     }
                 }
             }
