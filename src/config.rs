@@ -60,6 +60,7 @@ pub struct ReposConfig {
 ///     - repo: "owner/name"
 ///       skip_self_authored: false
 ///       skip_reviewer_check: true
+///       review_on_push: false
 ///       command: "claude code review"
 ///       max_concurrency: 3
 ///       base_repo_path: "/path/to/local/clone"
@@ -79,6 +80,12 @@ pub struct RepoEntry {
     /// in the `requested_reviewers` list. Useful for self-review workflows.
     #[serde(default)]
     pub skip_reviewer_check: bool,
+
+    /// Re-review on every push (force-push / additional commit). Default: true.
+    /// When false, a PR with a prior succeeded review is not re-queued on SHA
+    /// change, but in-flight reviews on stale SHAs are still canceled.
+    #[serde(default = "default_true")]
+    pub review_on_push: bool,
 
     /// Override the global `runner.command` for this repo.
     #[serde(default)]
@@ -109,6 +116,7 @@ pub struct RepoPolicy {
     pub id: crate::types::RepoId,
     pub skip_self_authored: bool,
     pub skip_reviewer_check: bool,
+    pub review_on_push: bool,
     pub command: Option<String>,
     pub prompt_template: Option<String>,
     /// Reserved for future use; not yet wired into the runner.
@@ -403,6 +411,7 @@ impl Config {
                     id: crate::types::RepoId::new(owner, name),
                     skip_self_authored: entry.skip_self_authored,
                     skip_reviewer_check: entry.skip_reviewer_check,
+                    review_on_push: entry.review_on_push,
                     command: entry.command.clone(),
                     prompt_template: entry.prompt_template.clone(),
                     max_concurrency: entry.max_concurrency,
@@ -431,10 +440,49 @@ impl Config {
                 .iter()
                 .map(|e| e.repo.as_str())
                 .collect();
-            changes.push(format!(
-                "repos.allowlist changed: {:?} -> {:?}",
-                old_repos, new_repos
-            ));
+            if old_repos != new_repos {
+                changes.push(format!(
+                    "repos.allowlist changed: {:?} -> {:?}",
+                    old_repos, new_repos
+                ));
+            }
+            // Report per-repo review_on_push changes specifically.
+            for new_entry in &new.repos.allowlist {
+                if let Some(old_entry) = old
+                    .repos
+                    .allowlist
+                    .iter()
+                    .find(|e| e.repo == new_entry.repo)
+                    .filter(|old_entry| old_entry.review_on_push != new_entry.review_on_push)
+                {
+                    changes.push(format!(
+                        "repos.allowlist[{}].review_on_push changed: {} -> {}",
+                        new_entry.repo, old_entry.review_on_push, new_entry.review_on_push
+                    ));
+                }
+            }
+            // Fallback: if repo list is the same but other per-repo settings
+            // changed (command, prompt_template, etc.), emit a generic line
+            // so the change isn't silently swallowed.
+            if old_repos == new_repos {
+                let has_other_changes = new.repos.allowlist.iter().any(|new_entry| {
+                    old.repos
+                        .allowlist
+                        .iter()
+                        .find(|e| e.repo == new_entry.repo)
+                        .is_some_and(|old_entry| {
+                            old_entry.skip_self_authored != new_entry.skip_self_authored
+                                || old_entry.skip_reviewer_check != new_entry.skip_reviewer_check
+                                || old_entry.command != new_entry.command
+                                || old_entry.prompt_template != new_entry.prompt_template
+                                || old_entry.max_concurrency != new_entry.max_concurrency
+                                || old_entry.base_repo_path != new_entry.base_repo_path
+                        })
+                });
+                if has_other_changes {
+                    changes.push("repos.allowlist per-repo settings changed".to_string());
+                }
+            }
         }
 
         if old.polling != new.polling {
@@ -849,5 +897,121 @@ cleanup:
         assert_eq!(changes.len(), 2);
         assert!(changes.iter().any(|c| c.contains("polling")));
         assert!(changes.iter().any(|c| c.contains("cleanup")));
+    }
+
+    #[test]
+    fn parse_review_on_push_false() {
+        let yaml = r#"
+repos:
+  allowlist:
+    - repo: org/repo
+      review_on_push: false
+"#;
+        let config = Config::from_yaml(yaml).expect("should parse");
+        assert!(!config.repos.allowlist[0].review_on_push);
+        let policies = config.repo_policies();
+        assert!(!policies[0].review_on_push);
+    }
+
+    #[test]
+    fn review_on_push_defaults_to_true() {
+        let yaml = r#"
+repos:
+  allowlist:
+    - repo: org/repo
+"#;
+        let config = Config::from_yaml(yaml).expect("should parse");
+        assert!(config.repos.allowlist[0].review_on_push);
+        let policies = config.repo_policies();
+        assert!(policies[0].review_on_push);
+    }
+
+    #[test]
+    fn diff_summary_detects_review_on_push_change() {
+        let old = Config::from_yaml(
+            r#"
+repos:
+  allowlist:
+    - repo: org/repo
+      review_on_push: true
+"#,
+        )
+        .expect("parse");
+        let new = Config::from_yaml(
+            r#"
+repos:
+  allowlist:
+    - repo: org/repo
+      review_on_push: false
+"#,
+        )
+        .expect("parse");
+        let changes = Config::diff_summary(&old, &new);
+        assert_eq!(changes.len(), 1);
+        assert!(changes[0].contains("review_on_push"));
+        assert!(changes[0].contains("true"));
+        assert!(changes[0].contains("false"));
+        // Should not have a generic "repos.allowlist changed" line
+        // since the repo list itself didn't change.
+        assert!(!changes[0].contains("repos.allowlist changed"));
+    }
+
+    #[test]
+    fn diff_summary_review_on_push_and_command_both_changed() {
+        let old = Config::from_yaml(
+            r#"
+repos:
+  allowlist:
+    - repo: org/repo
+      review_on_push: true
+      command: "old-cmd"
+"#,
+        )
+        .expect("parse");
+        let new = Config::from_yaml(
+            r#"
+repos:
+  allowlist:
+    - repo: org/repo
+      review_on_push: false
+      command: "new-cmd"
+"#,
+        )
+        .expect("parse");
+        let changes = Config::diff_summary(&old, &new);
+        // Should have 2 lines: specific review_on_push + generic per-repo settings
+        assert_eq!(changes.len(), 2);
+        assert!(changes.iter().any(|c| c.contains("review_on_push")));
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.contains("per-repo settings changed"))
+        );
+    }
+
+    #[test]
+    fn diff_summary_only_command_changed() {
+        let old = Config::from_yaml(
+            r#"
+repos:
+  allowlist:
+    - repo: org/repo
+      command: "old-cmd"
+"#,
+        )
+        .expect("parse");
+        let new = Config::from_yaml(
+            r#"
+repos:
+  allowlist:
+    - repo: org/repo
+      command: "new-cmd"
+"#,
+        )
+        .expect("parse");
+        let changes = Config::diff_summary(&old, &new);
+        // Should have the fallback line for other per-repo settings
+        assert_eq!(changes.len(), 1);
+        assert!(changes[0].contains("per-repo settings changed"));
     }
 }

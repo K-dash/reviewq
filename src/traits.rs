@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 
 use crate::error::Result;
 use crate::types::{
-    IdempotencyKey, Job, JobFilter, JobStatus, NewJob, PullRequest, RepoId, ReviewResult,
+    AgentKind, IdempotencyKey, Job, JobFilter, JobStatus, NewJob, PullRequest, RepoId, ReviewResult,
 };
 
 // ---------------------------------------------------------------------------
@@ -86,6 +86,12 @@ pub trait JobStore: Send + Sync {
 
     /// Re-queue a stale leased job for retry (increment retry_count, reset to queued).
     fn requeue_stale(&self, id: i64) -> Result<()>;
+
+    /// Check if a PR has already been reviewed (any SHA) by the given agent.
+    ///
+    /// Returns true when a non-failed, non-canceled job exists for the
+    /// (repo, pr_number, agent) triple, regardless of head SHA.
+    fn is_pr_reviewed(&self, repo: &RepoId, pr_number: u64, agent: &AgentKind) -> Result<bool>;
 }
 
 // ---------------------------------------------------------------------------

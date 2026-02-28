@@ -23,6 +23,19 @@ pub fn is_duplicate<S: JobStore>(
     store.is_processed(&key)
 }
 
+/// Check if a PR has already been reviewed by the given agent (ignoring SHA).
+///
+/// Used when `review_on_push` is false: a PR with a prior succeeded (or
+/// in-progress) review is not re-queued, even if the head SHA changed.
+pub fn is_duplicate_for_pr<S: JobStore>(
+    store: &S,
+    repo: &RepoId,
+    pr_number: u64,
+    agent: &AgentKind,
+) -> Result<bool> {
+    store.is_pr_reviewed(repo, pr_number, agent)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,6 +157,85 @@ mod tests {
 
         // Canceled jobs should be eligible for re-enqueueing.
         let result = is_duplicate(&db, &repo, 1, "sha1", &AgentKind::Claude);
+        assert!(!result.expect("should succeed"));
+    }
+
+    #[test]
+    fn pr_level_not_duplicate_when_no_jobs() {
+        let db = Database::open_in_memory().expect("db should open");
+        let repo = RepoId::new("owner", "repo");
+        let result = is_duplicate_for_pr(&db, &repo, 1, &AgentKind::Claude);
+        assert!(!result.expect("should succeed"));
+    }
+
+    #[test]
+    fn pr_level_duplicate_blocks_different_sha() {
+        let db = Database::open_in_memory().expect("db should open");
+        let repo = RepoId::new("owner", "repo");
+        let job = db
+            .enqueue(NewJob {
+                repo: repo.clone(),
+                pr_number: 1,
+                head_sha: "sha1".into(),
+                agent_kind: AgentKind::Claude,
+                command: None,
+                prompt_template: None,
+                max_retries: 3,
+            })
+            .expect("enqueue should succeed");
+
+        db.complete(job.id, crate::types::JobStatus::Succeeded, Some(0))
+            .expect("complete should succeed");
+
+        // Even with a different SHA, PR-level check should block.
+        let result = is_duplicate_for_pr(&db, &repo, 1, &AgentKind::Claude);
+        assert!(result.expect("should succeed"));
+    }
+
+    #[test]
+    fn pr_level_not_duplicate_when_failed() {
+        let db = Database::open_in_memory().expect("db should open");
+        let repo = RepoId::new("owner", "repo");
+        let job = db
+            .enqueue(NewJob {
+                repo: repo.clone(),
+                pr_number: 1,
+                head_sha: "sha1".into(),
+                agent_kind: AgentKind::Claude,
+                command: None,
+                prompt_template: None,
+                max_retries: 3,
+            })
+            .expect("enqueue should succeed");
+
+        db.complete(job.id, crate::types::JobStatus::Failed, Some(1))
+            .expect("complete should succeed");
+
+        // Failed jobs should be eligible for retry even at PR level.
+        let result = is_duplicate_for_pr(&db, &repo, 1, &AgentKind::Claude);
+        assert!(!result.expect("should succeed"));
+    }
+
+    #[test]
+    fn pr_level_not_duplicate_when_canceled() {
+        let db = Database::open_in_memory().expect("db should open");
+        let repo = RepoId::new("owner", "repo");
+        let job = db
+            .enqueue(NewJob {
+                repo: repo.clone(),
+                pr_number: 1,
+                head_sha: "sha1".into(),
+                agent_kind: AgentKind::Claude,
+                command: None,
+                prompt_template: None,
+                max_retries: 3,
+            })
+            .expect("enqueue should succeed");
+
+        db.cancel(job.id).expect("cancel should succeed");
+
+        // Canceled jobs should be eligible for retry even at PR level.
+        let result = is_duplicate_for_pr(&db, &repo, 1, &AgentKind::Claude);
         assert!(!result.expect("should succeed"));
     }
 }
