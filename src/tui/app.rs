@@ -1,6 +1,6 @@
 //! TUI application state and action dispatch.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::types::{Job, JobStatus};
 
@@ -145,10 +145,7 @@ impl App {
             }
             Action::ShowPrompt => {
                 if let Some(job) = self.selected_job() {
-                    self.command_text = job
-                        .command
-                        .clone()
-                        .unwrap_or_else(|| "(no command)".to_owned());
+                    self.command_text = build_prompt_display(job, &self.output_dir);
                     self.view = View::Prompt;
                 }
             }
@@ -213,6 +210,53 @@ impl App {
             self.selected_index = self.jobs.len() - 1;
         }
     }
+}
+
+/// Build the display text for the prompt view.
+///
+/// Shows the command with template variables (`{output_path}`, etc.) and
+/// `REVIEWQ_*` environment variables expanded, followed by the full rendered
+/// prompt content read from the prompt file written by the executor.
+fn build_prompt_display(job: &Job, output_dir: &Path) -> String {
+    let raw_cmd = job.command.as_deref().unwrap_or("(no command)");
+
+    // Resolve values for interpolation.
+    let repo = job.repo.full_name();
+    let pr_number = job.pr_number.to_string();
+    let pr_url = format!("https://github.com/{}/pull/{}", repo, pr_number);
+    let job_id = job.id.to_string();
+    let worktree_display = job
+        .worktree_path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<worktree>".into());
+    let output_path = job
+        .worktree_path
+        .as_ref()
+        .map(|p| p.join("REVIEW.md").display().to_string())
+        .unwrap_or_else(|| "<output_path>".into());
+    let prompt_file_path = output_dir
+        .join(format!("job-{}-prompt.txt", job.id))
+        .display()
+        .to_string();
+
+    // Expand {var} template placeholders.
+    let cmd = raw_cmd
+        .replace("{pr_url}", &pr_url)
+        .replace("{repo}", &repo)
+        .replace("{pr_number}", &pr_number)
+        .replace("{head_sha}", &job.head_sha)
+        .replace("{worktree_path}", &worktree_display)
+        .replace("{job_id}", &job_id)
+        .replace("{output_path}", &output_path)
+        .replace("{prompt_file}", &prompt_file_path);
+
+    // Read the rendered prompt from the file the executor writes.
+    let prompt_content =
+        std::fs::read_to_string(output_dir.join(format!("job-{}-prompt.txt", job.id)))
+            .unwrap_or_else(|_| "(prompt file not available)".into());
+
+    format!("── Command ──\n{cmd}\n\n── Prompt ──\n{prompt_content}")
 }
 
 /// Load log content from a job's stdout/stderr files.
@@ -359,6 +403,49 @@ mod tests {
 
         app.dispatch(Action::SelectJob);
         assert_eq!(app.view, View::Tail);
+    }
+
+    #[test]
+    fn show_prompt_displays_interpolated_command_and_prompt() {
+        let (mut app, _tmp) = make_app();
+        let mut job = make_job(1, JobStatus::Running);
+        job.command = Some("claude -p {output_path}".into());
+        job.worktree_path = Some(PathBuf::from("/tmp/wt"));
+        app.update_jobs(vec![job]);
+
+        // Write a fake prompt file.
+        let prompt_file = app.output_dir.join("job-1-prompt.txt");
+        std::fs::write(&prompt_file, "Review owner/repo PR #1").expect("write prompt file");
+
+        app.dispatch(Action::ShowPrompt);
+        assert_eq!(app.view, View::Prompt);
+        // Command should have {output_path} expanded.
+        assert!(
+            app.command_text.contains("claude -p /tmp/wt/REVIEW.md"),
+            "template vars not expanded: {}",
+            app.command_text
+        );
+        // Rendered prompt content should be present.
+        assert!(
+            app.command_text.contains("Review owner/repo PR #1"),
+            "prompt content missing: {}",
+            app.command_text
+        );
+    }
+
+    #[test]
+    fn show_prompt_without_prompt_file_shows_fallback() {
+        let (mut app, _tmp) = make_app();
+        let job = make_job(1, JobStatus::Queued);
+        app.update_jobs(vec![job]);
+
+        app.dispatch(Action::ShowPrompt);
+        assert_eq!(app.view, View::Prompt);
+        assert!(
+            app.command_text.contains("(prompt file not available)"),
+            "fallback message missing: {}",
+            app.command_text
+        );
     }
 
     #[test]
