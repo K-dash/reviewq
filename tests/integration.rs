@@ -86,12 +86,13 @@ fn job_lifecycle_cancel() {
     let _leased = db.lease_next().expect("lease");
     db.mark_running(job.id, 99999).expect("mark_running");
 
-    // Cancel the running job
-    db.cancel(job.id).expect("cancel");
+    // Request cancel, then verify it's flagged (but status unchanged).
+    db.request_cancel(job.id).expect("request_cancel");
 
     let jobs = db.list_jobs(&JobFilter::default()).expect("list");
-    let canceled = jobs.iter().find(|j| j.id == job.id).expect("find job");
-    assert_eq!(canceled.status, JobStatus::Canceled);
+    let requested = jobs.iter().find(|j| j.id == job.id).expect("find job");
+    assert_eq!(requested.status, JobStatus::Running);
+    assert!(requested.is_cancel_requested());
 }
 
 #[test]
@@ -141,6 +142,7 @@ fn make_test_job(id: i64, command: Option<&str>) -> reviewq::types::Job {
         worktree_path: None,
         review_output: None,
         session_id: None,
+        cancel_requested_at: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }

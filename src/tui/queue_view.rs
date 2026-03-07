@@ -87,7 +87,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         .jobs
         .iter()
         .map(|job| {
-            let (badge_text, badge_style) = widgets::status_badge(job.status);
+            let (badge_text, badge_style) = widgets::status_badge_for_job(job);
             Row::new(vec![
                 Cell::from(job.id.to_string()),
                 Cell::from(job.repo.full_name()),

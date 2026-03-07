@@ -393,6 +393,7 @@ mod tests {
             worktree_path: None,
             review_output: None,
             session_id: None,
+            cancel_requested_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

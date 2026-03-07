@@ -67,8 +67,19 @@ pub trait JobStore: Send + Sync {
     /// Mark a job as completed (succeeded or failed).
     fn complete(&self, id: i64, status: JobStatus, exit_code: Option<i32>) -> Result<()>;
 
-    /// Cancel a job.
-    fn cancel(&self, id: i64) -> Result<()>;
+    /// Request cancellation of a job (sets `cancel_requested_at`).
+    ///
+    /// Does NOT change the job's status — the runner is responsible for
+    /// transitioning to `Canceled` after killing the process.
+    fn request_cancel(&self, id: i64) -> Result<()>;
+
+    /// Check if a cancel has been requested for the given job.
+    fn is_cancel_requested(&self, id: i64) -> Result<bool>;
+
+    /// Sweep queued jobs that have a pending cancel request → mark them canceled.
+    ///
+    /// Returns the IDs of jobs that were canceled.
+    fn cancel_queued_requested(&self) -> Result<Vec<i64>>;
 
     /// Check if a job with the given idempotency key has been processed.
     fn is_processed(&self, key: &IdempotencyKey) -> Result<bool>;

@@ -47,6 +47,8 @@ pub struct App {
     pub pending_open: Option<PathBuf>,
     /// Whether to nudge the daemon to wake up and process queued jobs.
     pub pending_nudge: bool,
+    /// Job ID to cancel (deferred to the event loop for DB access).
+    pub pending_cancel: Option<i64>,
 }
 
 impl App {
@@ -62,6 +64,7 @@ impl App {
             output_dir,
             pending_open: None,
             pending_nudge: false,
+            pending_cancel: None,
         }
     }
 
@@ -138,8 +141,14 @@ impl App {
             }
             Action::CancelJob => {
                 if let Some(job) = self.selected_job() {
-                    if !job.status.is_terminal() {
-                        self.status_message = Some(format!("Cancel requested for job {}", job.id));
+                    if job.is_cancel_requested() {
+                        self.status_message =
+                            Some(format!("Cancel already requested for job {}", job.id));
+                    } else if !job.status.is_terminal() {
+                        let job_id = job.id;
+                        self.pending_cancel = Some(job_id);
+                        self.pending_nudge = true;
+                        self.status_message = Some(format!("Cancel requested for job {}", job_id));
                     } else {
                         self.status_message =
                             Some(format!("Job {} is already in terminal state", job.id));
@@ -301,6 +310,7 @@ mod tests {
             worktree_path: None,
             review_output: None,
             session_id: None,
+            cancel_requested_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

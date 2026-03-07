@@ -68,6 +68,21 @@ where
         // Recover stale leases before polling for new work.
         recover_stale_jobs(&*store);
 
+        // Sweep queued jobs with pending cancel requests.
+        match store.cancel_queued_requested() {
+            Ok(ids) => {
+                for id in &ids {
+                    info!(
+                        job_id = id,
+                        "canceled queued job with pending cancel request"
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to sweep cancel-requested queued jobs");
+            }
+        }
+
         // Acquire concurrency permit, but also listen for shutdown so we
         // don't block here indefinitely when a shutdown is requested.
         let permit = tokio::select! {
@@ -169,15 +184,34 @@ async fn execute_job<S: JobStore, E: ReviewExecutor>(
         warn!(job_id = job.id, error = %e, "failed to store worktree_path");
     }
 
+    // Check cancel before even starting execution.
+    if store.is_cancel_requested(job.id).unwrap_or(false) {
+        info!(
+            job_id = job.id,
+            "cancel requested before execution, marking canceled"
+        );
+        let _ = store.complete(job.id, JobStatus::Canceled, None);
+        return;
+    }
+
     let (pid_tx, mut pid_rx) = oneshot::channel();
     let mut execution = std::pin::pin!(executor.execute(&job, &worktree_path, Some(pid_tx)));
     let mut running_marked = false;
+    let mut cancel_sent = false;
 
     let execution_result = loop {
         tokio::select! {
             pid = &mut pid_rx, if !running_marked => {
                 match pid {
                     Ok(pid) => {
+                        // Check cancel before transitioning to running.
+                        if store.is_cancel_requested(job.id).unwrap_or(false) {
+                            info!(job_id = job.id, pid, "cancel requested during leased window");
+                            let _ = executor.cancel(&job).await;
+                            let _ = executor.clear_active_pid(job.id);
+                            let _ = store.complete(job.id, JobStatus::Canceled, None);
+                            return;
+                        }
                         if let Err(e) = store.mark_running(job.id, pid) {
                             error!(job_id = job.id, pid, error = %e, "failed to mark job as running");
                             let _ = executor.cancel(&job).await;
@@ -192,6 +226,15 @@ async fn execute_job<S: JobStore, E: ReviewExecutor>(
                 }
                 running_marked = true;
             }
+            // Poll for cancel requests every 2 seconds while running.
+            _ = tokio::time::sleep(std::time::Duration::from_secs(2)), if running_marked && !cancel_sent => {
+                if store.is_cancel_requested(job.id).unwrap_or(false) {
+                    info!(job_id = job.id, "cancel requested, killing review process");
+                    let _ = executor.cancel(&job).await;
+                    cancel_sent = true;
+                    // Don't break — let execution future complete naturally after kill.
+                }
+            }
             result = &mut execution => break result,
         }
     };
@@ -199,6 +242,16 @@ async fn execute_job<S: JobStore, E: ReviewExecutor>(
     if !running_marked {
         match pid_rx.try_recv() {
             Ok(pid) => {
+                // Check cancel before transitioning to running.
+                if store.is_cancel_requested(job.id).unwrap_or(false) {
+                    info!(
+                        job_id = job.id,
+                        pid, "cancel requested during leased window (post-exec)"
+                    );
+                    let _ = executor.clear_active_pid(job.id);
+                    let _ = store.complete(job.id, JobStatus::Canceled, None);
+                    return;
+                }
                 if let Err(e) = store.mark_running(job.id, pid) {
                     error!(job_id = job.id, pid, error = %e, "failed to mark job as running");
                     let _ = executor.cancel(&job).await;
@@ -214,6 +267,9 @@ async fn execute_job<S: JobStore, E: ReviewExecutor>(
         }
     }
 
+    // If cancel was requested, final status is Canceled regardless of exit code.
+    let was_cancel_requested = cancel_sent || store.is_cancel_requested(job.id).unwrap_or(false);
+
     match execution_result {
         Ok(result) => {
             // Persist log file paths so TUI and CLI tail can find them.
@@ -221,7 +277,9 @@ async fn execute_job<S: JobStore, E: ReviewExecutor>(
                 let _ = store.store_log_paths(job.id, stdout, stderr);
             }
 
-            let status = if result.exit_code == 0 {
+            let status = if was_cancel_requested {
+                JobStatus::Canceled
+            } else if result.exit_code == 0 {
                 JobStatus::Succeeded
             } else {
                 JobStatus::Failed
@@ -248,8 +306,13 @@ async fn execute_job<S: JobStore, E: ReviewExecutor>(
             }
         }
         Err(e) => {
-            warn!(job_id = job.id, error = %e, "review execution failed");
-            let _ = store.complete(job.id, JobStatus::Failed, None);
+            let status = if was_cancel_requested {
+                JobStatus::Canceled
+            } else {
+                JobStatus::Failed
+            };
+            warn!(job_id = job.id, error = %e, %status, "review execution failed");
+            let _ = store.complete(job.id, status, None);
         }
     }
 
@@ -269,7 +332,13 @@ fn recover_stale_jobs<S: JobStore>(store: &S) {
     };
 
     for job in stale {
-        if job.retry_count >= job.max_retries {
+        if job.is_cancel_requested() {
+            info!(
+                job_id = job.id,
+                "stale lease with cancel request, marking canceled"
+            );
+            let _ = store.complete(job.id, JobStatus::Canceled, None);
+        } else if job.retry_count >= job.max_retries {
             warn!(
                 job_id = job.id,
                 "stale lease exceeded max retries, marking failed"
@@ -298,13 +367,41 @@ fn recover_stale_jobs<S: JobStore>(store: &S) {
 
     for job in running {
         let Some(pid) = job.pid else {
-            warn!(
-                job_id = job.id,
-                "running job has no recorded PID, re-queuing"
-            );
-            let _ = store.requeue_running(job.id);
+            if job.is_cancel_requested() {
+                info!(
+                    job_id = job.id,
+                    "orphaned running job (no PID) with cancel request, marking canceled"
+                );
+                let _ = store.complete(job.id, JobStatus::Canceled, None);
+            } else {
+                warn!(
+                    job_id = job.id,
+                    "running job has no recorded PID, re-queuing"
+                );
+                let _ = store.requeue_running(job.id);
+            }
             continue;
         };
+
+        if job.is_cancel_requested() {
+            if is_process_alive(pid) {
+                info!(
+                    job_id = job.id,
+                    pid, "cancel requested for running job with live PID, killing process group"
+                );
+                kill_process_group(pid);
+                // Re-check after kill — if still alive, leave for next recovery cycle.
+                if is_process_alive(pid) {
+                    warn!(
+                        job_id = job.id,
+                        pid, "process still alive after SIGKILL, deferring cancel"
+                    );
+                    continue;
+                }
+            }
+            let _ = store.complete(job.id, JobStatus::Canceled, None);
+            continue;
+        }
 
         if is_process_alive(pid) {
             continue;
@@ -333,6 +430,21 @@ fn is_process_alive(pid: u32) -> bool {
         return false;
     };
     signal::kill(Pid::from_raw(raw_pid), None).is_ok()
+}
+
+/// Send SIGKILL to a process group during crash recovery.
+///
+/// Unlike the staged `cancel::cancel_process_group`, this is a synchronous
+/// best-effort kill used only in `recover_stale_jobs` where we don't have
+/// an async context or CancelConfig.
+fn kill_process_group(pid: u32) {
+    let Ok(raw_pid) = i32::try_from(pid) else {
+        return;
+    };
+    let pgid = Pid::from_raw(-raw_pid);
+    if let Err(e) = signal::kill(pgid, signal::Signal::SIGKILL) {
+        warn!(pid, error = %e, "failed to SIGKILL process group during recovery");
+    }
 }
 
 #[cfg(test)]

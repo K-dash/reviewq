@@ -6,7 +6,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::types::JobStatus;
+use crate::types::{Job, JobStatus};
 
 // ── Theme constants ──────────────────────────────────────────────
 
@@ -63,6 +63,19 @@ pub fn status_badge(status: JobStatus) -> (String, Style) {
         .fg(status_color(status))
         .add_modifier(Modifier::BOLD);
     (label.to_owned(), style)
+}
+
+/// Format a job's status badge, showing "CANCELING" when a cancel has been
+/// requested but the job has not yet reached a terminal state.
+pub fn status_badge_for_job(job: &Job) -> (String, Style) {
+    if job.is_cancel_requested() && !job.status.is_terminal() {
+        let style = Style::default()
+            .fg(Color::Indexed(208)) // orange
+            .add_modifier(Modifier::BOLD);
+        ("CANCELING".to_owned(), style)
+    } else {
+        status_badge(job.status)
+    }
 }
 
 // ── Formatting helpers ───────────────────────────────────────────

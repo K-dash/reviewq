@@ -684,7 +684,8 @@ polling:
             .expect("should succeed");
         assert_eq!(count1, 1);
 
-        // Second cycle with new SHA — old job should be canceled, new one queued
+        // Second cycle with new SHA — old job gets cancel_requested but is still
+        // active (not yet swept by runner), so new job is NOT enqueued yet.
         let github2 = MockGitHub {
             username: "bob".into(),
             prs: vec![make_pr(1, "new_sha")],
@@ -693,21 +694,27 @@ polling:
             .await
             .expect("should succeed");
         assert_eq!(
-            count2, 1,
-            "first review should still be queued on SHA change"
+            count2, 0,
+            "old job still active (cancel_requested but not canceled), blocks new enqueue"
         );
 
-        // Verify: old job canceled, new job queued
+        // Verify: old job has cancel_requested
         let all_jobs = db.list_jobs(&JobFilter::default()).expect("list");
-        assert_eq!(all_jobs.len(), 2);
-        let canceled = db
-            .list_jobs(&JobFilter {
-                status: Some(crate::types::JobStatus::Canceled),
-                ..Default::default()
-            })
-            .expect("list");
-        assert_eq!(canceled.len(), 1);
-        assert_eq!(canceled[0].head_sha, "old_sha");
+        assert_eq!(all_jobs.len(), 1);
+        assert!(all_jobs[0].is_cancel_requested());
+        assert_eq!(all_jobs[0].head_sha, "old_sha");
+
+        // Simulate runner sweeping the cancel-requested queued job.
+        db.cancel_queued_requested().expect("sweep");
+
+        // Third cycle: now the old job is canceled, new job should be enqueued.
+        let count3 = detect_once(&github2, &db, &config, "bob", &repo_ids, &policies)
+            .await
+            .expect("should succeed");
+        assert_eq!(
+            count3, 1,
+            "new job should be enqueued after old is canceled"
+        );
     }
 
     #[tokio::test]
@@ -796,7 +803,8 @@ polling:
         let leased = db.lease_next().expect("lease").expect("should have job");
         assert_eq!(leased.status, crate::types::JobStatus::Leased);
 
-        // Second cycle with new SHA — leased job should be canceled, new one queued
+        // Second cycle with new SHA — leased job gets cancel_requested but is
+        // still active, so new job is NOT enqueued yet.
         let github2 = MockGitHub {
             username: "bob".into(),
             prs: vec![make_pr(1, "new_sha")],
@@ -805,18 +813,28 @@ polling:
             .await
             .expect("should succeed");
         assert_eq!(
-            count2, 1,
-            "leased job on old SHA should be canceled and new job queued"
+            count2, 0,
+            "leased job still active (cancel_requested but not canceled)"
         );
 
-        let canceled = db
-            .list_jobs(&JobFilter {
-                status: Some(crate::types::JobStatus::Canceled),
-                ..Default::default()
-            })
-            .expect("list");
-        assert_eq!(canceled.len(), 1);
-        assert_eq!(canceled[0].head_sha, "old_sha");
+        // Verify cancel was requested on the leased job.
+        let all_jobs = db.list_jobs(&JobFilter::default()).expect("list");
+        assert_eq!(all_jobs.len(), 1);
+        assert!(all_jobs[0].is_cancel_requested());
+        assert_eq!(all_jobs[0].head_sha, "old_sha");
+
+        // Simulate runner completing the cancel (leased → canceled via complete()).
+        db.complete(leased.id, crate::types::JobStatus::Canceled, None)
+            .expect("complete canceled");
+
+        // Third cycle: now the old job is canceled, new job should be enqueued.
+        let count3 = detect_once(&github2, &db, &config, "bob", &repo_ids, &policies)
+            .await
+            .expect("should succeed");
+        assert_eq!(
+            count3, 1,
+            "new job should be enqueued after old is canceled"
+        );
     }
 
     #[tokio::test]
@@ -943,7 +961,8 @@ polling:
         let leased = db.lease_next().expect("lease").expect("should have job");
         db.mark_running(leased.id, 12345).expect("mark running");
 
-        // Second cycle with new SHA — running job should be canceled, new one queued
+        // Second cycle with new SHA — running job gets cancel_requested but is
+        // still active, so new job is NOT enqueued yet.
         let github2 = MockGitHub {
             username: "bob".into(),
             prs: vec![make_pr(1, "new_sha")],
@@ -952,18 +971,28 @@ polling:
             .await
             .expect("should succeed");
         assert_eq!(
-            count2, 1,
-            "running job on old SHA should be canceled and new job queued"
+            count2, 0,
+            "running job still active (cancel_requested but not canceled)"
         );
 
-        let canceled = db
-            .list_jobs(&JobFilter {
-                status: Some(crate::types::JobStatus::Canceled),
-                ..Default::default()
-            })
-            .expect("list");
-        assert_eq!(canceled.len(), 1);
-        assert_eq!(canceled[0].head_sha, "old_sha");
+        // Verify cancel was requested on the running job.
+        let all_jobs = db.list_jobs(&JobFilter::default()).expect("list");
+        assert_eq!(all_jobs.len(), 1);
+        assert!(all_jobs[0].is_cancel_requested());
+        assert_eq!(all_jobs[0].head_sha, "old_sha");
+
+        // Simulate runner completing the cancel.
+        db.complete(leased.id, crate::types::JobStatus::Canceled, None)
+            .expect("complete canceled");
+
+        // Third cycle: now the old job is canceled, new job should be enqueued.
+        let count3 = detect_once(&github2, &db, &config, "bob", &repo_ids, &policies)
+            .await
+            .expect("should succeed");
+        assert_eq!(
+            count3, 1,
+            "new job should be enqueued after old is canceled"
+        );
     }
 
     fn test_config_with_ignore_prs() -> Config {
