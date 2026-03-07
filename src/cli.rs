@@ -1,6 +1,7 @@
 //! CLI subcommand implementations: status, tail, open.
 
 use std::io::{self, BufRead, Seek, SeekFrom};
+use std::path::Path;
 
 use crate::db::Database;
 use crate::error::{Result, ReviewqError};
@@ -49,7 +50,7 @@ pub fn status(db: &Database, status_filter: Option<&str>, repo_filter: Option<&s
 ///
 /// If the job is still running, polls the file for new content until the job
 /// finishes or the user interrupts with Ctrl-C.
-pub fn tail(db: &Database, job_id: i64) -> Result<()> {
+pub fn tail(db: &Database, job_id: i64, output_dir: &Path) -> Result<()> {
     let jobs = db.list_jobs(&JobFilter {
         pr_number: None,
         status: None,
@@ -61,10 +62,9 @@ pub fn tail(db: &Database, job_id: i64) -> Result<()> {
         .find(|j| j.id == job_id)
         .ok_or_else(|| ReviewqError::Process(format!("job {job_id} not found")))?;
 
-    let log_path = job
-        .stdout_path
-        .as_ref()
-        .ok_or_else(|| ReviewqError::Process(format!("job {job_id} has no log file")))?;
+    // Use persisted path, falling back to derived path for old jobs.
+    let fallback = output_dir.join(format!("job-{job_id}-stdout.log"));
+    let log_path = job.stdout_path.as_deref().unwrap_or(&fallback);
 
     if !log_path.exists() {
         return Err(ReviewqError::Process(format!(
@@ -258,5 +258,48 @@ mod tests {
         let db = test_db();
         let result = open_target(&db, "999");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn tail_falls_back_to_output_dir_when_no_stored_path() {
+        let db = test_db();
+        let job = db.enqueue(sample_job("abc123")).expect("enqueue");
+        // Mark terminal so tail() doesn't enter the polling loop.
+        db.complete(job.id, JobStatus::Succeeded, Some(0))
+            .expect("complete");
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let log_file = tmp.path().join(format!("job-{}-stdout.log", job.id));
+        std::fs::write(&log_file, "fallback log content").expect("write");
+
+        // Job has no stdout_path in DB, but the fallback file exists.
+        let result = tail(&db, job.id, tmp.path());
+        assert!(
+            result.is_ok(),
+            "tail should succeed via fallback: {result:?}"
+        );
+    }
+
+    #[test]
+    fn tail_uses_stored_path_when_available() {
+        let db = test_db();
+        let job = db.enqueue(sample_job("abc123")).expect("enqueue");
+        // Mark terminal so tail() doesn't enter the polling loop.
+        db.complete(job.id, JobStatus::Succeeded, Some(0))
+            .expect("complete");
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let log_file = tmp.path().join("stored-stdout.log");
+        std::fs::write(&log_file, "stored log content").expect("write");
+
+        // Store the path in DB.
+        db.store_log_paths(job.id, &log_file, &tmp.path().join("stderr.log"))
+            .expect("store");
+
+        let result = tail(&db, job.id, tmp.path());
+        assert!(
+            result.is_ok(),
+            "tail should succeed via stored path: {result:?}"
+        );
     }
 }

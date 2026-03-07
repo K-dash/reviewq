@@ -124,6 +124,11 @@ pub fn run<S: JobStore>(store: &S, output_dir: &Path, logging_dir: &Path) -> Res
 
         // Periodic refresh from the store
         app.update_jobs(store.list_jobs(&JobFilter::default())?);
+
+        // Auto-refresh tail view content.
+        if app.view == View::Tail {
+            app.refresh_tail_log();
+        }
     }
 
     // Restore terminal

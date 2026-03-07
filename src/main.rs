@@ -80,7 +80,7 @@ async fn run(cli: Cli) -> reviewq::error::Result<()> {
         }
         Some(Commands::Tail { job_id }) => {
             let db = reviewq::db::Database::open(&config.state.sqlite_path)?;
-            reviewq::cli::tail(&db, job_id)
+            reviewq::cli::tail(&db, job_id, &config.output.dir)
         }
         Some(Commands::Open { target }) => {
             let db = reviewq::db::Database::open(&config.state.sqlite_path)?;

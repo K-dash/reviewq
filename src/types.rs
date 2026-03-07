@@ -418,6 +418,8 @@ pub struct ReviewResult {
     pub exit_code: i32,
     pub review_markdown: Option<String>,
     pub session_id: Option<String>,
+    pub stdout_path: Option<PathBuf>,
+    pub stderr_path: Option<PathBuf>,
 }
 
 #[cfg(test)]

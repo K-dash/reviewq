@@ -51,6 +51,8 @@ pub struct App {
     pub pending_open: Option<PathBuf>,
     /// Whether to nudge the daemon to wake up and process queued jobs.
     pub pending_nudge: bool,
+    /// Job ID being tailed (for auto-refresh).
+    pub tail_job_id: Option<i64>,
 }
 
 impl App {
@@ -67,6 +69,7 @@ impl App {
             output_dir,
             pending_open: None,
             pending_nudge: false,
+            tail_job_id: None,
         }
     }
 
@@ -131,16 +134,20 @@ impl App {
                     } else {
                         // No review output yet — fall back to tail view so the
                         // user can see logs (useful for running / queued jobs).
-                        let content = load_log_content(job);
+                        let job_id = job.id;
+                        let content = load_log_content(job, &self.output_dir);
                         self.log_content = content;
+                        self.tail_job_id = Some(job_id);
                         self.view = View::Tail;
                     }
                 }
             }
             Action::TailLog => {
                 if let Some(job) = self.selected_job() {
-                    let content = load_log_content(job);
+                    let job_id = job.id;
+                    let content = load_log_content(job, &self.output_dir);
                     self.log_content = content;
+                    self.tail_job_id = Some(job_id);
                     self.view = View::Tail;
                 }
             }
@@ -215,6 +222,7 @@ impl App {
             Action::GoBack => {
                 self.view = View::Queue;
                 self.status_message = None;
+                self.tail_job_id = None;
             }
             Action::Refresh => {
                 self.status_message = Some("Refreshing...".to_owned());
@@ -230,6 +238,24 @@ impl App {
             self.selected_index = 0;
         } else if self.selected_index >= self.jobs.len() {
             self.selected_index = self.jobs.len() - 1;
+        }
+    }
+
+    /// Refresh tail log content from the tailed job.
+    ///
+    /// If the tailed job is no longer in the job list, automatically
+    /// returns to the Queue view.
+    pub fn refresh_tail_log(&mut self) {
+        let Some(job_id) = self.tail_job_id else {
+            return;
+        };
+        if let Some(job) = self.jobs.iter().find(|j| j.id == job_id) {
+            self.log_content = load_log_content(job, &self.output_dir);
+        } else {
+            // Job disappeared — return to queue view.
+            self.view = View::Queue;
+            self.tail_job_id = None;
+            self.status_message = Some(format!("Job {job_id} no longer exists"));
         }
     }
 }
@@ -282,34 +308,36 @@ fn build_prompt_display(job: &Job, output_dir: &Path) -> String {
 }
 
 /// Load log content from a job's stdout/stderr files.
-fn load_log_content(job: &Job) -> String {
+///
+/// Uses `job.stdout_path`/`job.stderr_path` when available, falling back to
+/// deriving paths from `output_dir` (for jobs created before log paths were
+/// persisted to the DB).
+fn load_log_content(job: &Job, output_dir: &Path) -> String {
+    let stdout_fallback = output_dir.join(format!("job-{}-stdout.log", job.id));
+    let stderr_fallback = output_dir.join(format!("job-{}-stderr.log", job.id));
+
+    let stdout_path = job.stdout_path.as_deref().unwrap_or(&stdout_fallback);
+    let stderr_path = job.stderr_path.as_deref().unwrap_or(&stderr_fallback);
+
     let mut content = String::new();
 
-    if let Some(ref path) = job.stdout_path {
-        match std::fs::read_to_string(path) {
-            Ok(text) => {
-                content.push_str("=== stdout ===\n");
-                content.push_str(&text);
-            }
-            Err(e) => {
-                content.push_str(&format!("(unable to read stdout: {e})\n"));
-            }
+    match std::fs::read_to_string(stdout_path) {
+        Ok(text) if !text.is_empty() => {
+            content.push_str("=== stdout ===\n");
+            content.push_str(&text);
         }
+        _ => {}
     }
 
-    if let Some(ref path) = job.stderr_path {
-        match std::fs::read_to_string(path) {
-            Ok(text) => {
-                if !content.is_empty() {
-                    content.push('\n');
-                }
-                content.push_str("=== stderr ===\n");
-                content.push_str(&text);
+    match std::fs::read_to_string(stderr_path) {
+        Ok(text) if !text.is_empty() => {
+            if !content.is_empty() {
+                content.push('\n');
             }
-            Err(e) => {
-                content.push_str(&format!("(unable to read stderr: {e})\n"));
-            }
+            content.push_str("=== stderr ===\n");
+            content.push_str(&text);
         }
+        _ => {}
     }
 
     if content.is_empty() {
@@ -506,5 +534,71 @@ mod tests {
             app.status_message.as_deref(),
             Some("No session ID available")
         );
+    }
+
+    #[test]
+    fn load_log_content_derives_paths_from_output_dir() {
+        let tmp = TempDir::new().expect("temp dir");
+        let stdout_file = tmp.path().join("job-1-stdout.log");
+        let stderr_file = tmp.path().join("job-1-stderr.log");
+        std::fs::write(&stdout_file, "hello stdout").expect("write");
+        std::fs::write(&stderr_file, "hello stderr").expect("write");
+
+        // Job has no stdout_path/stderr_path — should fall back to output_dir.
+        let job = make_job(1, JobStatus::Running);
+        let content = load_log_content(&job, tmp.path());
+        assert!(
+            content.contains("hello stdout"),
+            "stdout missing: {content}"
+        );
+        assert!(
+            content.contains("hello stderr"),
+            "stderr missing: {content}"
+        );
+    }
+
+    #[test]
+    fn load_log_content_prefers_stored_paths() {
+        let tmp = TempDir::new().expect("temp dir");
+        let stored_stdout = tmp.path().join("stored-stdout.log");
+        std::fs::write(&stored_stdout, "from stored path").expect("write");
+
+        let mut job = make_job(1, JobStatus::Running);
+        job.stdout_path = Some(stored_stdout);
+        let content = load_log_content(&job, tmp.path());
+        assert!(
+            content.contains("from stored path"),
+            "stored path not used: {content}"
+        );
+    }
+
+    #[test]
+    fn tail_log_sets_tail_job_id() {
+        let (mut app, _tmp) = make_app();
+        app.update_jobs(vec![make_job(1, JobStatus::Running)]);
+
+        app.dispatch(Action::TailLog);
+        assert_eq!(app.view, View::Tail);
+        assert_eq!(app.tail_job_id, Some(1));
+
+        app.dispatch(Action::GoBack);
+        assert_eq!(app.view, View::Queue);
+        assert_eq!(app.tail_job_id, None);
+    }
+
+    #[test]
+    fn refresh_tail_log_returns_to_queue_when_job_disappears() {
+        let (mut app, _tmp) = make_app();
+        app.update_jobs(vec![make_job(1, JobStatus::Running)]);
+        app.dispatch(Action::TailLog);
+        assert_eq!(app.view, View::Tail);
+
+        // Simulate job disappearing from the list.
+        app.update_jobs(vec![]);
+        app.refresh_tail_log();
+
+        assert_eq!(app.view, View::Queue);
+        assert_eq!(app.tail_job_id, None);
+        assert!(app.status_message.is_some());
     }
 }

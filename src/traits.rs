@@ -93,6 +93,9 @@ pub trait JobStore: Send + Sync {
     /// Re-queue a stale leased job for retry (increment retry_count, reset to queued).
     fn requeue_stale(&self, id: i64) -> Result<()>;
 
+    /// Store the stdout/stderr log file paths for a job.
+    fn store_log_paths(&self, id: i64, stdout: &Path, stderr: &Path) -> Result<()>;
+
     /// Check if a PR has already been reviewed (any SHA) by the given agent.
     ///
     /// Returns true when a non-failed, non-canceled job exists for the
