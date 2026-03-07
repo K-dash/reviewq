@@ -87,9 +87,9 @@ pub struct RepoEntry {
     #[serde(default = "default_true")]
     pub review_on_push: bool,
 
-    /// Override the global `runner.command` for this repo.
+    /// Override the global `runner.agent` for this repo.
     #[serde(default)]
-    pub command: Option<String>,
+    pub agent: Option<crate::types::AgentKind>,
 
     /// Override the global `runner.prompt_template` for this repo.
     #[serde(default)]
@@ -117,7 +117,7 @@ pub struct RepoPolicy {
     pub skip_self_authored: bool,
     pub skip_reviewer_check: bool,
     pub review_on_push: bool,
-    pub command: Option<String>,
+    pub agent: Option<crate::types::AgentKind>,
     pub prompt_template: Option<String>,
     /// Reserved for future use; not yet wired into the runner.
     pub max_concurrency: Option<usize>,
@@ -206,11 +206,12 @@ fn default_lease_minutes() -> i64 {
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunnerConfig {
+    /// The agent to use for reviews (claude or codex). Default: claude.
     #[serde(default)]
-    pub command: Option<String>,
+    pub agent: Option<crate::types::AgentKind>,
 
     /// Prompt template for the AI review agent.
-    /// Supports the same template variables as `command`.
+    /// Supports the same template variables as the command.
     /// The rendered prompt is available as `{prompt}` and `{prompt_file}` in the command.
     #[serde(default)]
     pub prompt_template: Option<String>,
@@ -412,7 +413,7 @@ impl Config {
                     skip_self_authored: entry.skip_self_authored,
                     skip_reviewer_check: entry.skip_reviewer_check,
                     review_on_push: entry.review_on_push,
-                    command: entry.command.clone(),
+                    agent: entry.agent.clone(),
                     prompt_template: entry.prompt_template.clone(),
                     max_concurrency: entry.max_concurrency,
                     base_repo_path: entry.base_repo_path.clone(),
@@ -473,7 +474,7 @@ impl Config {
                         .is_some_and(|old_entry| {
                             old_entry.skip_self_authored != new_entry.skip_self_authored
                                 || old_entry.skip_reviewer_check != new_entry.skip_reviewer_check
-                                || old_entry.command != new_entry.command
+                                || old_entry.agent != new_entry.agent
                                 || old_entry.prompt_template != new_entry.prompt_template
                                 || old_entry.max_concurrency != new_entry.max_concurrency
                                 || old_entry.base_repo_path != new_entry.base_repo_path
@@ -517,10 +518,10 @@ impl Config {
             ));
         }
 
-        if old.runner.command != new.runner.command {
+        if old.runner.agent != new.runner.agent {
             changes.push(format!(
-                "runner.command changed: {:?} -> {:?}",
-                old.runner.command, new.runner.command
+                "runner.agent changed: {:?} -> {:?} (restart required)",
+                old.runner.agent, new.runner.agent
             ));
         }
 
@@ -606,7 +607,7 @@ repos:
         assert_eq!(config.repos.allowlist.len(), 1);
         assert_eq!(config.repos.allowlist[0].repo, "owner/repo");
         assert!(config.repos.allowlist[0].skip_self_authored);
-        assert!(config.repos.allowlist[0].command.is_none());
+        assert!(config.repos.allowlist[0].agent.is_none());
         assert!(config.repos.allowlist[0].max_concurrency.is_none());
         assert_eq!(config.polling.interval_seconds, 300);
         assert_eq!(config.execution.max_concurrency, 10);
@@ -619,7 +620,7 @@ repos:
   allowlist:
     - repo: org/repo1
       skip_self_authored: false
-      command: "claude review"
+      agent: codex
       max_concurrency: 3
     - repo: org/repo2
 "#;
@@ -629,13 +630,13 @@ repos:
         let e0 = &config.repos.allowlist[0];
         assert_eq!(e0.repo, "org/repo1");
         assert!(!e0.skip_self_authored);
-        assert_eq!(e0.command.as_deref(), Some("claude review"));
+        assert_eq!(e0.agent, Some(crate::types::AgentKind::Codex));
         assert_eq!(e0.max_concurrency, Some(3));
 
         let e1 = &config.repos.allowlist[1];
         assert_eq!(e1.repo, "org/repo2");
         assert!(e1.skip_self_authored);
-        assert!(e1.command.is_none());
+        assert!(e1.agent.is_none());
         assert!(e1.max_concurrency.is_none());
     }
 
@@ -646,7 +647,7 @@ repos:
   allowlist:
     - repo: org/repo
       skip_self_authored: false
-      command: "echo review"
+      agent: codex
       max_concurrency: 2
 "#;
         let config = Config::from_yaml(yaml).expect("should parse");
@@ -654,7 +655,7 @@ repos:
         assert_eq!(policies.len(), 1);
         assert_eq!(policies[0].id, crate::types::RepoId::new("org", "repo"));
         assert!(!policies[0].skip_self_authored);
-        assert_eq!(policies[0].command.as_deref(), Some("echo review"));
+        assert_eq!(policies[0].agent, Some(crate::types::AgentKind::Codex));
         assert_eq!(policies[0].max_concurrency, Some(2));
     }
 
@@ -713,7 +714,7 @@ repos:
   allowlist:
     - repo: owner/repo
 runner:
-  command: "claude -p '{prompt}'"
+  agent: claude
   prompt_template: "Review {pr_url}"
 "#;
         let config = Config::from_yaml(yaml).expect("should parse");
@@ -721,6 +722,7 @@ runner:
             config.runner.prompt_template.as_deref(),
             Some("Review {pr_url}")
         );
+        assert_eq!(config.runner.agent, Some(crate::types::AgentKind::Claude));
     }
 
     #[test]
@@ -957,14 +959,14 @@ repos:
     }
 
     #[test]
-    fn diff_summary_review_on_push_and_command_both_changed() {
+    fn diff_summary_review_on_push_and_agent_both_changed() {
         let old = Config::from_yaml(
             r#"
 repos:
   allowlist:
     - repo: org/repo
       review_on_push: true
-      command: "old-cmd"
+      agent: claude
 "#,
         )
         .expect("parse");
@@ -974,7 +976,7 @@ repos:
   allowlist:
     - repo: org/repo
       review_on_push: false
-      command: "new-cmd"
+      agent: codex
 "#,
         )
         .expect("parse");
@@ -990,13 +992,13 @@ repos:
     }
 
     #[test]
-    fn diff_summary_only_command_changed() {
+    fn diff_summary_only_agent_changed() {
         let old = Config::from_yaml(
             r#"
 repos:
   allowlist:
     - repo: org/repo
-      command: "old-cmd"
+      agent: claude
 "#,
         )
         .expect("parse");
@@ -1005,7 +1007,7 @@ repos:
 repos:
   allowlist:
     - repo: org/repo
-      command: "new-cmd"
+      agent: codex
 "#,
         )
         .expect("parse");

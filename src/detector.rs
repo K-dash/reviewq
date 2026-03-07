@@ -12,7 +12,7 @@ use tracing::{error, info, warn};
 use crate::config::{Config, RepoPolicy};
 use crate::error::Result;
 use crate::traits::{GitHubClient, JobStore};
-use crate::types::{AgentKind, NewJob, RepoId};
+use crate::types::{NewJob, RepoId};
 
 /// Run the detector loop.
 ///
@@ -92,7 +92,7 @@ where
 
     info!(pr_count = prs.len(), "fetched PRs from GitHub");
 
-    let agent_kind = AgentKind::default();
+    let global_agent = config.runner.agent.clone().unwrap_or_default();
     let mut enqueued = 0;
 
     for pr in &prs {
@@ -106,6 +106,11 @@ where
         if !crate::rules::should_process(pr, username, repo_ids, skip_self, skip_reviewer) {
             continue;
         }
+
+        // Resolve agent kind: per-repo override > global config > default (Claude).
+        let agent_kind = policy
+            .and_then(|p| p.agent.clone())
+            .unwrap_or_else(|| global_agent.clone());
 
         // Handle SHA changes (cancel stale jobs) — always runs regardless
         // of review_on_push to prevent stale reviews from completing.
@@ -130,10 +135,8 @@ where
             continue;
         }
 
-        // Resolve command: per-repo override > global runner.command.
-        let command = policy
-            .and_then(|p| p.command.clone())
-            .or_else(|| config.runner.command.clone());
+        // Generate command from resolved agent kind.
+        let command = Some(agent_kind.default_command().to_owned());
 
         // Resolve prompt_template: per-repo override > global runner.prompt_template.
         let prompt_template = policy
@@ -339,7 +342,7 @@ polling:
     }
 
     #[tokio::test]
-    async fn per_repo_command_overrides_global() {
+    async fn per_repo_agent_overrides_global() {
         let github = MockGitHub {
             username: "bob".into(),
             prs: vec![make_pr(1, "sha1")],
@@ -350,9 +353,9 @@ polling:
 repos:
   allowlist:
     - repo: org/repo
-      command: "per-repo-cmd"
+      agent: codex
 runner:
-  command: "global-cmd"
+  agent: claude
 polling:
   interval_seconds: 60
 "#,
@@ -367,11 +370,16 @@ polling:
         assert_eq!(count, 1);
 
         let jobs = db.list_jobs(&JobFilter::default()).expect("list");
-        assert_eq!(jobs[0].command.as_deref(), Some("per-repo-cmd"));
+        assert_eq!(jobs[0].agent_kind, crate::types::AgentKind::Codex);
+        assert!(
+            jobs[0].command.as_deref().unwrap().contains("codex exec"),
+            "command should be codex default: {:?}",
+            jobs[0].command
+        );
     }
 
     #[tokio::test]
-    async fn global_command_used_when_no_per_repo_override() {
+    async fn global_agent_used_when_no_per_repo_override() {
         let github = MockGitHub {
             username: "bob".into(),
             prs: vec![make_pr(1, "sha1")],
@@ -383,7 +391,7 @@ repos:
   allowlist:
     - repo: org/repo
 runner:
-  command: "global-cmd"
+  agent: codex
 polling:
   interval_seconds: 60
 "#,
@@ -398,7 +406,12 @@ polling:
         assert_eq!(count, 1);
 
         let jobs = db.list_jobs(&JobFilter::default()).expect("list");
-        assert_eq!(jobs[0].command.as_deref(), Some("global-cmd"));
+        assert_eq!(jobs[0].agent_kind, crate::types::AgentKind::Codex);
+        assert!(
+            jobs[0].command.as_deref().unwrap().contains("codex exec"),
+            "command should be codex default: {:?}",
+            jobs[0].command
+        );
     }
 
     #[tokio::test]
