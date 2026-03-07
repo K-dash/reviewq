@@ -33,6 +33,32 @@ pub fn create(
 
     let worktree_path = worktree_root.join(format!("reviewq-{job_id}"));
 
+    // Clean up stale worktree registration or leftover directory.
+    // Two failure modes exist:
+    //   1. Directory exists but git doesn't track it (e.g. DB reset reused job_id)
+    //   2. Directory is gone but git metadata still references it (e.g. manual rm)
+    // We handle both by always pruning, then force-removing if needed.
+    let _ = Command::new("git")
+        .args(["worktree", "prune"])
+        .current_dir(base_repo)
+        .output();
+    if worktree_path.exists() {
+        warn!(path = %worktree_path.display(), "worktree path already exists, removing stale entry");
+        let _ = Command::new("git")
+            .args(["worktree", "remove", "--force"])
+            .arg(&worktree_path)
+            .current_dir(base_repo)
+            .output();
+        if worktree_path.exists() {
+            std::fs::remove_dir_all(&worktree_path).map_err(|e| {
+                ReviewqError::Process(format!(
+                    "failed to remove stale worktree dir {}: {e}",
+                    worktree_path.display()
+                ))
+            })?;
+        }
+    }
+
     let output = Command::new("git")
         .args(["worktree", "add", "--detach"])
         .arg(&worktree_path)
