@@ -170,6 +170,10 @@ async fn execute_job<S: JobStore, E: ReviewExecutor>(
             }
         };
 
+    if let Err(e) = store.store_worktree_path(job.id, &worktree_path) {
+        warn!(job_id = job.id, error = %e, "failed to store worktree_path");
+    }
+
     match executor.execute(&job, &worktree_path).await {
         Ok(result) => {
             let status = if result.exit_code == 0 {

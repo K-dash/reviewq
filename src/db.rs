@@ -363,6 +363,16 @@ impl JobStore for Database {
         Ok(())
     }
 
+    fn store_worktree_path(&self, id: i64, path: &Path) -> Result<()> {
+        let conn = self.lock_conn();
+        conn.execute(
+            "UPDATE jobs SET worktree_path = ?1, updated_at = datetime('now')
+             WHERE id = ?2",
+            params![path.display().to_string(), id],
+        )?;
+        Ok(())
+    }
+
     fn requeue_stale(&self, id: i64) -> Result<()> {
         let conn = self.lock_conn();
         let rows = conn.execute(
