@@ -108,6 +108,10 @@ pub struct RepoEntry {
     /// Overrides the global `execution.base_repo_path` for worktree creation.
     #[serde(default)]
     pub base_repo_path: Option<PathBuf>,
+
+    /// PR numbers to exclude from review.
+    #[serde(default)]
+    pub ignore_prs: Vec<u64>,
 }
 
 fn default_true() -> bool {
@@ -128,6 +132,8 @@ pub struct RepoPolicy {
     pub max_concurrency: Option<usize>,
     /// Path to the local clone of this repository.
     pub base_repo_path: Option<PathBuf>,
+    /// PR numbers to exclude from review.
+    pub ignore_prs: Vec<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -447,6 +453,7 @@ impl Config {
                     model: entry.model.clone(),
                     max_concurrency: entry.max_concurrency,
                     base_repo_path: entry.base_repo_path.clone(),
+                    ignore_prs: entry.ignore_prs.clone(),
                 })
             })
             .collect()
@@ -509,6 +516,7 @@ impl Config {
                                 || old_entry.model != new_entry.model
                                 || old_entry.max_concurrency != new_entry.max_concurrency
                                 || old_entry.base_repo_path != new_entry.base_repo_path
+                                || old_entry.ignore_prs != new_entry.ignore_prs
                         })
                 });
                 if has_other_changes {
@@ -1193,5 +1201,57 @@ repos:
         // Should have the fallback line for other per-repo settings
         assert_eq!(changes.len(), 1);
         assert!(changes[0].contains("per-repo settings changed"));
+    }
+
+    #[test]
+    fn parse_ignore_prs() {
+        let yaml = r#"
+repos:
+  allowlist:
+    - repo: org/repo
+      ignore_prs: [9520, 9521, 9522]
+"#;
+        let config = Config::from_yaml(yaml).expect("should parse");
+        assert_eq!(config.repos.allowlist[0].ignore_prs, vec![9520, 9521, 9522]);
+        let policies = config.repo_policies();
+        assert_eq!(policies[0].ignore_prs, vec![9520, 9521, 9522]);
+    }
+
+    #[test]
+    fn ignore_prs_defaults_to_empty() {
+        let yaml = r#"
+repos:
+  allowlist:
+    - repo: org/repo
+"#;
+        let config = Config::from_yaml(yaml).expect("should parse");
+        assert!(config.repos.allowlist[0].ignore_prs.is_empty());
+    }
+
+    #[test]
+    fn diff_summary_detects_ignore_prs_change() {
+        let old = Config::from_yaml(
+            r#"
+repos:
+  allowlist:
+    - repo: org/repo
+"#,
+        )
+        .expect("parse");
+        let new = Config::from_yaml(
+            r#"
+repos:
+  allowlist:
+    - repo: org/repo
+      ignore_prs: [100]
+"#,
+        )
+        .expect("parse");
+        let changes = Config::diff_summary(&old, &new);
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.contains("per-repo settings changed")),
+        );
     }
 }
