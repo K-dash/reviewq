@@ -343,6 +343,20 @@ impl JobStore for Database {
         Ok(())
     }
 
+    fn store_log_paths(&self, id: i64, stdout: &Path, stderr: &Path) -> Result<()> {
+        let conn = self.lock_conn();
+        conn.execute(
+            "UPDATE jobs SET stdout_path = ?1, stderr_path = ?2, updated_at = datetime('now')
+             WHERE id = ?3",
+            params![
+                stdout.to_string_lossy().as_ref(),
+                stderr.to_string_lossy().as_ref(),
+                id
+            ],
+        )?;
+        Ok(())
+    }
+
     fn store_review_output(&self, id: i64, markdown: &str) -> Result<()> {
         let conn = self.lock_conn();
         conn.execute(
@@ -681,6 +695,29 @@ mod tests {
         assert!(
             db.is_pr_reviewed(&repo, 42, &AgentKind::Claude)
                 .expect("should succeed")
+        );
+    }
+
+    #[test]
+    fn store_log_paths_roundtrip() {
+        let db = test_db();
+        let job = db.enqueue(sample_job()).expect("enqueue");
+        assert!(job.stdout_path.is_none());
+        assert!(job.stderr_path.is_none());
+
+        let stdout = std::path::Path::new("/tmp/output/job-1-stdout.log");
+        let stderr = std::path::Path::new("/tmp/output/job-1-stderr.log");
+        db.store_log_paths(job.id, stdout, stderr)
+            .expect("store_log_paths");
+
+        let jobs = db.list_jobs(&JobFilter::default()).expect("list");
+        assert_eq!(
+            jobs[0].stdout_path.as_deref(),
+            Some(std::path::Path::new("/tmp/output/job-1-stdout.log"))
+        );
+        assert_eq!(
+            jobs[0].stderr_path.as_deref(),
+            Some(std::path::Path::new("/tmp/output/job-1-stderr.log"))
         );
     }
 }

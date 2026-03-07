@@ -316,6 +316,8 @@ impl ReviewExecutor for CommandExecutor {
             exit_code,
             review_markdown,
             session_id,
+            stdout_path: Some(stdout_path),
+            stderr_path: Some(stderr_path),
         })
     }
 

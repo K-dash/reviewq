@@ -176,6 +176,11 @@ async fn execute_job<S: JobStore, E: ReviewExecutor>(
 
     match executor.execute(&job, &worktree_path).await {
         Ok(result) => {
+            // Persist log file paths so TUI and CLI tail can find them.
+            if let (Some(stdout), Some(stderr)) = (&result.stdout_path, &result.stderr_path) {
+                let _ = store.store_log_paths(job.id, stdout, stderr);
+            }
+
             let status = if result.exit_code == 0 {
                 JobStatus::Succeeded
             } else {
