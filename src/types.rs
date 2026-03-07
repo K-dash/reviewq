@@ -74,26 +74,29 @@ pub enum AgentKind {
     #[default]
     Claude,
     Codex,
-    Custom(String),
 }
 
 impl fmt::Display for AgentKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Claude => write!(f, "claude"),
-            Self::Codex => write!(f, "codex"),
-            Self::Custom(name) => write!(f, "{name}"),
-        }
+        f.write_str(self.as_db_str())
     }
 }
 
 impl AgentKind {
     /// Parse from a string stored in the database.
+    ///
+    /// Unknown values fall back to `Claude` with a warning log.
     pub fn from_db(s: &str) -> Self {
         match s {
             "claude" => Self::Claude,
             "codex" => Self::Codex,
-            other => Self::Custom(other.to_owned()),
+            other => {
+                tracing::warn!(
+                    value = other,
+                    "unknown agent_kind in DB, falling back to claude"
+                );
+                Self::Claude
+            }
         }
     }
 
@@ -102,7 +105,21 @@ impl AgentKind {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
-            Self::Custom(s) => s,
+        }
+    }
+
+    /// Return the default shell command template for this agent.
+    ///
+    /// The template may contain `{prompt_file}` and `{output_path}` placeholders
+    /// that are interpolated by the executor before spawning.
+    pub fn default_command(&self) -> &'static str {
+        match self {
+            Self::Claude => {
+                r#"set -o pipefail; claude -p "$(cat "{prompt_file}")" | tee "{output_path}""#
+            }
+            Self::Codex => {
+                r#"set -o pipefail; codex exec --sandbox danger-full-access - < "{prompt_file}" | tee "{output_path}""#
+            }
         }
     }
 }
@@ -236,4 +253,45 @@ pub struct JobFilter {
 pub struct ReviewResult {
     pub exit_code: i32,
     pub review_markdown: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_kind_from_db_known_values() {
+        assert_eq!(AgentKind::from_db("claude"), AgentKind::Claude);
+        assert_eq!(AgentKind::from_db("codex"), AgentKind::Codex);
+    }
+
+    #[test]
+    fn agent_kind_from_db_unknown_falls_back_to_claude() {
+        assert_eq!(AgentKind::from_db("unknown"), AgentKind::Claude);
+        assert_eq!(AgentKind::from_db(""), AgentKind::Claude);
+        assert_eq!(AgentKind::from_db("custom:my-agent"), AgentKind::Claude);
+    }
+
+    #[test]
+    fn agent_kind_roundtrip() {
+        for kind in [AgentKind::Claude, AgentKind::Codex] {
+            assert_eq!(AgentKind::from_db(kind.as_db_str()), kind);
+        }
+    }
+
+    #[test]
+    fn agent_kind_default_command_contains_agent_name() {
+        assert!(AgentKind::Claude.default_command().contains("claude"));
+        assert!(AgentKind::Codex.default_command().contains("codex"));
+    }
+
+    #[test]
+    fn job_status_terminal() {
+        assert!(JobStatus::Succeeded.is_terminal());
+        assert!(JobStatus::Failed.is_terminal());
+        assert!(JobStatus::Canceled.is_terminal());
+        assert!(!JobStatus::Queued.is_terminal());
+        assert!(!JobStatus::Leased.is_terminal());
+        assert!(!JobStatus::Running.is_terminal());
+    }
 }

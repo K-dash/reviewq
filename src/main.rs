@@ -118,11 +118,8 @@ async fn run_daemon(
     let github = reviewq::github::GitHubApi::new(token);
 
     // Create the review executor.
-    let default_command = config
-        .runner
-        .command
-        .clone()
-        .unwrap_or_else(|| "echo 'no review command configured'".into());
+    let default_agent = config.runner.agent.clone().unwrap_or_default();
+    let default_command = default_agent.default_command().to_owned();
     let executor = Arc::new(reviewq::executor::CommandExecutor::new(
         default_command,
         config.cancel.clone(),

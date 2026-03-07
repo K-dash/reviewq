@@ -48,6 +48,7 @@ pub async fn spawn_in_group(
             .args(["-c", command])
             .current_dir(workdir)
             .envs(env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .env_remove("CLAUDECODE")
             .stdin(stdin_null)
             .stdout(stdout_file)
             .stderr(stderr_file)
