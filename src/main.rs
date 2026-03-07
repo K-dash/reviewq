@@ -285,11 +285,7 @@ async fn worktree_cleanup_loop(mut config_rx: watch::Receiver<Arc<reviewq::confi
             config.execution.base_repo_path.clone().unwrap_or_else(|| {
                 std::env::current_dir().expect("current directory is accessible")
             });
-        let worktree_root = config
-            .execution
-            .worktree_root
-            .clone()
-            .unwrap_or_else(|| base_repo.join(".worktrees"));
+        let worktree_root = config.execution.effective_worktree_root();
         let interval = std::time::Duration::from_secs(config.cleanup.interval_minutes * 60);
 
         tokio::time::sleep(interval).await;
