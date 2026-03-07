@@ -95,6 +95,10 @@ pub struct RepoEntry {
     #[serde(default)]
     pub prompt_template: Option<String>,
 
+    /// Override the global `runner.model` for this repo.
+    #[serde(default)]
+    pub model: Option<String>,
+
     /// Override the global `execution.max_concurrency` for this repo.
     /// Reserved for future use; not yet wired into the runner.
     #[serde(default)]
@@ -119,6 +123,7 @@ pub struct RepoPolicy {
     pub review_on_push: bool,
     pub agent: Option<crate::types::AgentKind>,
     pub prompt_template: Option<String>,
+    pub model: Option<String>,
     /// Reserved for future use; not yet wired into the runner.
     pub max_concurrency: Option<usize>,
     /// Path to the local clone of this repository.
@@ -215,6 +220,10 @@ pub struct RunnerConfig {
     /// The rendered prompt is available as `{prompt}` and `{prompt_file}` in the command.
     #[serde(default)]
     pub prompt_template: Option<String>,
+
+    /// The model to pass to the agent via `--model` flag.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -383,6 +392,26 @@ impl Config {
             }
         }
 
+        // Validate model names (global and per-repo).
+        if let Some(ref m) = self.runner.model
+            && !is_valid_model_name(m)
+        {
+            return Err(ReviewqError::Config(format!(
+                "invalid runner.model '{}': must match [A-Za-z0-9._:-]+",
+                m
+            )));
+        }
+        for entry in &self.repos.allowlist {
+            if let Some(ref m) = entry.model
+                && !is_valid_model_name(m)
+            {
+                return Err(ReviewqError::Config(format!(
+                    "invalid model '{}' for repo '{}': must match [A-Za-z0-9._:-]+",
+                    m, entry.repo
+                )));
+            }
+        }
+
         if self.polling.interval_seconds == 0 {
             return Err(ReviewqError::Config(
                 "polling.interval_seconds must be > 0".into(),
@@ -415,6 +444,7 @@ impl Config {
                     review_on_push: entry.review_on_push,
                     agent: entry.agent.clone(),
                     prompt_template: entry.prompt_template.clone(),
+                    model: entry.model.clone(),
                     max_concurrency: entry.max_concurrency,
                     base_repo_path: entry.base_repo_path.clone(),
                 })
@@ -476,6 +506,7 @@ impl Config {
                                 || old_entry.skip_reviewer_check != new_entry.skip_reviewer_check
                                 || old_entry.agent != new_entry.agent
                                 || old_entry.prompt_template != new_entry.prompt_template
+                                || old_entry.model != new_entry.model
                                 || old_entry.max_concurrency != new_entry.max_concurrency
                                 || old_entry.base_repo_path != new_entry.base_repo_path
                         })
@@ -532,6 +563,13 @@ impl Config {
             ));
         }
 
+        if old.runner.model != new.runner.model {
+            changes.push(format!(
+                "runner.model changed: {:?} -> {:?}",
+                old.runner.model, new.runner.model
+            ));
+        }
+
         if old.cancel != new.cancel {
             changes.push("cancel changed (restart required)".to_string());
         }
@@ -579,6 +617,14 @@ impl Config {
             .and_then(|p| p.base_repo_path.clone())
             .or_else(|| self.execution.base_repo_path.clone())
     }
+}
+
+/// Check if a model name contains only allowed characters: `[A-Za-z0-9._:-]+`.
+fn is_valid_model_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b':' || b == b'-')
 }
 
 /// Replace a leading `~` with the home directory.
@@ -988,6 +1034,138 @@ repos:
             changes
                 .iter()
                 .any(|c| c.contains("per-repo settings changed"))
+        );
+    }
+
+    #[test]
+    fn parse_model_in_runner() {
+        let yaml = r#"
+repos:
+  allowlist:
+    - repo: owner/repo
+runner:
+  model: claude-sonnet-4-5-20250514
+"#;
+        let config = Config::from_yaml(yaml).expect("should parse");
+        assert_eq!(
+            config.runner.model.as_deref(),
+            Some("claude-sonnet-4-5-20250514")
+        );
+    }
+
+    #[test]
+    fn parse_per_repo_model() {
+        let yaml = r#"
+repos:
+  allowlist:
+    - repo: org/repo1
+      model: gpt-5.3-codex
+    - repo: org/repo2
+"#;
+        let config = Config::from_yaml(yaml).expect("should parse");
+        let policies = config.repo_policies();
+        assert_eq!(policies[0].model.as_deref(), Some("gpt-5.3-codex"));
+        assert!(policies[1].model.is_none());
+    }
+
+    #[test]
+    fn valid_model_names_accepted() {
+        for name in [
+            "claude-sonnet-4-5-20250514",
+            "gpt-5.3-codex",
+            "gpt-5.4",
+            "model:v1.2",
+            "a_b-c.d:e",
+        ] {
+            let yaml =
+                format!("repos:\n  allowlist:\n    - repo: org/repo\nrunner:\n  model: {name}\n");
+            Config::from_yaml(&yaml)
+                .unwrap_or_else(|e| panic!("model '{name}' should be valid: {e}"));
+        }
+    }
+
+    #[test]
+    fn invalid_model_names_rejected() {
+        for name in ["model name", "model;rm", "$(echo hi)", "mod\"el", ""] {
+            let yaml = format!(
+                "repos:\n  allowlist:\n    - repo: org/repo\nrunner:\n  model: \"{name}\"\n"
+            );
+            assert!(
+                Config::from_yaml(&yaml).is_err(),
+                "model '{name}' should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_per_repo_model_rejected() {
+        let yaml = r#"
+repos:
+  allowlist:
+    - repo: org/repo
+      model: "bad model"
+"#;
+        let err = Config::from_yaml(yaml).unwrap_err();
+        assert!(err.to_string().contains("invalid model"));
+    }
+
+    #[test]
+    fn diff_summary_detects_runner_model_change() {
+        let old = Config::from_yaml(
+            r#"
+repos:
+  allowlist:
+    - repo: org/repo
+runner:
+  model: gpt-5.4
+"#,
+        )
+        .expect("parse");
+        let new = Config::from_yaml(
+            r#"
+repos:
+  allowlist:
+    - repo: org/repo
+runner:
+  model: gpt-5.3-codex
+"#,
+        )
+        .expect("parse");
+        let changes = Config::diff_summary(&old, &new);
+        assert!(
+            changes.iter().any(|c| c.contains("runner.model")),
+            "should detect runner.model change: {:?}",
+            changes
+        );
+    }
+
+    #[test]
+    fn diff_summary_detects_per_repo_model_change() {
+        let old = Config::from_yaml(
+            r#"
+repos:
+  allowlist:
+    - repo: org/repo
+      model: gpt-5.4
+"#,
+        )
+        .expect("parse");
+        let new = Config::from_yaml(
+            r#"
+repos:
+  allowlist:
+    - repo: org/repo
+      model: gpt-5.3-codex
+"#,
+        )
+        .expect("parse");
+        let changes = Config::diff_summary(&old, &new);
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.contains("per-repo settings changed")),
+            "should detect per-repo model change: {:?}",
+            changes
         );
     }
 

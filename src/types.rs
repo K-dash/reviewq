@@ -115,12 +115,22 @@ impl AgentKind {
     ///
     /// Commands use `--output-format json` (Claude) or `--json` (Codex) so the
     /// executor can parse session IDs from the structured output.
-    pub fn default_command(&self) -> &'static str {
+    ///
+    /// When `model` is `Some`, a `--model <name>` flag is injected into the
+    /// command so the agent uses a specific model.
+    pub fn default_command(&self, model: Option<&str>) -> String {
+        let model_flag = model.map(|m| format!(" --model {m}")).unwrap_or_default();
         match self {
             Self::Claude => {
-                r#"claude -p "$(cat "{prompt_file}")" --output-format json --allowedTools Read Grep Glob "Bash(gh:*)" "Bash(git:*)" WebFetch"#
+                format!(
+                    r#"claude -p "$(cat "{{prompt_file}}")"{model_flag} --output-format json --allowedTools Read Grep Glob "Bash(gh:*)" "Bash(git:*)" WebFetch"#
+                )
             }
-            Self::Codex => r#"codex exec --json --sandbox danger-full-access - < "{prompt_file}""#,
+            Self::Codex => {
+                format!(
+                    r#"codex exec --json{model_flag} --sandbox danger-full-access - < "{{prompt_file}}""#
+                )
+            }
         }
     }
 
@@ -436,8 +446,30 @@ mod tests {
 
     #[test]
     fn agent_kind_default_command_contains_agent_name() {
-        assert!(AgentKind::Claude.default_command().contains("claude"));
-        assert!(AgentKind::Codex.default_command().contains("codex"));
+        assert!(AgentKind::Claude.default_command(None).contains("claude"));
+        assert!(AgentKind::Codex.default_command(None).contains("codex"));
+    }
+
+    #[test]
+    fn default_command_with_model() {
+        let claude_cmd = AgentKind::Claude.default_command(Some("claude-sonnet-4-5-20250514"));
+        assert!(claude_cmd.contains("--model claude-sonnet-4-5-20250514"));
+        assert!(claude_cmd.contains("claude -p"));
+
+        let codex_cmd = AgentKind::Codex.default_command(Some("gpt-5.3-codex"));
+        assert!(codex_cmd.contains("--model gpt-5.3-codex"));
+        assert!(codex_cmd.contains("codex exec"));
+    }
+
+    #[test]
+    fn default_command_without_model() {
+        let claude_cmd = AgentKind::Claude.default_command(None);
+        assert!(!claude_cmd.contains("--model"));
+        assert!(claude_cmd.contains("{prompt_file}"));
+
+        let codex_cmd = AgentKind::Codex.default_command(None);
+        assert!(!codex_cmd.contains("--model"));
+        assert!(codex_cmd.contains("{prompt_file}"));
     }
 
     #[test]

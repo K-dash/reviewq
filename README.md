@@ -37,6 +37,7 @@ repos:
       review_on_push: true          # Re-review on every push/force-push (default: true)
       command: "claude -p '{prompt}'" # Per-repo command override (optional)
       prompt_template: "Review PR"  # Per-repo prompt template override (optional)
+      model: gpt-5.3-codex          # Per-repo model override (optional)
       max_concurrency: 3            # Per-repo concurrency limit (optional, reserved)
       base_repo_path: /path/to/clone # Per-repo local clone path (optional)
 
@@ -56,6 +57,7 @@ execution:
 runner:
   command: "claude -p '{prompt}'"   # Global review command (optional)
   prompt_template: "Review {pr_url}" # Global prompt template (optional)
+  model: claude-sonnet-4-5-20250514 # Model to pass via --model flag (optional)
 
 cancel:
   sigint_timeout_seconds: 5         # SIGINT grace period (default: 5)
@@ -75,6 +77,27 @@ state:
 output:
   dir: ~/.reviewq/output            # Review output directory (default: ~/.reviewq/output)
 ```
+
+### `model`
+
+Specifies the model to pass to the agent via the `--model` CLI flag. Can be set globally under `runner.model` and overridden per-repo.
+
+**Priority chain**: per-repo `model` > global `runner.model` > omitted (no `--model` flag).
+
+```yaml
+runner:
+  agent: claude
+  model: claude-sonnet-4-5-20250514  # Default model for all repos
+
+repos:
+  allowlist:
+    - repo: org/repo-a               # Uses claude-sonnet-4-5-20250514
+    - repo: org/repo-b
+      agent: codex
+      model: gpt-5.3-codex           # Override: uses gpt-5.3-codex with codex
+```
+
+Model names must match `[A-Za-z0-9._:-]+`.
 
 ### `review_on_push`
 
