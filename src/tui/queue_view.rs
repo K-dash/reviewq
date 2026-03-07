@@ -152,7 +152,6 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
             ("j/↓", "down"),
             ("k/↑", "up"),
             ("↵", "open"),
-            ("t", "tail"),
             ("p", "prompt"),
             ("s", "start"),
             ("c", "copy sid"),
