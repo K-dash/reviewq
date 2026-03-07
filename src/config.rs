@@ -206,6 +206,31 @@ impl Default for ExecutionConfig {
     }
 }
 
+/// Default worktree root directory (`~/.reviewq/worktrees`).
+///
+/// Placed outside any repository tree so that the review agent does not
+/// accidentally pick up CLAUDE.md / AGENTS.md from the host project.
+fn default_worktree_root() -> PathBuf {
+    PathBuf::from("~/.reviewq/worktrees")
+}
+
+impl ExecutionConfig {
+    /// Resolve the effective worktree root directory.
+    ///
+    /// Priority: explicit `worktree_root` config > default `~/.reviewq/worktrees`.
+    /// Expands leading `~` to the user's home directory.
+    pub fn effective_worktree_root(&self) -> PathBuf {
+        let mut path = self
+            .worktree_root
+            .clone()
+            .unwrap_or_else(default_worktree_root);
+        if let Some(home) = dirs::home_dir() {
+            expand_tilde(&mut path, &home);
+        }
+        path
+    }
+}
+
 fn default_max_concurrency() -> usize {
     10
 }
@@ -433,6 +458,9 @@ impl Config {
             expand_tilde(&mut self.logging.dir, &home);
             expand_tilde(&mut self.state.sqlite_path, &home);
             expand_tilde(&mut self.output.dir, &home);
+            if let Some(ref mut p) = self.execution.worktree_root {
+                expand_tilde(p, &home);
+            }
         }
     }
 

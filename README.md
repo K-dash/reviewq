@@ -131,7 +131,7 @@ auth:
 # ──────────────────────────────────────────────
 execution:
   base_repo_path: /path/to/repos           # Global base path for local clones (optional)
-  worktree_root: /path/to/worktrees        # Directory for git worktrees (optional, default: <base_repo_path>/.worktrees)
+  worktree_root: /path/to/worktrees        # Directory for git worktrees (optional, default: ~/.reviewq/worktrees)
   max_concurrency: 10                      # Max concurrent review jobs (default: 10)
   lease_minutes: 5                         # Job lease timeout in minutes (default: 5)
 

@@ -50,11 +50,7 @@ where
             config.execution.base_repo_path.clone().unwrap_or_else(|| {
                 std::env::current_dir().expect("current directory is accessible")
             });
-        let worktree_root = config
-            .execution
-            .worktree_root
-            .clone()
-            .unwrap_or_else(|| global_base_repo.join(".worktrees"));
+        let worktree_root = config.execution.effective_worktree_root();
         let policies = config.repo_policies();
 
         // Drain completed tasks so JoinSet doesn't grow unboundedly.
