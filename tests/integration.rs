@@ -177,16 +177,16 @@ async fn executor_interpolates_template_variables() {
     let worktree = tmp.path().join("worktree");
     std::fs::create_dir_all(&worktree).expect("create worktree dir");
 
-    // Command writes interpolated template values into REVIEW.md.
-    let cmd =
-        r#"printf '%s\n%s\n%s\n%s' '{pr_url}' '{repo}' '{pr_number}' '{head_sha}' > REVIEW.md"#;
-    let executor = CommandExecutor::new(cmd.into(), CancelConfig::default(), output_dir);
+    // Command writes interpolated template values to stdout.
+    let cmd = r#"printf '%s\n%s\n%s\n%s' '{pr_url}' '{repo}' '{pr_number}' '{head_sha}'"#;
+    let executor = CommandExecutor::new(cmd.into(), CancelConfig::default(), output_dir.clone());
 
     let job = make_test_job(7, None);
     let result = executor.execute(&job, &worktree).await.expect("execute");
 
     assert_eq!(result.exit_code, 0);
-    let content = result.review_markdown.expect("REVIEW.md should exist");
+    let content =
+        std::fs::read_to_string(output_dir.join("job-7-stdout.log")).expect("read stdout log");
     assert!(
         content.contains("https://github.com/owner/repo/pull/1"),
         "pr_url not interpolated: {content}"
@@ -208,15 +208,18 @@ async fn executor_sets_environment_variables() {
     let worktree = tmp.path().join("worktree");
     std::fs::create_dir_all(&worktree).expect("create worktree dir");
 
-    // Command echoes REVIEWQ_* env vars into REVIEW.md.
-    let cmd = r#"printf '%s\n%s\n%s\n%s' "$REVIEWQ_PR_URL" "$REVIEWQ_REPO" "$REVIEWQ_PR_NUMBER" "$REVIEWQ_HEAD_SHA" > REVIEW.md"#;
-    let executor = CommandExecutor::new(cmd.into(), CancelConfig::default(), output_dir);
+    // Command echoes REVIEWQ_* env vars to stdout.
+    let cmd = r#"printf '%s\n%s\n%s\n%s' "$REVIEWQ_PR_URL" "$REVIEWQ_REPO" "$REVIEWQ_PR_NUMBER" "$REVIEWQ_HEAD_SHA""#;
+    let executor = CommandExecutor::new(cmd.into(), CancelConfig::default(), output_dir.clone());
 
     let job = make_test_job(8, None);
     let result = executor.execute(&job, &worktree).await.expect("execute");
 
     assert_eq!(result.exit_code, 0);
-    let content = result.review_markdown.expect("REVIEW.md should exist");
+
+    // Read captured stdout log to verify env vars were set.
+    let content =
+        std::fs::read_to_string(output_dir.join("job-8-stdout.log")).expect("read stdout log");
     assert!(
         content.contains("https://github.com/owner/repo/pull/1"),
         "REVIEWQ_PR_URL not set: {content}"
@@ -232,24 +235,23 @@ async fn executor_sets_environment_variables() {
 }
 
 #[tokio::test]
-async fn executor_reads_review_md_from_worktree() {
+async fn executor_non_json_output_returns_none() {
     let tmp = TempDir::new().expect("temp dir");
     let output_dir = tmp.path().join("output");
     let worktree = tmp.path().join("worktree");
     std::fs::create_dir_all(&worktree).expect("create worktree dir");
 
-    // Pre-create REVIEW.md (simulating a review agent that writes output).
-    std::fs::write(worktree.join("REVIEW.md"), "# Excellent code\n\nLGTM!")
-        .expect("write REVIEW.md");
-
-    let executor = CommandExecutor::new("true".into(), CancelConfig::default(), output_dir);
+    // Non-JSON output — parse_output returns None for review_markdown.
+    let executor = CommandExecutor::new(
+        "echo 'plain text'".into(),
+        CancelConfig::default(),
+        output_dir,
+    );
 
     let job = make_test_job(1, None);
     let result = executor.execute(&job, &worktree).await.expect("execute");
 
     assert_eq!(result.exit_code, 0);
-    assert_eq!(
-        result.review_markdown.as_deref(),
-        Some("# Excellent code\n\nLGTM!")
-    );
+    assert!(result.review_markdown.is_none());
+    assert!(result.session_id.is_none());
 }

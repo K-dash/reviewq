@@ -134,27 +134,89 @@ impl AgentKind {
     }
 
     /// Return the CLI command to resume a session with this agent.
-    pub fn resume_command(&self, session_id: &str) -> String {
-        match self {
+    ///
+    /// If `repo_path` is provided, the command is prefixed with `cd <path> &&`
+    /// so users can paste and run it directly.
+    pub fn resume_command(&self, session_id: &str, repo_path: Option<&std::path::Path>) -> String {
+        let resume = match self {
             Self::Claude => format!("claude --resume {session_id}"),
             Self::Codex => format!("codex exec resume {session_id}"),
+        };
+        match repo_path {
+            Some(p) => format!("cd {} && {resume}", p.display()),
+            None => resume,
         }
     }
 }
 
 /// Parse Claude `--output-format json` output.
 ///
-/// Expects a single JSON object with `session_id` and `result` fields.
+/// Claude outputs a JSON array of conversation events:
+/// `[{type:"system", session_id:...}, {type:"assistant", message:{content:[...]}}, ..., {type:"result", result:"...", session_id:"..."}]`
+///
+/// The review text comes from `result.result`. If that is empty (e.g. the
+/// agent only used tools), we collect `assistant` → `message.content[]`
+/// text blocks instead.
 fn parse_claude_json(raw: &str) -> (Option<String>, Option<String>) {
     let val: serde_json::Value = match serde_json::from_str(raw) {
         Ok(v) => v,
         Err(_) => return (None, None),
     };
-    let session_id = val
-        .get("session_id")
-        .and_then(|v| v.as_str())
-        .map(String::from);
-    let markdown = val.get("result").and_then(|v| v.as_str()).map(String::from);
+
+    let arr = match val.as_array() {
+        Some(a) => a,
+        None => return (None, None),
+    };
+
+    let mut session_id: Option<String> = None;
+    let mut result_text: Option<String> = None;
+    let mut assistant_texts: Vec<String> = Vec::new();
+
+    for item in arr {
+        // session_id appears on every entry; grab it once.
+        if session_id.is_none()
+            && let Some(sid) = item.get("session_id").and_then(|v| v.as_str())
+        {
+            session_id = Some(sid.to_owned());
+        }
+
+        match item.get("type").and_then(|v| v.as_str()) {
+            Some("result") => {
+                if let Some(r) = item
+                    .get("result")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    result_text = Some(r.to_owned());
+                }
+            }
+            Some("assistant") => {
+                if let Some(content) = item
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_array())
+                {
+                    for c in content {
+                        if c.get("type").and_then(|v| v.as_str()) == Some("text")
+                            && let Some(text) = c.get("text").and_then(|v| v.as_str())
+                        {
+                            assistant_texts.push(text.to_owned());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let markdown = result_text.or_else(|| {
+        if assistant_texts.is_empty() {
+            None
+        } else {
+            Some(assistant_texts.join("\n\n"))
+        }
+    });
+
     (session_id, markdown)
 }
 
@@ -180,17 +242,26 @@ fn parse_codex_jsonl(raw: &str) -> (Option<String>, Option<String>) {
             continue;
         }
 
-        // Extract text from item.completed → agent_message → content[].output_text.
+        // Extract text from item.completed → agent_message.
+        // Codex has two output formats:
+        //   - item.text (direct text field on the item)
+        //   - item.content[].output_text.text (array of content blocks)
         if val.get("type").and_then(|v| v.as_str()) == Some("item.completed")
             && let Some(item) = val.get("item")
             && item.get("type").and_then(|v| v.as_str()) == Some("agent_message")
-            && let Some(content) = item.get("content").and_then(|v| v.as_array())
         {
-            for entry in content {
-                if entry.get("type").and_then(|v| v.as_str()) == Some("output_text")
-                    && let Some(text) = entry.get("text").and_then(|v| v.as_str())
-                {
-                    texts.push(text.to_owned());
+            // Format 1: direct text field
+            if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                texts.push(text.to_owned());
+            }
+            // Format 2: content array with output_text entries
+            else if let Some(content) = item.get("content").and_then(|v| v.as_array()) {
+                for entry in content {
+                    if entry.get("type").and_then(|v| v.as_str()) == Some("output_text")
+                        && let Some(text) = entry.get("text").and_then(|v| v.as_str())
+                    {
+                        texts.push(text.to_owned());
+                    }
                 }
             }
         }
@@ -369,10 +440,18 @@ mod tests {
 
     #[test]
     fn parse_claude_json_valid() {
-        let raw = r##"{"session_id":"abc-123","result":"# LGTM\nAll good."}"##;
+        let raw = r##"[{"type":"system","session_id":"abc-123"},{"type":"result","session_id":"abc-123","result":"# LGTM\nAll good."}]"##;
         let (sid, md) = AgentKind::Claude.parse_output(raw);
         assert_eq!(sid.as_deref(), Some("abc-123"));
         assert_eq!(md.as_deref(), Some("# LGTM\nAll good."));
+    }
+
+    #[test]
+    fn parse_claude_json_array_format() {
+        let raw = r##"[{"type":"system","subtype":"init","session_id":"sid-arr"},{"type":"assistant","session_id":"sid-arr"},{"type":"result","session_id":"sid-arr","result":"# Review\nLGTM"}]"##;
+        let (sid, md) = AgentKind::Claude.parse_output(raw);
+        assert_eq!(sid.as_deref(), Some("sid-arr"));
+        assert_eq!(md.as_deref(), Some("# Review\nLGTM"));
     }
 
     #[test]
@@ -400,6 +479,15 @@ mod tests {
     }
 
     #[test]
+    fn parse_codex_jsonl_direct_text_format() {
+        let raw = r##"{"type":"thread.started","thread_id":"tid-direct"}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"# Direct Review\nLGTM"}}"##;
+        let (sid, md) = AgentKind::Codex.parse_output(raw);
+        assert_eq!(sid.as_deref(), Some("tid-direct"));
+        assert_eq!(md.as_deref(), Some("# Direct Review\nLGTM"));
+    }
+
+    #[test]
     fn parse_codex_jsonl_missing_thread_started() {
         let raw = r##"{"type":"item.completed","item":{"type":"agent_message","content":[{"type":"output_text","text":"hello"}]}}"##;
         let (sid, md) = AgentKind::Codex.parse_output(raw);
@@ -415,18 +503,31 @@ mod tests {
     }
 
     #[test]
-    fn resume_command_claude() {
+    fn resume_command_claude_without_path() {
         assert_eq!(
-            AgentKind::Claude.resume_command("abc-123"),
+            AgentKind::Claude.resume_command("abc-123", None),
             "claude --resume abc-123"
         );
     }
 
     #[test]
-    fn resume_command_codex() {
+    fn resume_command_codex_without_path() {
         assert_eq!(
-            AgentKind::Codex.resume_command("tid-999"),
+            AgentKind::Codex.resume_command("tid-999", None),
             "codex exec resume tid-999"
+        );
+    }
+
+    #[test]
+    fn resume_command_with_repo_path() {
+        let path = std::path::Path::new("/home/user/my-repo");
+        assert_eq!(
+            AgentKind::Claude.resume_command("abc-123", Some(path)),
+            "cd /home/user/my-repo && claude --resume abc-123"
+        );
+        assert_eq!(
+            AgentKind::Codex.resume_command("tid-999", Some(path)),
+            "cd /home/user/my-repo && codex exec resume tid-999"
         );
     }
 
