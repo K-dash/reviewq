@@ -184,13 +184,11 @@ impl App {
             Action::CopySessionId => {
                 if let Some(job) = self.selected_job() {
                     if let Some(ref sid) = job.session_id {
-                        // Derive base repo path from worktree_path.
-                        // Worktree paths follow: <base>/.worktrees/reviewq-{id}
-                        let repo_path = job
-                            .worktree_path
-                            .as_ref()
-                            .and_then(|p| p.parent()?.parent());
-                        let cmd = job.agent_kind.resume_command(sid, repo_path);
+                        // Use worktree path as cwd — agent sessions are
+                        // stored under ~/.claude/projects/<cwd>.
+                        let cmd = job
+                            .agent_kind
+                            .resume_command(sid, job.worktree_path.as_deref());
                         match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(&cmd)) {
                             Ok(()) => {
                                 self.status_message = Some(format!("Copied: {cmd}"));
