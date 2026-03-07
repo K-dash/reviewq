@@ -101,9 +101,17 @@ where
         let skip_self = policy.is_none_or(|p| p.skip_self_authored);
         let skip_reviewer = policy.is_some_and(|p| p.skip_reviewer_check);
         let review_on_push = policy.is_none_or(|p| p.review_on_push);
+        let ignore_prs = policy.map(|p| p.ignore_prs.as_slice()).unwrap_or(&[]);
 
         // Apply filtering rules
-        if !crate::rules::should_process(pr, username, repo_ids, skip_self, skip_reviewer) {
+        if !crate::rules::should_process(
+            pr,
+            username,
+            repo_ids,
+            skip_self,
+            skip_reviewer,
+            ignore_prs,
+        ) {
             continue;
         }
 
@@ -956,5 +964,56 @@ polling:
             .expect("list");
         assert_eq!(canceled.len(), 1);
         assert_eq!(canceled[0].head_sha, "old_sha");
+    }
+
+    fn test_config_with_ignore_prs() -> Config {
+        Config::from_yaml(
+            r#"
+repos:
+  allowlist:
+    - repo: org/repo
+      ignore_prs: [1, 42]
+polling:
+  interval_seconds: 60
+"#,
+        )
+        .expect("config should parse")
+    }
+
+    #[tokio::test]
+    async fn ignore_prs_skips_matching_pr() {
+        let github = MockGitHub {
+            username: "bob".into(),
+            prs: vec![make_pr(1, "sha1")],
+        };
+        let db = Database::open_in_memory().expect("db");
+        let config = test_config_with_ignore_prs();
+        let policies = config.repo_policies();
+        let repo_ids = config.repo_ids();
+
+        let count = detect_once(&github, &db, &config, "bob", &repo_ids, &policies)
+            .await
+            .expect("should succeed");
+        assert_eq!(count, 0, "ignored PR should not be enqueued");
+
+        let jobs = db.list_jobs(&JobFilter::default()).expect("list");
+        assert!(jobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ignore_prs_allows_non_matching_pr() {
+        let github = MockGitHub {
+            username: "bob".into(),
+            prs: vec![make_pr(99, "sha1")],
+        };
+        let db = Database::open_in_memory().expect("db");
+        let config = test_config_with_ignore_prs();
+        let policies = config.repo_policies();
+        let repo_ids = config.repo_ids();
+
+        let count = detect_once(&github, &db, &config, "bob", &repo_ids, &policies)
+            .await
+            .expect("should succeed");
+        assert_eq!(count, 1, "non-ignored PR should be enqueued");
     }
 }

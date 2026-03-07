@@ -13,12 +13,18 @@ pub fn should_process(
     allowlist: &[RepoId],
     skip_self_authored: bool,
     skip_reviewer_check: bool,
+    ignore_prs: &[u64],
 ) -> bool {
     is_in_allowlist(pr, allowlist)
         && is_open(pr)
         && !is_draft(pr)
+        && !is_ignored(pr, ignore_prs)
         && (!skip_self_authored || !is_self_authored(pr, username))
         && (skip_reviewer_check || is_review_requested(pr, username))
+}
+
+fn is_ignored(pr: &PullRequest, ignore_prs: &[u64]) -> bool {
+    ignore_prs.contains(&pr.number)
 }
 
 fn is_in_allowlist(pr: &PullRequest, allowlist: &[RepoId]) -> bool {
@@ -65,75 +71,96 @@ mod tests {
     #[test]
     fn passes_all_rules() {
         let pr = make_pr();
-        assert!(should_process(&pr, "bob", &allowlist(), true, false));
+        assert!(should_process(&pr, "bob", &allowlist(), true, false, &[]));
     }
 
     #[test]
     fn rejects_repo_not_in_allowlist() {
         let mut pr = make_pr();
         pr.repo = RepoId::new("other", "repo");
-        assert!(!should_process(&pr, "bob", &allowlist(), true, false));
+        assert!(!should_process(&pr, "bob", &allowlist(), true, false, &[]));
     }
 
     #[test]
     fn rejects_closed_pr() {
         let mut pr = make_pr();
         pr.state = PrState::Closed;
-        assert!(!should_process(&pr, "bob", &allowlist(), true, false));
+        assert!(!should_process(&pr, "bob", &allowlist(), true, false, &[]));
     }
 
     #[test]
     fn rejects_merged_pr() {
         let mut pr = make_pr();
         pr.state = PrState::Merged;
-        assert!(!should_process(&pr, "bob", &allowlist(), true, false));
+        assert!(!should_process(&pr, "bob", &allowlist(), true, false, &[]));
     }
 
     #[test]
     fn rejects_draft_pr() {
         let mut pr = make_pr();
         pr.draft = true;
-        assert!(!should_process(&pr, "bob", &allowlist(), true, false));
+        assert!(!should_process(&pr, "bob", &allowlist(), true, false, &[]));
     }
 
     #[test]
     fn rejects_self_authored_pr() {
         let pr = make_pr();
-        assert!(!should_process(&pr, "alice", &allowlist(), true, false));
+        assert!(!should_process(
+            &pr,
+            "alice",
+            &allowlist(),
+            true,
+            false,
+            &[]
+        ));
     }
 
     #[test]
     fn accepts_self_authored_when_skip_disabled() {
         let mut pr = make_pr();
         pr.requested_reviewers.push("alice".into());
-        assert!(should_process(&pr, "alice", &allowlist(), false, false));
+        assert!(should_process(
+            &pr,
+            "alice",
+            &allowlist(),
+            false,
+            false,
+            &[]
+        ));
     }
 
     #[test]
     fn rejects_no_review_requested() {
         let mut pr = make_pr();
         pr.requested_reviewers.clear();
-        assert!(!should_process(&pr, "bob", &allowlist(), true, false));
+        assert!(!should_process(&pr, "bob", &allowlist(), true, false, &[]));
     }
 
     #[test]
     fn rejects_review_requested_for_different_user() {
         let pr = make_pr();
-        assert!(!should_process(&pr, "charlie", &allowlist(), true, false));
+        assert!(!should_process(
+            &pr,
+            "charlie",
+            &allowlist(),
+            true,
+            false,
+            &[]
+        ));
     }
 
     #[test]
     fn accepts_without_reviewer_when_check_skipped() {
         let mut pr = make_pr();
         pr.requested_reviewers.clear();
-        assert!(should_process(&pr, "bob", &allowlist(), true, true));
+        assert!(should_process(&pr, "bob", &allowlist(), true, true, &[]));
     }
 
     #[test]
     fn accepts_self_authored_with_both_skips() {
         let pr = make_pr();
         // author=alice, reviewer check skipped, self-authored check skipped
-        assert!(should_process(&pr, "alice", &allowlist(), false, true));
+        assert!(should_process(&pr, "alice", &allowlist(), false, true, &[]));
     }
 
     #[test]
@@ -151,5 +178,24 @@ mod tests {
             RepoId::new("other", "two"),
         ];
         assert!(is_in_allowlist(&pr, &list));
+    }
+
+    #[test]
+    fn rejects_ignored_pr() {
+        let pr = make_pr();
+        assert!(!should_process(&pr, "bob", &allowlist(), true, false, &[1]));
+    }
+
+    #[test]
+    fn accepts_pr_not_in_ignore_list() {
+        let pr = make_pr();
+        assert!(should_process(
+            &pr,
+            "bob",
+            &allowlist(),
+            true,
+            false,
+            &[99, 100]
+        ));
     }
 }
