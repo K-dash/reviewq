@@ -73,6 +73,14 @@ pub trait JobStore: Send + Sync {
     /// transitioning to `Canceled` after killing the process.
     fn request_cancel(&self, id: i64) -> Result<()>;
 
+    /// Reset a failed or canceled job back to queued for retry.
+    ///
+    /// Resets `retry_count` to 0 (manual retry is distinct from automatic
+    /// stale/orphan recovery) and NULLs out all execution-related columns
+    /// so the job runs cleanly. `created_at` is preserved so retried jobs
+    /// get priority in the queue.
+    fn retry_job(&self, id: i64) -> Result<()>;
+
     /// Check if a cancel has been requested for the given job.
     fn is_cancel_requested(&self, id: i64) -> Result<bool>;
 

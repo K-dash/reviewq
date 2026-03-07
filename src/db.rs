@@ -277,6 +277,34 @@ impl JobStore for Database {
         Ok(())
     }
 
+    fn retry_job(&self, id: i64) -> Result<()> {
+        let conn = self.lock_conn();
+        let rows = conn.execute(
+            "UPDATE jobs SET status = 'queued',
+                    retry_count = 0,
+                    exit_code = NULL,
+                    review_output = NULL,
+                    session_id = NULL,
+                    pid = NULL,
+                    leased_at = NULL,
+                    lease_expires = NULL,
+                    stdout_path = NULL,
+                    stderr_path = NULL,
+                    worktree_path = NULL,
+                    cancel_requested_at = NULL,
+                    updated_at = datetime('now')
+             WHERE id = ?1 AND status IN ('failed', 'canceled')",
+            params![id],
+        )?;
+        if rows == 0 {
+            tracing::warn!(
+                job_id = id,
+                "retry_job() matched 0 rows — job may not be in a retriable state"
+            );
+        }
+        Ok(())
+    }
+
     fn is_cancel_requested(&self, id: i64) -> Result<bool> {
         let conn = self.lock_conn();
         let exists: bool = conn.query_row(
@@ -810,6 +838,71 @@ mod tests {
             db.is_pr_reviewed(&repo, 42, &AgentKind::Claude)
                 .expect("should succeed")
         );
+    }
+
+    #[test]
+    fn retry_failed_job_resets_to_queued() {
+        let db = test_db();
+        let job = db.enqueue(sample_job()).expect("enqueue");
+        db.complete(job.id, JobStatus::Failed, Some(1))
+            .expect("complete");
+
+        db.retry_job(job.id).expect("retry");
+
+        let jobs = db.list_jobs(&JobFilter::default()).expect("list");
+        assert_eq!(jobs[0].status, JobStatus::Queued);
+        assert_eq!(jobs[0].retry_count, 0);
+        assert!(jobs[0].exit_code.is_none());
+        assert!(jobs[0].review_output.is_none());
+        assert!(jobs[0].session_id.is_none());
+        assert!(jobs[0].pid.is_none());
+        assert!(jobs[0].leased_at.is_none());
+        assert!(jobs[0].lease_expires.is_none());
+        assert!(jobs[0].stdout_path.is_none());
+        assert!(jobs[0].stderr_path.is_none());
+        assert!(jobs[0].worktree_path.is_none());
+        assert!(jobs[0].cancel_requested_at.is_none());
+    }
+
+    #[test]
+    fn retry_canceled_job_resets_to_queued() {
+        let db = test_db();
+        let job = db.enqueue(sample_job()).expect("enqueue");
+        db.request_cancel(job.id).expect("request_cancel");
+        db.cancel_queued_requested().expect("sweep");
+
+        db.retry_job(job.id).expect("retry");
+
+        let jobs = db.list_jobs(&JobFilter::default()).expect("list");
+        assert_eq!(jobs[0].status, JobStatus::Queued);
+        assert_eq!(jobs[0].retry_count, 0);
+        assert!(jobs[0].cancel_requested_at.is_none());
+    }
+
+    #[test]
+    fn retry_noop_on_non_terminal() {
+        let db = test_db();
+        let job = db.enqueue(sample_job()).expect("enqueue");
+
+        // Job is queued — retry should be a no-op.
+        db.retry_job(job.id).expect("retry");
+
+        let jobs = db.list_jobs(&JobFilter::default()).expect("list");
+        assert_eq!(jobs[0].status, JobStatus::Queued);
+        assert_eq!(jobs[0].retry_count, 0);
+    }
+
+    #[test]
+    fn retry_noop_on_succeeded() {
+        let db = test_db();
+        let job = db.enqueue(sample_job()).expect("enqueue");
+        db.complete(job.id, JobStatus::Succeeded, Some(0))
+            .expect("complete");
+
+        db.retry_job(job.id).expect("retry");
+
+        let jobs = db.list_jobs(&JobFilter::default()).expect("list");
+        assert_eq!(jobs[0].status, JobStatus::Succeeded);
     }
 
     #[test]
