@@ -117,7 +117,9 @@ impl AgentKind {
     /// executor can parse session IDs from the structured output.
     pub fn default_command(&self) -> &'static str {
         match self {
-            Self::Claude => r#"claude -p "$(cat "{prompt_file}")" --output-format json"#,
+            Self::Claude => {
+                r#"claude -p "$(cat "{prompt_file}")" --output-format json --allowedTools Read Grep Glob "Bash(gh:*)" "Bash(git:*)" WebFetch"#
+            }
             Self::Codex => r#"codex exec --json --sandbox danger-full-access - < "{prompt_file}""#,
         }
     }
