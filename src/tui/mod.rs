@@ -111,6 +111,20 @@ pub fn run<S: JobStore>(store: &S, output_dir: &Path, logging_dir: &Path) -> Res
             }
         }
 
+        // Process pending retry request (DB write BEFORE nudge).
+        if let Some(job_id) = app.pending_retry.take() {
+            match store.retry_job(job_id) {
+                Ok(()) => {
+                    // nudge stays true — daemon should wake to process the retried job.
+                }
+                Err(e) => {
+                    // Retry DB write failed — suppress the nudge.
+                    app.pending_nudge = false;
+                    app.status_message = Some(format!("Failed to retry job: {e}"));
+                }
+            }
+        }
+
         // Nudge daemon if dispatch requested it.
         if app.pending_nudge {
             app.pending_nudge = false;

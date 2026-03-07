@@ -49,6 +49,8 @@ pub struct App {
     pub pending_nudge: bool,
     /// Job ID to cancel (deferred to the event loop for DB access).
     pub pending_cancel: Option<i64>,
+    /// Job ID to retry (deferred to the event loop for DB access).
+    pub pending_retry: Option<i64>,
 }
 
 impl App {
@@ -65,6 +67,7 @@ impl App {
             pending_open: None,
             pending_nudge: false,
             pending_cancel: None,
+            pending_retry: None,
         }
     }
 
@@ -158,7 +161,10 @@ impl App {
             Action::RetryJob => {
                 if let Some(job) = self.selected_job() {
                     if job.status == JobStatus::Failed || job.status == JobStatus::Canceled {
-                        self.status_message = Some(format!("Retry requested for job {}", job.id));
+                        let job_id = job.id;
+                        self.pending_retry = Some(job_id);
+                        self.pending_nudge = true;
+                        self.status_message = Some(format!("Retry requested for job {}", job_id));
                     } else {
                         self.status_message =
                             Some(format!("Job {} is not in a retriable state", job.id));
@@ -455,6 +461,45 @@ mod tests {
 
         // Should stay on Queue view (browser open is deferred to event loop).
         assert_eq!(app.view, View::Queue);
+    }
+
+    #[test]
+    fn retry_job_sets_pending_retry_for_failed() {
+        let (mut app, _tmp) = make_app();
+        app.update_jobs(vec![make_job(1, JobStatus::Failed)]);
+        app.dispatch(Action::RetryJob);
+        assert_eq!(app.pending_retry, Some(1));
+        assert!(app.pending_nudge);
+        assert!(
+            app.status_message
+                .as_deref()
+                .unwrap()
+                .contains("Retry requested")
+        );
+    }
+
+    #[test]
+    fn retry_job_sets_pending_retry_for_canceled() {
+        let (mut app, _tmp) = make_app();
+        app.update_jobs(vec![make_job(1, JobStatus::Canceled)]);
+        app.dispatch(Action::RetryJob);
+        assert_eq!(app.pending_retry, Some(1));
+        assert!(app.pending_nudge);
+    }
+
+    #[test]
+    fn retry_job_rejected_for_non_terminal() {
+        let (mut app, _tmp) = make_app();
+        app.update_jobs(vec![make_job(1, JobStatus::Running)]);
+        app.dispatch(Action::RetryJob);
+        assert!(app.pending_retry.is_none());
+        assert!(!app.pending_nudge);
+        assert!(
+            app.status_message
+                .as_deref()
+                .unwrap()
+                .contains("not in a retriable state")
+        );
     }
 
     #[test]
