@@ -6,14 +6,16 @@ pub mod process;
 use std::path::Path;
 use std::sync::Arc;
 
-use tokio::sync::{Notify, Semaphore, watch};
+use nix::sys::signal;
+use nix::unistd::Pid;
+use tokio::sync::{Notify, Semaphore, oneshot, watch};
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 
 use crate::config::Config;
 use crate::error::Result;
 use crate::traits::{Clock, JobStore, ReviewExecutor};
-use crate::types::{Job, JobStatus};
+use crate::types::{Job, JobFilter, JobStatus};
 
 /// Run the job execution loop.
 ///
@@ -64,7 +66,7 @@ where
         }
 
         // Recover stale leases before polling for new work.
-        recover_stale_leases(&*store);
+        recover_stale_jobs(&*store);
 
         // Acquire concurrency permit, but also listen for shutdown so we
         // don't block here indefinitely when a shutdown is requested.
@@ -153,13 +155,6 @@ async fn execute_job<S: JobStore, E: ReviewExecutor>(
     base_repo: &Path,
     worktree_root: &Path,
 ) {
-    // Transition leased → running so stale lease recovery won't re-queue us.
-    if let Err(e) = store.mark_running(job.id, std::process::id()) {
-        error!(job_id = job.id, error = %e, "failed to mark job as running");
-        let _ = store.complete(job.id, JobStatus::Failed, None);
-        return;
-    }
-
     let worktree_path =
         match crate::worktree::create(base_repo, worktree_root, job.id, &job.head_sha) {
             Ok(path) => path,
@@ -174,7 +169,52 @@ async fn execute_job<S: JobStore, E: ReviewExecutor>(
         warn!(job_id = job.id, error = %e, "failed to store worktree_path");
     }
 
-    match executor.execute(&job, &worktree_path).await {
+    let (pid_tx, mut pid_rx) = oneshot::channel();
+    let mut execution = std::pin::pin!(executor.execute(&job, &worktree_path, Some(pid_tx)));
+    let mut running_marked = false;
+
+    let execution_result = loop {
+        tokio::select! {
+            pid = &mut pid_rx, if !running_marked => {
+                match pid {
+                    Ok(pid) => {
+                        if let Err(e) = store.mark_running(job.id, pid) {
+                            error!(job_id = job.id, pid, error = %e, "failed to mark job as running");
+                            let _ = executor.cancel(&job).await;
+                            let _ = executor.clear_active_pid(job.id);
+                            let _ = store.complete(job.id, JobStatus::Failed, None);
+                            return;
+                        }
+                    }
+                    Err(_) => {
+                        warn!(job_id = job.id, "review process exited before reporting PID");
+                    }
+                }
+                running_marked = true;
+            }
+            result = &mut execution => break result,
+        }
+    };
+
+    if !running_marked {
+        match pid_rx.try_recv() {
+            Ok(pid) => {
+                if let Err(e) = store.mark_running(job.id, pid) {
+                    error!(job_id = job.id, pid, error = %e, "failed to mark job as running");
+                    let _ = executor.cancel(&job).await;
+                    let _ = executor.clear_active_pid(job.id);
+                    let _ = store.complete(job.id, JobStatus::Failed, None);
+                    return;
+                }
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                unreachable!("executor finished, so PID channel must be sent or closed")
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {}
+        }
+    }
+
+    match execution_result {
         Ok(result) => {
             // Persist log file paths so TUI and CLI tail can find them.
             if let (Some(stdout), Some(stderr)) = (&result.stdout_path, &result.stderr_path) {
@@ -218,8 +258,8 @@ async fn execute_job<S: JobStore, E: ReviewExecutor>(
     // (e.g. `claude --resume <sid>`) which are tied to the worktree cwd.
 }
 
-/// Re-queue jobs whose leases have expired (crash recovery).
-fn recover_stale_leases<S: JobStore>(store: &S) {
+/// Re-queue abandoned jobs after daemon crash recovery.
+fn recover_stale_jobs<S: JobStore>(store: &S) {
     let stale = match store.find_stale_leases() {
         Ok(jobs) => jobs,
         Err(e) => {
@@ -243,5 +283,91 @@ fn recover_stale_leases<S: JobStore>(store: &S) {
             );
             let _ = store.requeue_stale(job.id);
         }
+    }
+
+    let running = match store.list_jobs(&JobFilter {
+        status: Some(JobStatus::Running),
+        ..Default::default()
+    }) {
+        Ok(jobs) => jobs,
+        Err(e) => {
+            warn!(error = %e, "failed to query running jobs for recovery");
+            return;
+        }
+    };
+
+    for job in running {
+        let Some(pid) = job.pid else {
+            warn!(
+                job_id = job.id,
+                "running job has no recorded PID, re-queuing"
+            );
+            let _ = store.requeue_running(job.id);
+            continue;
+        };
+
+        if is_process_alive(pid) {
+            continue;
+        }
+
+        if job.retry_count >= job.max_retries {
+            warn!(
+                job_id = job.id,
+                pid, "orphaned running job exceeded max retries, marking failed"
+            );
+            let _ = store.complete(job.id, JobStatus::Failed, None);
+        } else {
+            warn!(
+                job_id = job.id,
+                pid,
+                retry = job.retry_count + 1,
+                "re-queuing orphaned running job"
+            );
+            let _ = store.requeue_running(job.id);
+        }
+    }
+}
+
+fn is_process_alive(pid: u32) -> bool {
+    let Ok(raw_pid) = i32::try_from(pid) else {
+        return false;
+    };
+    signal::kill(Pid::from_raw(raw_pid), None).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Database;
+    use crate::traits::JobStore;
+    use crate::types::{AgentKind, NewJob, RepoId};
+
+    fn sample_job() -> NewJob {
+        NewJob {
+            repo: RepoId::new("owner", "repo"),
+            pr_number: 42,
+            head_sha: "abc123".into(),
+            agent_kind: AgentKind::Claude,
+            command: Some("echo review".into()),
+            prompt_template: None,
+            max_retries: 3,
+        }
+    }
+
+    #[test]
+    fn recover_stale_jobs_requeues_orphaned_running_job() {
+        let db = Database::open_in_memory().expect("db");
+        let job = db.enqueue(sample_job()).expect("enqueue");
+        let leased = db.lease_next().expect("lease").expect("has job");
+        db.mark_running(leased.id, i32::MAX as u32)
+            .expect("mark running");
+
+        recover_stale_jobs(&db);
+
+        let jobs = db.list_jobs(&JobFilter::default()).expect("list");
+        let recovered = jobs.iter().find(|j| j.id == job.id).expect("find job");
+        assert_eq!(recovered.status, JobStatus::Queued);
+        assert_eq!(recovered.retry_count, 1);
+        assert!(recovered.pid.is_none());
     }
 }

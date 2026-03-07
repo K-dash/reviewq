@@ -160,7 +160,10 @@ async fn executor_runs_command_and_captures_output() {
     );
 
     let job = make_test_job(42, None);
-    let result = executor.execute(&job, &worktree).await.expect("execute");
+    let result = executor
+        .execute(&job, &worktree, None)
+        .await
+        .expect("execute");
 
     assert_eq!(result.exit_code, 0);
 
@@ -182,7 +185,10 @@ async fn executor_interpolates_template_variables() {
     let executor = CommandExecutor::new(cmd.into(), CancelConfig::default(), output_dir.clone());
 
     let job = make_test_job(7, None);
-    let result = executor.execute(&job, &worktree).await.expect("execute");
+    let result = executor
+        .execute(&job, &worktree, None)
+        .await
+        .expect("execute");
 
     assert_eq!(result.exit_code, 0);
     let content =
@@ -213,7 +219,10 @@ async fn executor_sets_environment_variables() {
     let executor = CommandExecutor::new(cmd.into(), CancelConfig::default(), output_dir.clone());
 
     let job = make_test_job(8, None);
-    let result = executor.execute(&job, &worktree).await.expect("execute");
+    let result = executor
+        .execute(&job, &worktree, None)
+        .await
+        .expect("execute");
 
     assert_eq!(result.exit_code, 0);
 
@@ -249,7 +258,10 @@ async fn executor_non_json_output_returns_none() {
     );
 
     let job = make_test_job(1, None);
-    let result = executor.execute(&job, &worktree).await.expect("execute");
+    let result = executor
+        .execute(&job, &worktree, None)
+        .await
+        .expect("execute");
 
     assert_eq!(result.exit_code, 0);
     assert!(result.review_markdown.is_none());
