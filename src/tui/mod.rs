@@ -97,12 +97,29 @@ pub fn run<S: JobStore>(store: &S, output_dir: &Path, logging_dir: &Path) -> Res
             app.view = View::Review;
         }
 
+        // Process pending cancel request (DB write BEFORE nudge).
+        if let Some(job_id) = app.pending_cancel.take() {
+            match store.request_cancel(job_id) {
+                Ok(()) => {
+                    // nudge stays true — daemon should wake to process the cancel.
+                }
+                Err(e) => {
+                    // Cancel DB write failed — suppress the nudge.
+                    app.pending_nudge = false;
+                    app.status_message = Some(format!("Failed to request cancel: {e}"));
+                }
+            }
+        }
+
         // Nudge daemon if dispatch requested it.
         if app.pending_nudge {
             app.pending_nudge = false;
             match nudge_daemon(&pid_file) {
                 Ok(()) => {
-                    app.status_message = Some("Nudged daemon to start review".to_owned());
+                    // Don't overwrite cancel message — only set if no message yet.
+                    if app.status_message.is_none() {
+                        app.status_message = Some("Nudged daemon to start review".to_owned());
+                    }
                 }
                 Err(NudgeError::NotRunning) => {
                     app.status_message = Some("Daemon is not running".to_owned());

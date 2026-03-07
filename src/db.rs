@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     worktree_path TEXT,
     review_output TEXT,
     session_id    TEXT,
+    cancel_requested_at TEXT,
     created_at    TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at    TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(repo_owner, repo_name, pr_number, head_sha, agent_kind)
@@ -128,6 +129,16 @@ impl Database {
         if !has_session_id {
             conn.execute_batch("ALTER TABLE jobs ADD COLUMN session_id TEXT;")?;
         }
+
+        // Add cancel_requested_at column if it doesn't exist.
+        let has_cancel_requested_at: bool = conn
+            .prepare("PRAGMA table_info(jobs)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .any(|name| name.as_deref() == Ok("cancel_requested_at"));
+
+        if !has_cancel_requested_at {
+            conn.execute_batch("ALTER TABLE jobs ADD COLUMN cancel_requested_at TEXT;")?;
+        }
         Ok(())
     }
 
@@ -156,6 +167,7 @@ fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
     let stdout_path: Option<String> = row.get("stdout_path")?;
     let stderr_path: Option<String> = row.get("stderr_path")?;
     let worktree_path: Option<String> = row.get("worktree_path")?;
+    let cancel_requested_at: Option<String> = row.get("cancel_requested_at")?;
 
     Ok(Job {
         id: row.get("id")?,
@@ -180,6 +192,7 @@ fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
         worktree_path: worktree_path.map(Into::into),
         review_output: row.get("review_output")?,
         session_id: row.get("session_id")?,
+        cancel_requested_at: cancel_requested_at.map(|s| parse_datetime(&s)),
         created_at: parse_datetime(&created_at),
         updated_at: parse_datetime(&updated_at),
     })
@@ -226,6 +239,7 @@ impl JobStore for Database {
                      WHERE id = (
                          SELECT id FROM jobs
                          WHERE status = 'queued'
+                           AND cancel_requested_at IS NULL
                          ORDER BY created_at ASC
                          LIMIT 1
                      )
@@ -243,23 +257,47 @@ impl JobStore for Database {
         let conn = self.lock_conn();
         let rows = conn.execute(
             "UPDATE jobs SET status = ?1, exit_code = ?2, updated_at = datetime('now')
-             WHERE id = ?3",
+             WHERE id = ?3 AND status NOT IN ('succeeded', 'failed', 'canceled')",
             params![status.as_db_str(), exit_code, id],
         )?;
         if rows == 0 {
-            return Err(ReviewqError::Database(rusqlite::Error::QueryReturnedNoRows));
+            tracing::warn!(job_id = id, target_status = %status, "complete() matched 0 rows — job may already be terminal or not found");
         }
         Ok(())
     }
 
-    fn cancel(&self, id: i64) -> Result<()> {
+    fn request_cancel(&self, id: i64) -> Result<()> {
         let conn = self.lock_conn();
         conn.execute(
-            "UPDATE jobs SET status = 'canceled', updated_at = datetime('now')
-             WHERE id = ?1 AND status NOT IN ('succeeded', 'failed', 'canceled')",
+            "UPDATE jobs SET cancel_requested_at = datetime('now'), updated_at = datetime('now')
+             WHERE id = ?1 AND status NOT IN ('succeeded', 'failed', 'canceled')
+               AND cancel_requested_at IS NULL",
             params![id],
         )?;
         Ok(())
+    }
+
+    fn is_cancel_requested(&self, id: i64) -> Result<bool> {
+        let conn = self.lock_conn();
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM jobs WHERE id = ?1 AND cancel_requested_at IS NOT NULL)",
+            params![id],
+            |row| row.get(0),
+        )?;
+        Ok(exists)
+    }
+
+    fn cancel_queued_requested(&self) -> Result<Vec<i64>> {
+        let conn = self.lock_conn();
+        let mut stmt = conn.prepare(
+            "UPDATE jobs SET status = 'canceled', updated_at = datetime('now')
+             WHERE status = 'queued' AND cancel_requested_at IS NOT NULL
+             RETURNING id",
+        )?;
+        let ids = stmt
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(ids)
     }
 
     fn is_processed(&self, key: &IdempotencyKey) -> Result<bool> {
@@ -537,18 +575,78 @@ mod tests {
     }
 
     #[test]
-    fn cancel_job() {
+    fn request_cancel_sets_timestamp() {
         let db = test_db();
         let job = db.enqueue(sample_job()).expect("enqueue");
-        db.cancel(job.id).expect("cancel");
+        db.request_cancel(job.id).expect("request_cancel");
 
-        let jobs = db
-            .list_jobs(&JobFilter {
-                status: Some(JobStatus::Canceled),
-                ..Default::default()
-            })
-            .expect("list");
-        assert_eq!(jobs.len(), 1);
+        let jobs = db.list_jobs(&JobFilter::default()).expect("list");
+        assert_eq!(jobs[0].status, JobStatus::Queued);
+        assert!(jobs[0].is_cancel_requested());
+    }
+
+    #[test]
+    fn request_cancel_idempotent() {
+        let db = test_db();
+        let job = db.enqueue(sample_job()).expect("enqueue");
+        db.request_cancel(job.id).expect("first");
+        db.request_cancel(job.id).expect("second");
+
+        let jobs = db.list_jobs(&JobFilter::default()).expect("list");
+        assert!(jobs[0].is_cancel_requested());
+    }
+
+    #[test]
+    fn request_cancel_noop_on_terminal() {
+        let db = test_db();
+        let job = db.enqueue(sample_job()).expect("enqueue");
+        db.complete(job.id, JobStatus::Succeeded, Some(0))
+            .expect("complete");
+        db.request_cancel(job.id).expect("request_cancel");
+
+        let jobs = db.list_jobs(&JobFilter::default()).expect("list");
+        assert!(!jobs[0].is_cancel_requested());
+    }
+
+    #[test]
+    fn cancel_queued_requested_sweeps() {
+        let db = test_db();
+        let job = db.enqueue(sample_job()).expect("enqueue");
+        db.request_cancel(job.id).expect("request_cancel");
+
+        let canceled_ids = db.cancel_queued_requested().expect("sweep");
+        assert_eq!(canceled_ids, vec![job.id]);
+
+        let jobs = db.list_jobs(&JobFilter::default()).expect("list");
+        assert_eq!(jobs[0].status, JobStatus::Canceled);
+    }
+
+    #[test]
+    fn cancel_queued_requested_skips_running() {
+        let db = test_db();
+        let job = db.enqueue(sample_job()).expect("enqueue");
+        let leased = db.lease_next().expect("lease").expect("has job");
+        db.mark_running(leased.id, 1234).expect("mark running");
+        db.request_cancel(job.id).expect("request_cancel");
+
+        let canceled_ids = db.cancel_queued_requested().expect("sweep");
+        assert!(canceled_ids.is_empty());
+    }
+
+    #[test]
+    fn lease_next_skips_cancel_requested() {
+        let db = test_db();
+        let mut j1 = sample_job();
+        j1.head_sha = "sha1".into();
+        let mut j2 = sample_job();
+        j2.head_sha = "sha2".into();
+
+        let job1 = db.enqueue(j1).expect("enqueue 1");
+        db.enqueue(j2).expect("enqueue 2");
+        db.request_cancel(job1.id).expect("request_cancel");
+
+        let leased = db.lease_next().expect("lease").expect("has job");
+        assert_eq!(leased.head_sha, "sha2");
     }
 
     #[test]
@@ -562,7 +660,8 @@ mod tests {
 
         db.enqueue(j1).expect("enqueue 1");
         let job2 = db.enqueue(j2).expect("enqueue 2");
-        db.cancel(job2.id).expect("cancel");
+        db.request_cancel(job2.id).expect("request_cancel");
+        db.cancel_queued_requested().expect("sweep");
 
         // List only queued
         let queued = db
@@ -688,7 +787,8 @@ mod tests {
         let db = test_db();
         let repo = RepoId::new("owner", "repo");
         let job = db.enqueue(sample_job()).expect("enqueue");
-        db.cancel(job.id).expect("cancel");
+        db.request_cancel(job.id).expect("request_cancel");
+        db.cancel_queued_requested().expect("sweep");
         assert!(
             !db.is_pr_reviewed(&repo, 42, &AgentKind::Claude)
                 .expect("should succeed")

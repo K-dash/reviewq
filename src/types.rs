@@ -371,8 +371,16 @@ pub struct Job {
     pub worktree_path: Option<PathBuf>,
     pub review_output: Option<String>,
     pub session_id: Option<String>,
+    pub cancel_requested_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+impl Job {
+    /// Whether a cancel has been requested for this job.
+    pub fn is_cancel_requested(&self) -> bool {
+        self.cancel_requested_at.is_some()
+    }
 }
 
 /// Data needed to create a new job (before it has an id).

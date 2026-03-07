@@ -40,7 +40,7 @@ pub fn handle_sha_change<S: JobStore>(
                 pr = pr.number,
                 "SHA changed, canceling stale job"
             );
-            if let Err(e) = store.cancel(job.id) {
+            if let Err(e) = store.request_cancel(job.id) {
                 warn!(job_id = job.id, error = %e, "failed to cancel stale job");
             }
             sha_changed = true;
@@ -113,14 +113,11 @@ mod tests {
         let pr = make_pr("new_sha");
         assert!(handle_sha_change(&db, &pr, &AgentKind::Claude).expect("should succeed"));
 
-        // Verify the old job was canceled
-        let filter = JobFilter {
-            status: Some(JobStatus::Canceled),
-            ..Default::default()
-        };
-        let canceled = db.list_jobs(&filter).expect("list");
-        assert_eq!(canceled.len(), 1);
-        assert_eq!(canceled[0].id, job.id);
+        // Verify cancel was requested (status stays queued until runner sweeps).
+        let jobs = db.list_jobs(&JobFilter::default()).expect("list");
+        let updated = jobs.iter().find(|j| j.id == job.id).expect("find job");
+        assert!(updated.is_cancel_requested());
+        assert_eq!(updated.status, JobStatus::Queued);
     }
 
     #[test]

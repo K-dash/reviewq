@@ -153,7 +153,8 @@ mod tests {
             })
             .expect("enqueue should succeed");
 
-        db.cancel(job.id).expect("cancel should succeed");
+        db.request_cancel(job.id).expect("request_cancel");
+        db.cancel_queued_requested().expect("cancel should succeed");
 
         // Canceled jobs should be eligible for re-enqueueing.
         let result = is_duplicate(&db, &repo, 1, "sha1", &AgentKind::Claude);
@@ -232,7 +233,8 @@ mod tests {
             })
             .expect("enqueue should succeed");
 
-        db.cancel(job.id).expect("cancel should succeed");
+        db.request_cancel(job.id).expect("request_cancel");
+        db.cancel_queued_requested().expect("cancel should succeed");
 
         // Canceled jobs should be eligible for retry even at PR level.
         let result = is_duplicate_for_pr(&db, &repo, 1, &AgentKind::Claude);
