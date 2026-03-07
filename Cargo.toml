@@ -9,7 +9,7 @@ repository = "https://github.com/K-dash/reviewq"
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
-comrak = "0.34"
+comrak = "0.50"
 crossterm = { version = "0.28", features = ["event-stream"] }
 arboard = "3"
 dirs = "6"
