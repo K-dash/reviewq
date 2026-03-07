@@ -202,7 +202,7 @@ Selects the AI review agent. Each agent has a built-in default command:
 
 | Agent    | Default command |
 |----------|----------------|
-| `claude` | `claude -p "$(cat "{prompt_file}")" --output-format json --allowedTools Read Grep Glob "Bash(gh:*)" "Bash(git:*)" WebFetch` |
+| `claude` | `claude -p "$(cat "{prompt_file}")" --output-format json --allowedTools Read Grep Glob Bash WebFetch WebSearch Agent Skill` |
 | `codex`  | `codex exec --json --sandbox danger-full-access - < "{prompt_file}"` |
 
 **Priority chain**: per-repo `agent` > global `runner.agent` > `claude` (default).

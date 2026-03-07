@@ -123,7 +123,7 @@ impl AgentKind {
         match self {
             Self::Claude => {
                 format!(
-                    r#"claude -p "$(cat "{{prompt_file}}")"{model_flag} --output-format json --allowedTools Read Grep Glob "Bash(gh:*)" "Bash(git:*)" WebFetch"#
+                    r#"claude -p "$(cat "{{prompt_file}}")"{model_flag} --output-format json --allowedTools Read Grep Glob Bash WebFetch WebSearch Agent Skill"#
                 )
             }
             Self::Codex => {
