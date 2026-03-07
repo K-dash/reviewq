@@ -155,6 +155,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
             ("t", "tail"),
             ("p", "prompt"),
             ("s", "start"),
+            ("c", "copy sid"),
             ("x", "cancel"),
             ("r", "retry"),
             ("o", "PR"),

@@ -84,6 +84,12 @@ pub trait JobStore: Send + Sync {
     /// Store review output for a completed job.
     fn store_review_output(&self, id: i64, markdown: &str) -> Result<()>;
 
+    /// Store the session ID extracted from agent output.
+    fn store_session_id(&self, id: i64, session_id: &str) -> Result<()>;
+
+    /// Store the worktree path for a running job.
+    fn store_worktree_path(&self, id: i64, path: &Path) -> Result<()>;
+
     /// Re-queue a stale leased job for retry (increment retry_count, reset to queued).
     fn requeue_stale(&self, id: i64) -> Result<()>;
 

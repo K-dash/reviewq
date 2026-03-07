@@ -112,16 +112,169 @@ impl AgentKind {
     ///
     /// The template may contain `{prompt_file}` and `{output_path}` placeholders
     /// that are interpolated by the executor before spawning.
+    ///
+    /// Commands use `--output-format json` (Claude) or `--json` (Codex) so the
+    /// executor can parse session IDs from the structured output.
     pub fn default_command(&self) -> &'static str {
         match self {
             Self::Claude => {
-                r#"set -o pipefail; claude -p "$(cat "{prompt_file}")" | tee "{output_path}""#
+                r#"claude -p "$(cat "{prompt_file}")" --output-format json --allowedTools Read Grep Glob "Bash(gh:*)" "Bash(git:*)" WebFetch"#
             }
-            Self::Codex => {
-                r#"set -o pipefail; codex exec --sandbox danger-full-access - < "{prompt_file}" | tee "{output_path}""#
+            Self::Codex => r#"codex exec --json --sandbox danger-full-access - < "{prompt_file}""#,
+        }
+    }
+
+    /// Parse agent-specific structured output to extract session ID and markdown.
+    ///
+    /// Returns `(session_id, markdown)`. Both are `None` on parse failure,
+    /// allowing the caller to fall back to other sources.
+    pub fn parse_output(&self, raw: &str) -> (Option<String>, Option<String>) {
+        match self {
+            Self::Claude => parse_claude_json(raw),
+            Self::Codex => parse_codex_jsonl(raw),
+        }
+    }
+
+    /// Return the CLI command to resume a session with this agent.
+    ///
+    /// If `repo_path` is provided, the command is prefixed with `cd <path> &&`
+    /// so users can paste and run it directly.
+    pub fn resume_command(&self, session_id: &str, repo_path: Option<&std::path::Path>) -> String {
+        let resume = match self {
+            Self::Claude => format!("claude --resume {session_id}"),
+            Self::Codex => format!("codex exec resume {session_id}"),
+        };
+        match repo_path {
+            Some(p) => format!("cd {} && {resume}", p.display()),
+            None => resume,
+        }
+    }
+}
+
+/// Parse Claude `--output-format json` output.
+///
+/// Claude outputs a JSON array of conversation events:
+/// `[{type:"system", session_id:...}, {type:"assistant", message:{content:[...]}}, ..., {type:"result", result:"...", session_id:"..."}]`
+///
+/// The review text comes from `result.result`. If that is empty (e.g. the
+/// agent only used tools), we collect `assistant` → `message.content[]`
+/// text blocks instead.
+fn parse_claude_json(raw: &str) -> (Option<String>, Option<String>) {
+    let val: serde_json::Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(_) => return (None, None),
+    };
+
+    let arr = match val.as_array() {
+        Some(a) => a,
+        None => return (None, None),
+    };
+
+    let mut session_id: Option<String> = None;
+    let mut result_text: Option<String> = None;
+    let mut assistant_texts: Vec<String> = Vec::new();
+
+    for item in arr {
+        // session_id appears on every entry; grab it once.
+        if session_id.is_none()
+            && let Some(sid) = item.get("session_id").and_then(|v| v.as_str())
+        {
+            session_id = Some(sid.to_owned());
+        }
+
+        match item.get("type").and_then(|v| v.as_str()) {
+            Some("result") => {
+                if let Some(r) = item
+                    .get("result")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    result_text = Some(r.to_owned());
+                }
+            }
+            Some("assistant") => {
+                if let Some(content) = item
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_array())
+                {
+                    for c in content {
+                        if c.get("type").and_then(|v| v.as_str()) == Some("text")
+                            && let Some(text) = c.get("text").and_then(|v| v.as_str())
+                        {
+                            assistant_texts.push(text.to_owned());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let markdown = result_text.or_else(|| {
+        if assistant_texts.is_empty() {
+            None
+        } else {
+            Some(assistant_texts.join("\n\n"))
+        }
+    });
+
+    (session_id, markdown)
+}
+
+/// Parse Codex `--json` JSONL output.
+///
+/// Scans lines for `thread.started` (session ID) and `item.completed`
+/// with `agent_message` content (review text).
+fn parse_codex_jsonl(raw: &str) -> (Option<String>, Option<String>) {
+    let mut session_id: Option<String> = None;
+    let mut texts: Vec<String> = Vec::new();
+
+    for line in raw.lines() {
+        let val: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        // Extract thread_id from thread.started event.
+        if val.get("type").and_then(|v| v.as_str()) == Some("thread.started") {
+            if let Some(tid) = val.get("thread_id").and_then(|v| v.as_str()) {
+                session_id = Some(tid.to_owned());
+            }
+            continue;
+        }
+
+        // Extract text from item.completed → agent_message.
+        // Codex has two output formats:
+        //   - item.text (direct text field on the item)
+        //   - item.content[].output_text.text (array of content blocks)
+        if val.get("type").and_then(|v| v.as_str()) == Some("item.completed")
+            && let Some(item) = val.get("item")
+            && item.get("type").and_then(|v| v.as_str()) == Some("agent_message")
+        {
+            // Format 1: direct text field
+            if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                texts.push(text.to_owned());
+            }
+            // Format 2: content array with output_text entries
+            else if let Some(content) = item.get("content").and_then(|v| v.as_array()) {
+                for entry in content {
+                    if entry.get("type").and_then(|v| v.as_str()) == Some("output_text")
+                        && let Some(text) = entry.get("text").and_then(|v| v.as_str())
+                    {
+                        texts.push(text.to_owned());
+                    }
+                }
             }
         }
     }
+
+    let markdown = if texts.is_empty() {
+        None
+    } else {
+        Some(texts.join(""))
+    };
+    (session_id, markdown)
 }
 
 // ---------------------------------------------------------------------------
@@ -207,6 +360,7 @@ pub struct Job {
     pub stderr_path: Option<PathBuf>,
     pub worktree_path: Option<PathBuf>,
     pub review_output: Option<String>,
+    pub session_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -253,6 +407,7 @@ pub struct JobFilter {
 pub struct ReviewResult {
     pub exit_code: i32,
     pub review_markdown: Option<String>,
+    pub session_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -283,6 +438,99 @@ mod tests {
     fn agent_kind_default_command_contains_agent_name() {
         assert!(AgentKind::Claude.default_command().contains("claude"));
         assert!(AgentKind::Codex.default_command().contains("codex"));
+    }
+
+    #[test]
+    fn parse_claude_json_valid() {
+        let raw = r##"[{"type":"system","session_id":"abc-123"},{"type":"result","session_id":"abc-123","result":"# LGTM\nAll good."}]"##;
+        let (sid, md) = AgentKind::Claude.parse_output(raw);
+        assert_eq!(sid.as_deref(), Some("abc-123"));
+        assert_eq!(md.as_deref(), Some("# LGTM\nAll good."));
+    }
+
+    #[test]
+    fn parse_claude_json_array_format() {
+        let raw = r##"[{"type":"system","subtype":"init","session_id":"sid-arr"},{"type":"assistant","session_id":"sid-arr"},{"type":"result","session_id":"sid-arr","result":"# Review\nLGTM"}]"##;
+        let (sid, md) = AgentKind::Claude.parse_output(raw);
+        assert_eq!(sid.as_deref(), Some("sid-arr"));
+        assert_eq!(md.as_deref(), Some("# Review\nLGTM"));
+    }
+
+    #[test]
+    fn parse_claude_json_malformed() {
+        let (sid, md) = AgentKind::Claude.parse_output("not json at all");
+        assert!(sid.is_none());
+        assert!(md.is_none());
+    }
+
+    #[test]
+    fn parse_claude_json_empty() {
+        let (sid, md) = AgentKind::Claude.parse_output("");
+        assert!(sid.is_none());
+        assert!(md.is_none());
+    }
+
+    #[test]
+    fn parse_codex_jsonl_valid() {
+        let raw = r##"{"type":"thread.started","thread_id":"tid-999"}
+{"type":"item.completed","item":{"type":"agent_message","content":[{"type":"output_text","text":"# Review\n"}]}}
+{"type":"item.completed","item":{"type":"agent_message","content":[{"type":"output_text","text":"LGTM"}]}}"##;
+        let (sid, md) = AgentKind::Codex.parse_output(raw);
+        assert_eq!(sid.as_deref(), Some("tid-999"));
+        assert_eq!(md.as_deref(), Some("# Review\nLGTM"));
+    }
+
+    #[test]
+    fn parse_codex_jsonl_direct_text_format() {
+        let raw = r##"{"type":"thread.started","thread_id":"tid-direct"}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"# Direct Review\nLGTM"}}"##;
+        let (sid, md) = AgentKind::Codex.parse_output(raw);
+        assert_eq!(sid.as_deref(), Some("tid-direct"));
+        assert_eq!(md.as_deref(), Some("# Direct Review\nLGTM"));
+    }
+
+    #[test]
+    fn parse_codex_jsonl_missing_thread_started() {
+        let raw = r##"{"type":"item.completed","item":{"type":"agent_message","content":[{"type":"output_text","text":"hello"}]}}"##;
+        let (sid, md) = AgentKind::Codex.parse_output(raw);
+        assert!(sid.is_none());
+        assert_eq!(md.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn parse_codex_jsonl_empty() {
+        let (sid, md) = AgentKind::Codex.parse_output("");
+        assert!(sid.is_none());
+        assert!(md.is_none());
+    }
+
+    #[test]
+    fn resume_command_claude_without_path() {
+        assert_eq!(
+            AgentKind::Claude.resume_command("abc-123", None),
+            "claude --resume abc-123"
+        );
+    }
+
+    #[test]
+    fn resume_command_codex_without_path() {
+        assert_eq!(
+            AgentKind::Codex.resume_command("tid-999", None),
+            "codex exec resume tid-999"
+        );
+    }
+
+    #[test]
+    fn resume_command_with_repo_path() {
+        let path = std::path::Path::new("/home/user/my-repo");
+        assert_eq!(
+            AgentKind::Claude.resume_command("abc-123", Some(path)),
+            "cd /home/user/my-repo && claude --resume abc-123"
+        );
+        assert_eq!(
+            AgentKind::Codex.resume_command("tid-999", Some(path)),
+            "cd /home/user/my-repo && codex exec resume tid-999"
+        );
     }
 
     #[test]

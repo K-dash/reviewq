@@ -304,14 +304,18 @@ impl ReviewExecutor for CommandExecutor {
 
         let exit_code = status.code().unwrap_or(-1);
 
-        // Try to read review output from the well-known file (async I/O — fix #5).
-        let review_markdown = tokio::fs::read_to_string(worktree.join(REVIEW_OUTPUT_FILE))
-            .await
-            .ok();
+        // Parse agent-specific structured output (Claude JSON / Codex JSONL)
+        // to extract session ID and review markdown.
+        let stdout_content = tokio::fs::read_to_string(&stdout_path).await.ok();
+        let (session_id, review_markdown) = stdout_content
+            .as_deref()
+            .map(|raw| job.agent_kind.parse_output(raw))
+            .unwrap_or((None, None));
 
         Ok(ReviewResult {
             exit_code,
             review_markdown,
+            session_id,
         })
     }
 
@@ -366,6 +370,7 @@ mod tests {
             stderr_path: None,
             worktree_path: None,
             review_output: None,
+            session_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -501,18 +506,19 @@ mod tests {
         let result = executor.execute(&job, &worktree).await.expect("execute");
 
         assert_eq!(result.exit_code, 0);
+        // Non-JSON output — parse_output returns None for both fields.
         assert!(result.review_markdown.is_none());
+        assert!(result.session_id.is_none());
         assert!(output_dir.join("job-1-stdout.log").exists());
         assert!(output_dir.join("job-1-stderr.log").exists());
     }
 
     #[tokio::test]
-    async fn execute_reads_review_md() {
+    async fn execute_non_json_output_returns_none() {
         let tmp = TempDir::new().expect("temp dir");
         let output_dir = tmp.path().join("output");
         let worktree = tmp.path().join("worktree");
         std::fs::create_dir_all(&worktree).expect("create worktree dir");
-        std::fs::write(worktree.join("REVIEW.md"), "# LGTM").expect("write REVIEW.md");
 
         let executor = CommandExecutor::new("true".into(), CancelConfig::default(), output_dir);
 
@@ -520,7 +526,9 @@ mod tests {
         let result = executor.execute(&job, &worktree).await.expect("execute");
 
         assert_eq!(result.exit_code, 0);
-        assert_eq!(result.review_markdown.as_deref(), Some("# LGTM"));
+        // Non-JSON stdout — no review markdown extracted.
+        assert!(result.review_markdown.is_none());
+        assert!(result.session_id.is_none());
     }
 
     #[tokio::test]
@@ -611,17 +619,16 @@ mod tests {
         let worktree = tmp.path().join("worktree");
         std::fs::create_dir_all(&worktree).expect("create worktree dir");
 
-        // Command echoes the REVIEWQ_PROMPT env var into REVIEW.md
-        let cmd = r#"printf '%s' "$REVIEWQ_PROMPT" > REVIEW.md"#;
         let executor =
-            CommandExecutor::new(cmd.into(), CancelConfig::default(), output_dir.clone());
+            CommandExecutor::new("true".into(), CancelConfig::default(), output_dir.clone());
 
         let job = make_job(1, None);
         let result = executor.execute(&job, &worktree).await.expect("execute");
-
         assert_eq!(result.exit_code, 0);
-        let content = result.review_markdown.expect("REVIEW.md should exist");
-        // Default prompt should contain the spec's structured template
+
+        // Verify prompt file contains rendered default template.
+        let content =
+            std::fs::read_to_string(output_dir.join("job-1-prompt.txt")).expect("read prompt");
         assert!(
             content.contains("Review the following pull request"),
             "default prompt not rendered: {content}"
@@ -639,15 +646,16 @@ mod tests {
         let worktree = tmp.path().join("worktree");
         std::fs::create_dir_all(&worktree).expect("create worktree dir");
 
-        let cmd = r#"printf '%s' "$REVIEWQ_PROMPT" > REVIEW.md"#;
-        let executor = CommandExecutor::new(cmd.into(), CancelConfig::default(), output_dir);
+        let executor =
+            CommandExecutor::new("true".into(), CancelConfig::default(), output_dir.clone());
 
         let job = make_job_with_prompt(1, None, Some("Custom review for {repo} PR #{pr_number}"));
         let result = executor.execute(&job, &worktree).await.expect("execute");
-
         assert_eq!(result.exit_code, 0);
-        let content = result.review_markdown.expect("REVIEW.md should exist");
-        // Builtin header is always prepended.
+
+        // Verify prompt file contains builtin header + custom body.
+        let content =
+            std::fs::read_to_string(output_dir.join("job-1-prompt.txt")).expect("read prompt");
         assert!(
             content.contains("Review the following pull request"),
             "builtin header missing: {content}"
@@ -693,8 +701,8 @@ mod tests {
         let worktree = tmp.path().join("worktree");
         std::fs::create_dir_all(&worktree).expect("create worktree dir");
 
-        // Command uses both {prompt} and {prompt_file}
-        let cmd = r#"printf '%s\n%s' '{prompt}' '{prompt_file}' > REVIEW.md"#;
+        // Command uses both {prompt} and {prompt_file} — verify via stdout log.
+        let cmd = r#"printf '%s\n%s' '{prompt}' '{prompt_file}'"#;
         let executor =
             CommandExecutor::new(cmd.into(), CancelConfig::default(), output_dir.clone());
 
@@ -702,7 +710,8 @@ mod tests {
         let result = executor.execute(&job, &worktree).await.expect("execute");
 
         assert_eq!(result.exit_code, 0);
-        let content = result.review_markdown.expect("REVIEW.md should exist");
+        let content =
+            std::fs::read_to_string(output_dir.join("job-1-stdout.log")).expect("read stdout");
         assert!(
             content.contains("Hello owner/repo"),
             "prompt not interpolated in command: {content}"
@@ -721,7 +730,8 @@ mod tests {
         let worktree = tmp.path().join("worktree");
         std::fs::create_dir_all(&worktree).expect("create worktree dir");
 
-        let cmd = r#"printf '%s' "$REVIEWQ_PROMPT_FILE" > REVIEW.md"#;
+        // Verify REVIEWQ_PROMPT_FILE env var is set via stdout log.
+        let cmd = r#"printf '%s' "$REVIEWQ_PROMPT_FILE""#;
         let executor =
             CommandExecutor::new(cmd.into(), CancelConfig::default(), output_dir.clone());
 
@@ -729,7 +739,8 @@ mod tests {
         let result = executor.execute(&job, &worktree).await.expect("execute");
 
         assert_eq!(result.exit_code, 0);
-        let content = result.review_markdown.expect("REVIEW.md should exist");
+        let content =
+            std::fs::read_to_string(output_dir.join("job-1-stdout.log")).expect("read stdout");
         let expected_path = output_dir.join("job-1-prompt.txt").display().to_string();
         assert_eq!(content, expected_path);
     }
@@ -744,7 +755,8 @@ mod tests {
         // Create a prompt template that, combined with builtin header, exceeds 128KB.
         let header_len = BUILTIN_HEADER.len() + 2; // +2 for "\n\n"
         let large_template = "x".repeat(MAX_PROMPT_ENV_SIZE + 1 - header_len);
-        let cmd = r#"printf '%s\n%s' "$REVIEWQ_PROMPT" "$REVIEWQ_PROMPT_FILE" > REVIEW.md"#;
+        // Verify REVIEWQ_PROMPT is empty when prompt exceeds 128KB, via stdout log.
+        let cmd = r#"printf '%s\n%s' "$REVIEWQ_PROMPT" "$REVIEWQ_PROMPT_FILE""#;
         let executor =
             CommandExecutor::new(cmd.into(), CancelConfig::default(), output_dir.clone());
 
@@ -752,7 +764,8 @@ mod tests {
         let result = executor.execute(&job, &worktree).await.expect("execute");
 
         assert_eq!(result.exit_code, 0);
-        let content = result.review_markdown.expect("REVIEW.md should exist");
+        let content =
+            std::fs::read_to_string(output_dir.join("job-1-stdout.log")).expect("read stdout");
         // REVIEWQ_PROMPT should be empty (not set), but REVIEWQ_PROMPT_FILE should be present
         let lines: Vec<&str> = content.split('\n').collect();
         assert!(
@@ -809,5 +822,24 @@ mod tests {
         let result = executor.execute(&job, &worktree).await.expect("execute");
 
         assert_eq!(result.exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn execute_extracts_session_id_from_claude_json() {
+        let tmp = TempDir::new().expect("temp dir");
+        let output_dir = tmp.path().join("output");
+        let worktree = tmp.path().join("worktree");
+        std::fs::create_dir_all(&worktree).expect("create worktree dir");
+
+        // Command outputs Claude-style JSON array to stdout.
+        let cmd = r##"printf '[{"type":"system","session_id":"sid-42"},{"type":"result","session_id":"sid-42","result":"# LGTM"}]'"##;
+        let executor = CommandExecutor::new(cmd.into(), CancelConfig::default(), output_dir);
+
+        let job = make_job(1, None);
+        let result = executor.execute(&job, &worktree).await.expect("execute");
+
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.session_id.as_deref(), Some("sid-42"));
+        assert_eq!(result.review_markdown.as_deref(), Some("# LGTM"));
     }
 }

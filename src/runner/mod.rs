@@ -170,6 +170,10 @@ async fn execute_job<S: JobStore, E: ReviewExecutor>(
             }
         };
 
+    if let Err(e) = store.store_worktree_path(job.id, &worktree_path) {
+        warn!(job_id = job.id, error = %e, "failed to store worktree_path");
+    }
+
     match executor.execute(&job, &worktree_path).await {
         Ok(result) => {
             let status = if result.exit_code == 0 {
@@ -180,6 +184,11 @@ async fn execute_job<S: JobStore, E: ReviewExecutor>(
 
             if let Some(ref markdown) = result.review_markdown {
                 let _ = store.store_review_output(job.id, markdown);
+            }
+            if let Some(ref sid) = result.session_id
+                && let Err(e) = store.store_session_id(job.id, sid)
+            {
+                warn!(job_id = job.id, error = %e, "failed to store session_id");
             }
 
             if let Err(e) = store.complete(job.id, status, Some(result.exit_code)) {
@@ -199,9 +208,9 @@ async fn execute_job<S: JobStore, E: ReviewExecutor>(
         }
     }
 
-    if let Err(e) = crate::worktree::remove(base_repo, &worktree_path) {
-        warn!(job_id = job.id, error = %e, "failed to remove worktree after job");
-    }
+    // Worktree is NOT removed here — the TTL-based cleanup loop handles
+    // expiration.  Keeping it around lets users resume agent sessions
+    // (e.g. `claude --resume <sid>`) which are tied to the worktree cwd.
 }
 
 /// Re-queue jobs whose leases have expired (crash recovery).
