@@ -304,14 +304,35 @@ impl ReviewExecutor for CommandExecutor {
 
         let exit_code = status.code().unwrap_or(-1);
 
-        // Try to read review output from the well-known file (async I/O — fix #5).
-        let review_markdown = tokio::fs::read_to_string(worktree.join(REVIEW_OUTPUT_FILE))
-            .await
-            .ok();
+        // 3-tier fallback for review markdown + session ID extraction:
+        // 1. Parse agent-specific JSON/JSONL from stdout log
+        // 2. Read REVIEW.md from worktree (for custom commands that still use tee)
+        // 3. Raw stdout content as last resort
+        let stdout_content = tokio::fs::read_to_string(&stdout_path).await.ok();
+        let (session_id, parsed_markdown) = stdout_content
+            .as_deref()
+            .map(|raw| job.agent_kind.parse_output(raw))
+            .unwrap_or((None, None));
+
+        let review_markdown = if parsed_markdown.is_some() {
+            parsed_markdown
+        } else {
+            // Tier 2: REVIEW.md from worktree
+            let review_file = tokio::fs::read_to_string(worktree.join(REVIEW_OUTPUT_FILE))
+                .await
+                .ok();
+            if review_file.is_some() {
+                review_file
+            } else {
+                // Tier 3: raw stdout
+                stdout_content
+            }
+        };
 
         Ok(ReviewResult {
             exit_code,
             review_markdown,
+            session_id,
         })
     }
 
@@ -366,6 +387,7 @@ mod tests {
             stderr_path: None,
             worktree_path: None,
             review_output: None,
+            session_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -501,7 +523,9 @@ mod tests {
         let result = executor.execute(&job, &worktree).await.expect("execute");
 
         assert_eq!(result.exit_code, 0);
-        assert!(result.review_markdown.is_none());
+        // 3-tier fallback: JSON parse fails, no REVIEW.md, so raw stdout is returned.
+        assert_eq!(result.review_markdown.as_deref(), Some("hello\n"));
+        assert!(result.session_id.is_none());
         assert!(output_dir.join("job-1-stdout.log").exists());
         assert!(output_dir.join("job-1-stderr.log").exists());
     }
@@ -809,5 +833,47 @@ mod tests {
         let result = executor.execute(&job, &worktree).await.expect("execute");
 
         assert_eq!(result.exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn execute_extracts_session_id_from_claude_json() {
+        let tmp = TempDir::new().expect("temp dir");
+        let output_dir = tmp.path().join("output");
+        let worktree = tmp.path().join("worktree");
+        std::fs::create_dir_all(&worktree).expect("create worktree dir");
+
+        // Command outputs Claude-style JSON to stdout.
+        let cmd = r##"printf '{"session_id":"sid-42","result":"# LGTM"}'"##;
+        let executor = CommandExecutor::new(cmd.into(), CancelConfig::default(), output_dir);
+
+        let job = make_job(1, None);
+        let result = executor.execute(&job, &worktree).await.expect("execute");
+
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.session_id.as_deref(), Some("sid-42"));
+        assert_eq!(result.review_markdown.as_deref(), Some("# LGTM"));
+    }
+
+    #[tokio::test]
+    async fn execute_falls_back_to_review_md_when_json_fails() {
+        let tmp = TempDir::new().expect("temp dir");
+        let output_dir = tmp.path().join("output");
+        let worktree = tmp.path().join("worktree");
+        std::fs::create_dir_all(&worktree).expect("create worktree dir");
+
+        // Command outputs non-JSON, but writes REVIEW.md (custom command pattern).
+        let cmd = r##"echo "not json" && echo "# From REVIEW.md" > REVIEW.md"##;
+        let executor = CommandExecutor::new(cmd.into(), CancelConfig::default(), output_dir);
+
+        let job = make_job(1, None);
+        let result = executor.execute(&job, &worktree).await.expect("execute");
+
+        assert_eq!(result.exit_code, 0);
+        assert!(result.session_id.is_none());
+        // Should fall back to REVIEW.md (Tier 2), not raw stdout (Tier 3).
+        assert_eq!(
+            result.review_markdown.as_deref(),
+            Some("# From REVIEW.md\n")
+        );
     }
 }

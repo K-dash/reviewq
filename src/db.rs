@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     stderr_path   TEXT,
     worktree_path TEXT,
     review_output TEXT,
+    session_id    TEXT,
     created_at    TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at    TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(repo_owner, repo_name, pr_number, head_sha, agent_kind)
@@ -117,6 +118,16 @@ impl Database {
         if !has_prompt_template {
             conn.execute_batch("ALTER TABLE jobs ADD COLUMN prompt_template TEXT;")?;
         }
+
+        // Add session_id column if it doesn't exist.
+        let has_session_id: bool = conn
+            .prepare("PRAGMA table_info(jobs)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .any(|name| name.as_deref() == Ok("session_id"));
+
+        if !has_session_id {
+            conn.execute_batch("ALTER TABLE jobs ADD COLUMN session_id TEXT;")?;
+        }
         Ok(())
     }
 
@@ -168,6 +179,7 @@ fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
         stderr_path: stderr_path.map(Into::into),
         worktree_path: worktree_path.map(Into::into),
         review_output: row.get("review_output")?,
+        session_id: row.get("session_id")?,
         created_at: parse_datetime(&created_at),
         updated_at: parse_datetime(&updated_at),
     })
@@ -337,6 +349,16 @@ impl JobStore for Database {
             "UPDATE jobs SET review_output = ?1, updated_at = datetime('now')
              WHERE id = ?2",
             params![markdown, id],
+        )?;
+        Ok(())
+    }
+
+    fn store_session_id(&self, id: i64, session_id: &str) -> Result<()> {
+        let conn = self.lock_conn();
+        conn.execute(
+            "UPDATE jobs SET session_id = ?1, updated_at = datetime('now')
+             WHERE id = ?2",
+            params![session_id, id],
         )?;
         Ok(())
     }
@@ -527,6 +549,19 @@ mod tests {
 
         let jobs = db.list_jobs(&JobFilter::default()).expect("list");
         assert_eq!(jobs[0].review_output.as_deref(), Some("# Review\nLGTM"));
+    }
+
+    #[test]
+    fn store_session_id_roundtrip() {
+        let db = test_db();
+        let job = db.enqueue(sample_job()).expect("enqueue");
+        assert!(job.session_id.is_none());
+
+        db.store_session_id(job.id, "sess-abc-123")
+            .expect("store session_id");
+
+        let jobs = db.list_jobs(&JobFilter::default()).expect("list");
+        assert_eq!(jobs[0].session_id.as_deref(), Some("sess-abc-123"));
     }
 
     #[test]

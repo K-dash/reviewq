@@ -181,6 +181,11 @@ async fn execute_job<S: JobStore, E: ReviewExecutor>(
             if let Some(ref markdown) = result.review_markdown {
                 let _ = store.store_review_output(job.id, markdown);
             }
+            if let Some(ref sid) = result.session_id
+                && let Err(e) = store.store_session_id(job.id, sid)
+            {
+                warn!(job_id = job.id, error = %e, "failed to store session_id");
+            }
 
             if let Err(e) = store.complete(job.id, status, Some(result.exit_code)) {
                 error!(job_id = job.id, error = %e, "failed to mark job complete");

@@ -112,16 +112,96 @@ impl AgentKind {
     ///
     /// The template may contain `{prompt_file}` and `{output_path}` placeholders
     /// that are interpolated by the executor before spawning.
+    ///
+    /// Commands use `--output-format json` (Claude) or `--json` (Codex) so the
+    /// executor can parse session IDs from the structured output.
     pub fn default_command(&self) -> &'static str {
         match self {
-            Self::Claude => {
-                r#"set -o pipefail; claude -p "$(cat "{prompt_file}")" | tee "{output_path}""#
+            Self::Claude => r#"claude -p "$(cat "{prompt_file}")" --output-format json"#,
+            Self::Codex => r#"codex exec --json --sandbox danger-full-access - < "{prompt_file}""#,
+        }
+    }
+
+    /// Parse agent-specific structured output to extract session ID and markdown.
+    ///
+    /// Returns `(session_id, markdown)`. Both are `None` on parse failure,
+    /// allowing the caller to fall back to other sources.
+    pub fn parse_output(&self, raw: &str) -> (Option<String>, Option<String>) {
+        match self {
+            Self::Claude => parse_claude_json(raw),
+            Self::Codex => parse_codex_jsonl(raw),
+        }
+    }
+
+    /// Return the CLI command to resume a session with this agent.
+    pub fn resume_command(&self, session_id: &str) -> String {
+        match self {
+            Self::Claude => format!("claude --resume {session_id}"),
+            Self::Codex => format!("codex exec resume {session_id}"),
+        }
+    }
+}
+
+/// Parse Claude `--output-format json` output.
+///
+/// Expects a single JSON object with `session_id` and `result` fields.
+fn parse_claude_json(raw: &str) -> (Option<String>, Option<String>) {
+    let val: serde_json::Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(_) => return (None, None),
+    };
+    let session_id = val
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let markdown = val.get("result").and_then(|v| v.as_str()).map(String::from);
+    (session_id, markdown)
+}
+
+/// Parse Codex `--json` JSONL output.
+///
+/// Scans lines for `thread.started` (session ID) and `item.completed`
+/// with `agent_message` content (review text).
+fn parse_codex_jsonl(raw: &str) -> (Option<String>, Option<String>) {
+    let mut session_id: Option<String> = None;
+    let mut texts: Vec<String> = Vec::new();
+
+    for line in raw.lines() {
+        let val: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        // Extract thread_id from thread.started event.
+        if val.get("type").and_then(|v| v.as_str()) == Some("thread.started") {
+            if let Some(tid) = val.get("thread_id").and_then(|v| v.as_str()) {
+                session_id = Some(tid.to_owned());
             }
-            Self::Codex => {
-                r#"set -o pipefail; codex exec --sandbox danger-full-access - < "{prompt_file}" | tee "{output_path}""#
+            continue;
+        }
+
+        // Extract text from item.completed → agent_message → content[].output_text.
+        if val.get("type").and_then(|v| v.as_str()) == Some("item.completed")
+            && let Some(item) = val.get("item")
+            && item.get("type").and_then(|v| v.as_str()) == Some("agent_message")
+            && let Some(content) = item.get("content").and_then(|v| v.as_array())
+        {
+            for entry in content {
+                if entry.get("type").and_then(|v| v.as_str()) == Some("output_text")
+                    && let Some(text) = entry.get("text").and_then(|v| v.as_str())
+                {
+                    texts.push(text.to_owned());
+                }
             }
         }
     }
+
+    let markdown = if texts.is_empty() {
+        None
+    } else {
+        Some(texts.join(""))
+    };
+    (session_id, markdown)
 }
 
 // ---------------------------------------------------------------------------
@@ -207,6 +287,7 @@ pub struct Job {
     pub stderr_path: Option<PathBuf>,
     pub worktree_path: Option<PathBuf>,
     pub review_output: Option<String>,
+    pub session_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -253,6 +334,7 @@ pub struct JobFilter {
 pub struct ReviewResult {
     pub exit_code: i32,
     pub review_markdown: Option<String>,
+    pub session_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -283,6 +365,69 @@ mod tests {
     fn agent_kind_default_command_contains_agent_name() {
         assert!(AgentKind::Claude.default_command().contains("claude"));
         assert!(AgentKind::Codex.default_command().contains("codex"));
+    }
+
+    #[test]
+    fn parse_claude_json_valid() {
+        let raw = r##"{"session_id":"abc-123","result":"# LGTM\nAll good."}"##;
+        let (sid, md) = AgentKind::Claude.parse_output(raw);
+        assert_eq!(sid.as_deref(), Some("abc-123"));
+        assert_eq!(md.as_deref(), Some("# LGTM\nAll good."));
+    }
+
+    #[test]
+    fn parse_claude_json_malformed() {
+        let (sid, md) = AgentKind::Claude.parse_output("not json at all");
+        assert!(sid.is_none());
+        assert!(md.is_none());
+    }
+
+    #[test]
+    fn parse_claude_json_empty() {
+        let (sid, md) = AgentKind::Claude.parse_output("");
+        assert!(sid.is_none());
+        assert!(md.is_none());
+    }
+
+    #[test]
+    fn parse_codex_jsonl_valid() {
+        let raw = r##"{"type":"thread.started","thread_id":"tid-999"}
+{"type":"item.completed","item":{"type":"agent_message","content":[{"type":"output_text","text":"# Review\n"}]}}
+{"type":"item.completed","item":{"type":"agent_message","content":[{"type":"output_text","text":"LGTM"}]}}"##;
+        let (sid, md) = AgentKind::Codex.parse_output(raw);
+        assert_eq!(sid.as_deref(), Some("tid-999"));
+        assert_eq!(md.as_deref(), Some("# Review\nLGTM"));
+    }
+
+    #[test]
+    fn parse_codex_jsonl_missing_thread_started() {
+        let raw = r##"{"type":"item.completed","item":{"type":"agent_message","content":[{"type":"output_text","text":"hello"}]}}"##;
+        let (sid, md) = AgentKind::Codex.parse_output(raw);
+        assert!(sid.is_none());
+        assert_eq!(md.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn parse_codex_jsonl_empty() {
+        let (sid, md) = AgentKind::Codex.parse_output("");
+        assert!(sid.is_none());
+        assert!(md.is_none());
+    }
+
+    #[test]
+    fn resume_command_claude() {
+        assert_eq!(
+            AgentKind::Claude.resume_command("abc-123"),
+            "claude --resume abc-123"
+        );
+    }
+
+    #[test]
+    fn resume_command_codex() {
+        assert_eq!(
+            AgentKind::Codex.resume_command("tid-999"),
+            "codex exec resume tid-999"
+        );
     }
 
     #[test]

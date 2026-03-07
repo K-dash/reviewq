@@ -25,6 +25,7 @@ pub enum Action {
     CancelJob,
     RetryJob,
     StartReview,
+    CopySessionId,
     OpenInBrowser,
     GoBack,
     Refresh,
@@ -180,6 +181,23 @@ impl App {
                     }
                 }
             }
+            Action::CopySessionId => {
+                if let Some(job) = self.selected_job() {
+                    if let Some(ref sid) = job.session_id {
+                        let cmd = job.agent_kind.resume_command(sid);
+                        match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(&cmd)) {
+                            Ok(()) => {
+                                self.status_message = Some(format!("Copied: {cmd}"));
+                            }
+                            Err(e) => {
+                                self.status_message = Some(format!("Clipboard error: {e}"));
+                            }
+                        }
+                    } else {
+                        self.status_message = Some("No session ID available".to_owned());
+                    }
+                }
+            }
             Action::OpenInBrowser => {
                 if let Some(job) = self.selected_job() {
                     let url = format!(
@@ -330,6 +348,7 @@ mod tests {
             stderr_path: None,
             worktree_path: None,
             review_output: None,
+            session_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -470,5 +489,18 @@ mod tests {
 
         // Should stay on Queue view (browser open is deferred to event loop).
         assert_eq!(app.view, View::Queue);
+    }
+
+    #[test]
+    fn copy_session_id_without_session_shows_message() {
+        let (mut app, _tmp) = make_app();
+        let job = make_job(1, JobStatus::Succeeded);
+        app.update_jobs(vec![job]);
+
+        app.dispatch(Action::CopySessionId);
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("No session ID available")
+        );
     }
 }

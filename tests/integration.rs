@@ -140,6 +140,7 @@ fn make_test_job(id: i64, command: Option<&str>) -> reviewq::types::Job {
         stderr_path: None,
         worktree_path: None,
         review_output: None,
+        session_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }

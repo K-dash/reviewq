@@ -163,6 +163,7 @@ fn map_key(key: event::KeyEvent, app: &App) -> Option<Action> {
             KeyCode::Char('x') => Some(Action::CancelJob),
             KeyCode::Char('r') => Some(Action::RetryJob),
             KeyCode::Char('s') => Some(Action::StartReview),
+            KeyCode::Char('c') => Some(Action::CopySessionId),
             KeyCode::Char('R') => Some(Action::Refresh),
             KeyCode::Char('o') => Some(Action::OpenInBrowser),
             _ => None,
