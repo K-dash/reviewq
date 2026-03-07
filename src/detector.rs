@@ -135,8 +135,13 @@ where
             continue;
         }
 
-        // Generate command from resolved agent kind.
-        let command = Some(agent_kind.default_command().to_owned());
+        // Resolve model: per-repo override > global runner.model.
+        let model = policy
+            .and_then(|p| p.model.clone())
+            .or_else(|| config.runner.model.clone());
+
+        // Generate command from resolved agent kind and model.
+        let command = Some(agent_kind.default_command(model.as_deref()));
 
         // Resolve prompt_template: per-repo override > global runner.prompt_template.
         let prompt_template = policy
@@ -804,6 +809,109 @@ polling:
             .expect("list");
         assert_eq!(canceled.len(), 1);
         assert_eq!(canceled[0].head_sha, "old_sha");
+    }
+
+    #[tokio::test]
+    async fn per_repo_model_overrides_global() {
+        let github = MockGitHub {
+            username: "bob".into(),
+            prs: vec![make_pr(1, "sha1")],
+        };
+        let db = Database::open_in_memory().expect("db");
+        let config = Config::from_yaml(
+            r#"
+repos:
+  allowlist:
+    - repo: org/repo
+      model: gpt-5.3-codex
+runner:
+  model: gpt-5.4
+polling:
+  interval_seconds: 60
+"#,
+        )
+        .expect("config");
+        let policies = config.repo_policies();
+        let repo_ids = config.repo_ids();
+
+        let count = detect_once(&github, &db, &config, "bob", &repo_ids, &policies)
+            .await
+            .expect("should succeed");
+        assert_eq!(count, 1);
+
+        let jobs = db.list_jobs(&JobFilter::default()).expect("list");
+        assert!(
+            jobs[0]
+                .command
+                .as_deref()
+                .unwrap()
+                .contains("--model gpt-5.3-codex"),
+            "per-repo model should override global: {:?}",
+            jobs[0].command
+        );
+    }
+
+    #[tokio::test]
+    async fn global_model_used_when_no_per_repo() {
+        let github = MockGitHub {
+            username: "bob".into(),
+            prs: vec![make_pr(1, "sha1")],
+        };
+        let db = Database::open_in_memory().expect("db");
+        let config = Config::from_yaml(
+            r#"
+repos:
+  allowlist:
+    - repo: org/repo
+runner:
+  model: gpt-5.4
+polling:
+  interval_seconds: 60
+"#,
+        )
+        .expect("config");
+        let policies = config.repo_policies();
+        let repo_ids = config.repo_ids();
+
+        let count = detect_once(&github, &db, &config, "bob", &repo_ids, &policies)
+            .await
+            .expect("should succeed");
+        assert_eq!(count, 1);
+
+        let jobs = db.list_jobs(&JobFilter::default()).expect("list");
+        assert!(
+            jobs[0]
+                .command
+                .as_deref()
+                .unwrap()
+                .contains("--model gpt-5.4"),
+            "global model should be used: {:?}",
+            jobs[0].command
+        );
+    }
+
+    #[tokio::test]
+    async fn no_model_flag_when_both_none() {
+        let github = MockGitHub {
+            username: "bob".into(),
+            prs: vec![make_pr(1, "sha1")],
+        };
+        let db = Database::open_in_memory().expect("db");
+        let config = test_config();
+        let policies = config.repo_policies();
+        let repo_ids = config.repo_ids();
+
+        let count = detect_once(&github, &db, &config, "bob", &repo_ids, &policies)
+            .await
+            .expect("should succeed");
+        assert_eq!(count, 1);
+
+        let jobs = db.list_jobs(&JobFilter::default()).expect("list");
+        assert!(
+            !jobs[0].command.as_deref().unwrap().contains("--model"),
+            "no --model flag expected: {:?}",
+            jobs[0].command
+        );
     }
 
     #[tokio::test]

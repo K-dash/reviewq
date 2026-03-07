@@ -119,7 +119,7 @@ async fn run_daemon(
 
     // Create the review executor.
     let default_agent = config.runner.agent.clone().unwrap_or_default();
-    let default_command = default_agent.default_command().to_owned();
+    let default_command = default_agent.default_command(config.runner.model.as_deref());
     let executor = Arc::new(reviewq::executor::CommandExecutor::new(
         default_command,
         config.cancel.clone(),
