@@ -40,6 +40,7 @@ repos:
       model: gpt-5.3-codex          # Per-repo model override (optional)
       max_concurrency: 3            # Per-repo concurrency limit (optional, reserved)
       base_repo_path: /path/to/clone # Per-repo local clone path (optional)
+      ignore_prs: [100, 200]        # PR numbers to exclude from review (default: [])
 
 polling:
   interval_seconds: 300             # How often to poll GitHub (default: 300)
@@ -117,6 +118,19 @@ repos:
       review_on_push: false   # Review only once per PR
     - repo: org/small-repo    # Default: re-review on every push
 ```
+
+### `ignore_prs`
+
+Excludes specific PR numbers from review. Useful when onboarding a repository that has long-lived or legacy PRs you never want auto-reviewed.
+
+```yaml
+repos:
+  allowlist:
+    - repo: org/repo
+      ignore_prs: [9520, 9521, 9522]
+```
+
+Ignored PRs are filtered out before any other processing (idempotency checks, SHA change detection, etc.). The setting is hot-reloadable via SIGHUP.
 
 ## License
 
