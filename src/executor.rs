@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use tokio::sync::oneshot;
 use tracing::{info, warn};
 
 use crate::config::CancelConfig;
@@ -192,6 +193,12 @@ impl CommandExecutor {
             active_pids: Mutex::new(HashMap::new()),
         }
     }
+
+    /// Remove a job from active PID tracking.
+    pub fn clear_active_pid(&self, job_id: i64) -> Result<()> {
+        lock_active_pids(&self.active_pids)?.remove(&job_id);
+        Ok(())
+    }
 }
 
 /// Lock `active_pids`, mapping poisoned-mutex to a domain error.
@@ -204,7 +211,12 @@ fn lock_active_pids(
 }
 
 impl ReviewExecutor for CommandExecutor {
-    async fn execute(&self, job: &Job, worktree: &Path) -> Result<ReviewResult> {
+    async fn execute(
+        &self,
+        job: &Job,
+        worktree: &Path,
+        pid_tx: Option<oneshot::Sender<u32>>,
+    ) -> Result<ReviewResult> {
         // Ensure output directory exists (async I/O — fix #5).
         tokio::fs::create_dir_all(&self.output_dir)
             .await
@@ -269,6 +281,14 @@ impl ReviewExecutor for CommandExecutor {
         let (mut child, pid) =
             process::spawn_in_group(&cmd, worktree, &stdout_path, &stderr_path, &env_vars).await?;
 
+        // Track the child PID for cancel support.
+        // Lock is not held across .await — only brief HashMap insert.
+        lock_active_pids(&self.active_pids)?.insert(job.id, pid);
+
+        if let Some(tx) = pid_tx {
+            let _ = tx.send(pid);
+        }
+
         // Log with truncated command when the raw command contained {prompt}
         // to avoid leaking potentially large/sensitive prompt content in logs.
         let cmd_has_prompt = raw_cmd.contains("{prompt}");
@@ -288,10 +308,6 @@ impl ReviewExecutor for CommandExecutor {
                 "spawned review process"
             );
         }
-
-        // Track the child PID for cancel support.
-        // Lock is not held across .await — only brief HashMap insert.
-        lock_active_pids(&self.active_pids)?.insert(job.id, pid);
 
         // Wait for child — always clean up active_pids even on error (fix #3).
         let wait_result = child.wait().await;
@@ -334,6 +350,10 @@ impl ReviewExecutor for CommandExecutor {
                 Ok(())
             }
         }
+    }
+
+    fn clear_active_pid(&self, job_id: i64) -> Result<()> {
+        self.clear_active_pid(job_id)
     }
 }
 
@@ -505,7 +525,10 @@ mod tests {
         );
 
         let job = make_job(1, None);
-        let result = executor.execute(&job, &worktree).await.expect("execute");
+        let result = executor
+            .execute(&job, &worktree, None)
+            .await
+            .expect("execute");
 
         assert_eq!(result.exit_code, 0);
         // Non-JSON output — parse_output returns None for both fields.
@@ -525,7 +548,10 @@ mod tests {
         let executor = CommandExecutor::new("true".into(), CancelConfig::default(), output_dir);
 
         let job = make_job(1, None);
-        let result = executor.execute(&job, &worktree).await.expect("execute");
+        let result = executor
+            .execute(&job, &worktree, None)
+            .await
+            .expect("execute");
 
         assert_eq!(result.exit_code, 0);
         // Non-JSON stdout — no review markdown extracted.
@@ -543,7 +569,10 @@ mod tests {
         let executor = CommandExecutor::new("exit 1".into(), CancelConfig::default(), output_dir);
 
         let job = make_job(1, None);
-        let result = executor.execute(&job, &worktree).await.expect("execute");
+        let result = executor
+            .execute(&job, &worktree, None)
+            .await
+            .expect("execute");
 
         assert_eq!(result.exit_code, 1);
     }
@@ -625,7 +654,10 @@ mod tests {
             CommandExecutor::new("true".into(), CancelConfig::default(), output_dir.clone());
 
         let job = make_job(1, None);
-        let result = executor.execute(&job, &worktree).await.expect("execute");
+        let result = executor
+            .execute(&job, &worktree, None)
+            .await
+            .expect("execute");
         assert_eq!(result.exit_code, 0);
 
         // Verify prompt file contains rendered default template.
@@ -652,7 +684,10 @@ mod tests {
             CommandExecutor::new("true".into(), CancelConfig::default(), output_dir.clone());
 
         let job = make_job_with_prompt(1, None, Some("Custom review for {repo} PR #{pr_number}"));
-        let result = executor.execute(&job, &worktree).await.expect("execute");
+        let result = executor
+            .execute(&job, &worktree, None)
+            .await
+            .expect("execute");
         assert_eq!(result.exit_code, 0);
 
         // Verify prompt file contains builtin header + custom body.
@@ -679,7 +714,10 @@ mod tests {
             CommandExecutor::new("true".into(), CancelConfig::default(), output_dir.clone());
 
         let job = make_job_with_prompt(42, None, Some("Prompt for {repo}"));
-        let result = executor.execute(&job, &worktree).await.expect("execute");
+        let result = executor
+            .execute(&job, &worktree, None)
+            .await
+            .expect("execute");
         assert_eq!(result.exit_code, 0);
 
         let prompt_file = output_dir.join("job-42-prompt.txt");
@@ -709,7 +747,10 @@ mod tests {
             CommandExecutor::new(cmd.into(), CancelConfig::default(), output_dir.clone());
 
         let job = make_job_with_prompt(1, None, Some("Hello {repo}"));
-        let result = executor.execute(&job, &worktree).await.expect("execute");
+        let result = executor
+            .execute(&job, &worktree, None)
+            .await
+            .expect("execute");
 
         assert_eq!(result.exit_code, 0);
         let content =
@@ -738,7 +779,10 @@ mod tests {
             CommandExecutor::new(cmd.into(), CancelConfig::default(), output_dir.clone());
 
         let job = make_job(1, None);
-        let result = executor.execute(&job, &worktree).await.expect("execute");
+        let result = executor
+            .execute(&job, &worktree, None)
+            .await
+            .expect("execute");
 
         assert_eq!(result.exit_code, 0);
         let content =
@@ -763,7 +807,10 @@ mod tests {
             CommandExecutor::new(cmd.into(), CancelConfig::default(), output_dir.clone());
 
         let job = make_job_with_prompt(1, None, Some(&large_template));
-        let result = executor.execute(&job, &worktree).await.expect("execute");
+        let result = executor
+            .execute(&job, &worktree, None)
+            .await
+            .expect("execute");
 
         assert_eq!(result.exit_code, 0);
         let content =
@@ -821,7 +868,10 @@ mod tests {
 
         // Job-specific command overrides the default.
         let job = make_job(1, Some("echo override"));
-        let result = executor.execute(&job, &worktree).await.expect("execute");
+        let result = executor
+            .execute(&job, &worktree, None)
+            .await
+            .expect("execute");
 
         assert_eq!(result.exit_code, 0);
     }
@@ -838,10 +888,35 @@ mod tests {
         let executor = CommandExecutor::new(cmd.into(), CancelConfig::default(), output_dir);
 
         let job = make_job(1, None);
-        let result = executor.execute(&job, &worktree).await.expect("execute");
+        let result = executor
+            .execute(&job, &worktree, None)
+            .await
+            .expect("execute");
 
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.session_id.as_deref(), Some("sid-42"));
         assert_eq!(result.review_markdown.as_deref(), Some("# LGTM"));
+    }
+
+    #[tokio::test]
+    async fn execute_reports_child_pid() {
+        let tmp = TempDir::new().expect("temp dir");
+        let output_dir = tmp.path().join("output");
+        let worktree = tmp.path().join("worktree");
+        std::fs::create_dir_all(&worktree).expect("create worktree dir");
+
+        let executor =
+            CommandExecutor::new("sleep 0.01".into(), CancelConfig::default(), output_dir);
+        let job = make_job(99, None);
+        let (pid_tx, pid_rx) = oneshot::channel();
+
+        let result = executor
+            .execute(&job, &worktree, Some(pid_tx))
+            .await
+            .expect("execute");
+
+        let pid = pid_rx.await.expect("pid should be reported");
+        assert!(pid > 0);
+        assert_eq!(result.exit_code, 0);
     }
 }

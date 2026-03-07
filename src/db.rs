@@ -401,6 +401,20 @@ impl JobStore for Database {
         Ok(())
     }
 
+    fn requeue_running(&self, id: i64) -> Result<()> {
+        let conn = self.lock_conn();
+        let rows = conn.execute(
+            "UPDATE jobs SET status = 'queued', leased_at = NULL, lease_expires = NULL,
+                    pid = NULL, retry_count = retry_count + 1, updated_at = datetime('now')
+             WHERE id = ?1 AND status = 'running'",
+            params![id],
+        )?;
+        if rows == 0 {
+            return Err(ReviewqError::Database(rusqlite::Error::QueryReturnedNoRows));
+        }
+        Ok(())
+    }
+
     fn is_pr_reviewed(&self, repo: &RepoId, pr_number: u64, agent: &AgentKind) -> Result<bool> {
         let conn = self.lock_conn();
         let exists: bool = conn.query_row(
@@ -719,5 +733,22 @@ mod tests {
             jobs[0].stderr_path.as_deref(),
             Some(std::path::Path::new("/tmp/output/job-1-stderr.log"))
         );
+    }
+
+    #[test]
+    fn requeue_running_job_resets_status_and_pid() {
+        let db = test_db();
+        let job = db.enqueue(sample_job()).expect("enqueue");
+        let leased = db.lease_next().expect("lease").expect("has job");
+        db.mark_running(leased.id, 4321).expect("mark running");
+
+        db.requeue_running(job.id).expect("requeue running");
+
+        let jobs = db.list_jobs(&JobFilter::default()).expect("list");
+        assert_eq!(jobs[0].status, JobStatus::Queued);
+        assert_eq!(jobs[0].retry_count, 1);
+        assert!(jobs[0].pid.is_none());
+        assert!(jobs[0].leased_at.is_none());
+        assert!(jobs[0].lease_expires.is_none());
     }
 }

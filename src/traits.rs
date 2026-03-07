@@ -7,6 +7,7 @@
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
+use tokio::sync::oneshot;
 
 use crate::error::Result;
 use crate::types::{
@@ -93,6 +94,12 @@ pub trait JobStore: Send + Sync {
     /// Re-queue a stale leased job for retry (increment retry_count, reset to queued).
     fn requeue_stale(&self, id: i64) -> Result<()>;
 
+    /// Re-queue an orphaned running job after daemon crash recovery.
+    ///
+    /// Intended for jobs that were marked `running` by a previous daemon
+    /// instance whose PID is no longer alive.
+    fn requeue_running(&self, id: i64) -> Result<()>;
+
     /// Store the stdout/stderr log file paths for a job.
     fn store_log_paths(&self, id: i64, stdout: &Path, stderr: &Path) -> Result<()>;
 
@@ -114,10 +121,16 @@ pub trait ReviewExecutor: Send + Sync {
         &self,
         job: &Job,
         worktree: &Path,
+        pid_tx: Option<oneshot::Sender<u32>>,
     ) -> impl std::future::Future<Output = Result<ReviewResult>> + Send;
 
     /// Cancel a running review.
     fn cancel(&self, job: &Job) -> impl std::future::Future<Output = Result<()>> + Send;
+
+    /// Clear any executor-local process tracking for the given job.
+    fn clear_active_pid(&self, _job_id: i64) -> Result<()> {
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
