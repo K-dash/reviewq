@@ -194,10 +194,14 @@ fn parse_claude_json(raw: &str) -> (Option<String>, Option<String>) {
 
         match item.get("type").and_then(|v| v.as_str()) {
             Some("result") => {
-                if let Some(r) = item
-                    .get("result")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
+                // Take the first non-empty result only; subsequent result
+                // events (e.g. from late-arriving sub-agent completions)
+                // should not overwrite the primary review output.
+                if result_text.is_none()
+                    && let Some(r) = item
+                        .get("result")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
                 {
                     result_text = Some(r.to_owned());
                 }
@@ -496,6 +500,18 @@ mod tests {
         let (sid, md) = AgentKind::Claude.parse_output(raw);
         assert_eq!(sid.as_deref(), Some("sid-arr"));
         assert_eq!(md.as_deref(), Some("# Review\nLGTM"));
+    }
+
+    #[test]
+    fn parse_claude_json_multiple_results_takes_first() {
+        let raw = r##"[
+            {"type":"system","session_id":"sid-multi"},
+            {"type":"result","session_id":"sid-multi","result":"# Real Review\nLGTM"},
+            {"type":"result","session_id":"sid-multi","result":"Late sub-agent noise"}
+        ]"##;
+        let (sid, md) = AgentKind::Claude.parse_output(raw);
+        assert_eq!(sid.as_deref(), Some("sid-multi"));
+        assert_eq!(md.as_deref(), Some("# Real Review\nLGTM"));
     }
 
     #[test]
