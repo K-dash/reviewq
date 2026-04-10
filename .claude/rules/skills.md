@@ -13,6 +13,17 @@ This project ships 127+ skills from [Everything Claude Code](https://github.com/
 
 ## Phase-to-Skill Map
 
+### Phase 0 — Workspace Setup (before touching any file)
+
+**Mandatory for every task**, no exemptions for "tiny" changes. reviewq requires a dedicated git worktree per feature branch (see `AGENTS.md` → Git Workflow).
+
+| Trigger                                                                             | Skill(s) / Action                                             |
+|-------------------------------------------------------------------------------------|---------------------------------------------------------------|
+| First filesystem edit of a task, any size                                           | Verify `git worktree list` + `git rev-parse --show-toplevel`; if in the main worktree, run `git worktree add -b <type>/<slug> .worktree/<type>-<slug>` and `cd` into it before editing. |
+| User asks for a "quick fix" / "one-liner" / "just commit this"                      | Still create a worktree first. There is **no** small-change exemption. |
+| Found yourself editing on `main` by mistake                                         | `git stash push -u`, create the worktree, `git -C .worktree/<name> stash pop`, continue there. |
+| Worktree already exists for this task                                               | Re-enter it instead of creating a new one (`cd .worktree/<name>`). |
+
 ### Phase 1 — Understand & Plan (before any edit)
 
 | Trigger                                                                             | Skill(s)                                                      |
@@ -82,7 +93,8 @@ This project ships 127+ skills from [Everything Claude Code](https://github.com/
 
 ## Default "Happy Path" for a New Feature
 
-1. `plan-and-handoff` → produce plan, enter worktree.
+0. **`git worktree add -b <type>/<slug> .worktree/<type>-<slug>` and `cd` into it.** Mandatory first step, no exceptions.
+1. `plan-and-handoff` → produce plan. (For complex tasks this may create its own worktree; if so, reuse it and skip step 0.)
 2. `search-first` + `documentation-lookup` → research existing solutions / crate APIs.
 3. `tdd-workflow` + `rust-testing` → write failing tests first.
 4. `rust-patterns` (+ `rust-async-patterns` if async) → implement.
@@ -90,6 +102,7 @@ This project ships 127+ skills from [Everything Claude Code](https://github.com/
 6. `verification-loop` → run `make all`, fix fallout.
 7. `commit-oss` → conventional commit on the feature branch.
 8. `continuous-learning-v2` → capture reusable instincts before ending the session.
+9. After merge: `/cleanup-worktree --restore-cwd --delete-branch`.
 
 ## Explicitly Out of Scope for reviewq
 
