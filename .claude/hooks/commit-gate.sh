@@ -58,10 +58,39 @@ if printf '%s' "$cmd" | grep -Eq '(^|[[:space:]])(echo|printf|grep|rg|awk|sed)([
     fi
 fi
 
-# cwd from the hook input is where the Bash tool will execute the command,
-# which is where we need to run `cargo`.
+# cwd from the hook input is the persistent session cwd, which is almost
+# always the main worktree (where Claude Code was started). When the
+# agent composes a command like `cd .worktree/<branch> && git commit ...`
+# the `cd` changes the effective cwd for the command, but the hook JSON
+# still reports the session cwd. Parse a leading `cd <path>` off the
+# command so we can check the gate against the ACTUAL directory the
+# commit will run in. Supports both `cd X && ...` and `cd X; ...`, with
+# either absolute or repo-relative paths. If parsing fails we fall back
+# to the reported cwd (conservative: may block, never lets a bad commit
+# through).
 cwd=$(reviewq_jq '.cwd')
 [[ -z "$cwd" ]] && cwd=$(reviewq_project_dir)
+
+# Use bash builtin regex (BSD sed ERE support is inconsistent across
+# macOS versions — the portable path is in-process).
+cd_target=""
+if [[ "$cmd" =~ ^[[:space:]]*cd[[:space:]]+([^[:space:]\;\&\|]+) ]]; then
+    cd_target="${BASH_REMATCH[1]}"
+    cd_target="${cd_target%\"}"
+    cd_target="${cd_target#\"}"
+    cd_target="${cd_target%\'}"
+    cd_target="${cd_target#\'}"
+fi
+if [[ -n "$cd_target" ]]; then
+    case "$cd_target" in
+        /*) effective_cwd="$cd_target" ;;
+        *)  effective_cwd="$cwd/$cd_target" ;;
+    esac
+    if [[ -d "$effective_cwd" ]]; then
+        cwd="$effective_cwd"
+    fi
+fi
+
 [[ ! -d "$cwd" ]] && exit 0
 
 # The commit must happen inside a worktree. Worktree-gate covers edits but
@@ -85,6 +114,35 @@ if [[ -z "$staged" ]]; then
     exit 0
 fi
 rust_staged=$(printf '%s\n' "$staged" | grep -E '\.rs$' || true)
+
+# ---- 0. AGENTS.md size budget -------------------------------------------
+# Keep AGENTS.md under the harness-engineering Pointer Pattern ceiling so
+# it does not consume the whole context window before the first turn.
+# Source: nyosegawa harness-engineering-best-practices-2026 recommends
+# ≤50 lines of pointers; we allow up to 120 as a working ceiling because
+# the project's mistake / ADR logs live in this file and need room to
+# grow. Adjust AGENTS_MD_MAX if the project genuinely outgrows it.
+AGENTS_MD_MAX=${AGENTS_MD_MAX:-120}
+if printf '%s\n' "$staged" | grep -qx 'AGENTS.md'; then
+    lines=$(git -C "$cwd" show ":AGENTS.md" 2>/dev/null | wc -l | tr -d ' ')
+    if [[ -n "$lines" && "$lines" -gt "$AGENTS_MD_MAX" ]]; then
+        reviewq_block "AGENTS.md is $lines lines; the commit-gate budget is $AGENTS_MD_MAX.
+
+Harness-engineering best practice: keep the agent instructions file
+small and use the Pointer Pattern (reference .claude/rules/*.md files
+instead of inlining their content). A bloated AGENTS.md is loaded into
+every session's first turn and consumes context that could be used for
+actual work.
+
+Fix:
+  - Move inline sections into the matching .claude/rules/<topic>.md file
+    and leave a one-line pointer behind.
+  - If the content truly belongs in AGENTS.md (project-wide mistakes,
+    ADR shortlist), trim it to essentials.
+  - If the ceiling itself is wrong, raise AGENTS_MD_MAX in commit-gate.sh
+    with a justifying comment, in a dedicated chore/ worktree."
+    fi
+fi
 
 # ---- 1. cargo fmt --check -----------------------------------------------
 if ! (cd "$cwd" && cargo fmt --check >/tmp/reviewq-gate-fmt.log 2>&1); then

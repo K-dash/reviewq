@@ -1,158 +1,81 @@
 # Agent Instructions
 
-## Project Overview
+**reviewq** is a Rust CLI/TUI that detects PRs where you are a requested
+reviewer and triggers AI code-review agents.
 
-**reviewq** is a CLI/TUI tool that automatically detects PRs where you are a requested reviewer and triggers AI code review agents.
+## Non-negotiable constraints
 
-## Build & Quality
+- **Work inside a `.worktree/<branch>/` directory**, always. Never edit
+  files in the main worktree. Mechanically enforced by
+  `.claude/hooks/worktree-gate.sh`. → full procedure:
+  `.claude/rules/git-workflow.md`.
+- **Read this file** (AGENTS.md) before the first edit — required by
+  `.claude/hooks/agents-md-gate.sh`.
+- **Invoke a routing skill** (`.claude/rules/skills.md`) before the
+  first `*.rs` edit — required by `.claude/hooks/skill-routing-gate.sh`.
+- **Write tests first** — production Rust edits are blocked until a
+  test file is touched or the `tdd-workflow` / `rust-testing` skill is
+  invoked (`.claude/hooks/tdd-gate.sh`).
+- **`make all` must be green before every commit** (fmt + clippy
+  `-D warnings` + test + test-hooks). Enforced by
+  `.claude/hooks/commit-gate.sh`.
+- **All commit messages, PR text, and code comments must be written in
+  English.** No exceptions.
+
+## Build & quality
 
 ```bash
-# REQUIRED: Run before completing any work
-make all          # format + lint + test
-
-# Individual commands
-make fmt          # cargo fmt
-make lint         # cargo clippy -- -D warnings
-make test         # cargo test
-
-# Workflow-enforcement hook self-tests (see .claude/hooks/README.md)
-make test-hooks
+make all          # fmt + lint + test + test-hooks   ← run before every commit
+make test-hooks   # workflow-enforcement hook self-tests
 ```
 
-## Workflow Enforcement Hooks
+Individual targets: `make fmt` / `make lint` / `make test` / `make build`.
 
-`.claude/hooks/` contains **mechanically enforced** gates wired into
-`.claude/settings.json` that block tool calls when the workflow below
-is not being followed. They exist because soft guidance in
-`CLAUDE.md` and `.claude/rules/` was historically skipped.
+Rust 2024 edition. `cargo clippy -- -D warnings`. Format with `cargo fmt`.
 
-| Gate | Blocks when … |
-|------|----------------|
-| `worktree-gate.sh` | Editing any file in the main reviewq worktree outside `.worktree/**` (only `.claude/hooks/**` is allowed, for bootstrap). |
-| `agents-md-gate.sh` | Any edit before this `AGENTS.md` has been `Read` in the current session. |
-| `skill-routing-gate.sh` | Editing any `*.rs` file before any `Skill()` call has been made this session. |
-| `commit-gate.sh` | `git commit` when `cargo fmt --check` / `cargo clippy -D warnings` / `cargo test` fails, when the commit is from outside a `.worktree/`, when `*.rs` files are staged without a `rust-review-done` marker, or when `src/tui/**` files are staged without an `e2e-done` marker. |
+## Where to find the detailed rules
 
-Markers are set automatically by `mark-post-tool.sh` (a PostToolUse
-dispatcher) when the matching tool runs. They are session-scoped under
-`.claude/.session/<session_id>/` and discarded at session end.
+| Topic | File |
+|-------|------|
+| Git worktree + commit + PR procedure | `.claude/rules/git-workflow.md` |
+| Full feature pipeline (research → plan → TDD → review → commit) | `.claude/rules/development-workflow.md` |
+| Plan-first rule (≥3 files or new patterns) | `.claude/rules/plan-first.md` |
+| Skill routing table (ECC + rust-skills) | `.claude/rules/skills.md` |
+| Agent orchestration (which agent for what) | `.claude/rules/agents.md` |
+| Rust coding style / patterns / testing / security | `.claude/rules/coding-style.md`, `.claude/rules/patterns.md`, `.claude/rules/testing.md`, `.claude/rules/security.md` |
+| Harness-engineering theory behind the hooks | `.claude/rules/harness-engineering.md` |
+| Every hook's purpose + marker vocabulary | `.claude/hooks/README.md` |
+| Model selection / context budgeting | `.claude/rules/performance.md` |
 
-**Never bypass these hooks.** The global `~/.claude/CLAUDE.md` forbids
-`--no-verify` and any hook disable. If a gate is wrong, patch the
-hook in a `chore/` worktree and re-run `make test-hooks`.
+## Project structure
 
-## Git Workflow (MUST FOLLOW)
+<!-- Keep this section short; point to rules files for details. -->
 
-⚠️ **NEVER commit directly to main. Always use a git worktree on a feature branch.**
+- `src/main.rs` — CLI entry point.
+- `src/tui/**` — ratatui TUI (see `.claude/rules/skills.md` for the
+  `reviewq-e2e` skill that must run on TUI changes).
+- `src/` — everything else is domain-separated by folder (jobs, repos,
+  executor, …).
+- `.claude/hooks/` — mechanically enforced workflow gates.
+- `.claude/rules/` — referenced by this file; the source of truth for
+  *how* to do each phase of work.
 
-**Every development task — including single-file edits, typo fixes, and docs-only changes — MUST start by creating a dedicated `git worktree` under `.worktree/<branch-name>/`.** Editing files in the main worktree is not allowed, even when the change looks trivial. This is intentional: it keeps main clean, makes parallel work safe, and matches the `cleanup-worktree` rules in the global `~/.claude/CLAUDE.md`.
+## Known mistakes & lessons learned
 
-1. **BEFORE any file edit or code change**: Create a worktree + feature branch
-   ```bash
-   # From the repo root (main worktree)
-   git worktree add -b feat/your-feature-name .worktree/feat-your-feature-name
-   cd .worktree/feat-your-feature-name
-   ```
-   - Use `feat/`, `fix/`, `docs/`, `chore/`, `refactor/` prefixes to match Conventional Commits.
-   - The worktree directory name should mirror the branch (slashes replaced with `-`).
-   - If you have already started editing on main by mistake, stop, `git stash push -u`, create the worktree, then `git -C .worktree/<name> stash pop` before continuing.
-2. **Work inside the worktree**: All edits, tests, and builds happen there. Never `cd` back to the main worktree to edit files mid-task.
-3. **After changes**: Run quality checks inside the worktree
-   ```bash
-   make all  # format + lint + test
-   ```
-4. **Update documentation**: If user-facing behavior changes, update README.md (still inside the worktree).
-5. **Commit**: Use conventional commits (feat:, fix:, docs:, etc.).
-6. **Push and create PR**: Never merge directly to main
-   ```bash
-   git push -u origin <branch-name>
-   gh pr create
-   ```
-7. **Cleanup**: When the PR is merged (or abandoned), run `/cleanup-worktree --restore-cwd --delete-branch` from the worktree to remove it. `--restore-cwd` is required per the global CLAUDE.md rule to keep the session's tools alive.
+Record AI-generated mistakes and the rule that prevents recurrence.
+Newest first. Keep each entry ≤5 lines so this section does not bloat.
 
-### Pre-Commit Checklist
+<!-- ### YYYY-MM-DD: short description -->
+<!-- - What happened: … -->
+<!-- - Root cause: … -->
+<!-- - Rule: the constraint that prevents recurrence. -->
 
-Before committing, verify:
-- [ ] Working inside a `.worktree/<branch>` directory (not the main worktree)?
-- [ ] On a feature branch (not main)?
-- [ ] `make all` passes?
-- [ ] README.md updated if needed?
-- [ ] PR will be created?
+## Architecture decisions
 
-## Instructions for AI Agents
+Short ADR notes that explain *why* the code is the way it is. Full ADRs
+go under `docs/adr/` when we add them; this section is for quick refs.
 
-- Before committing, ALWAYS re-read this Workflow section
-- **At the start of every task that touches the filesystem, check `git worktree list` and `git rev-parse --show-toplevel` first. If the cwd is the main worktree (or you are on `main`), stop and create a new worktree per the Git Workflow section before editing anything.**
-- When user says "commit", first verify you are inside a `.worktree/<branch>` directory on a feature branch. If not, create the worktree (stashing any accidental changes) before committing.
-- When user-facing behavior changes, proactively update README.md before committing
-- **All code comments, commit messages, PR titles, PR descriptions, and review comments MUST be written in English**
-
-### Plan-First Rule
-
-For changes touching **3 or more files** or introducing **new architectural patterns**:
-
-1. **Enter plan mode first** — use `EnterPlanMode` to explore the codebase and design the approach before writing any code.
-2. **Get the plan approved** — the user must approve before execution begins. The plan is the contract.
-3. **Include a verification strategy** — every plan must answer: "How will we verify this works?" (tests, manual checks, CI gates, etc.)
-4. **Stop if scope drifts** — if the implementation diverges from the approved plan, stop and re-plan rather than improvising.
-
-For small, well-scoped changes (single-file fixes, typo corrections, simple bug fixes), skip the plan mode step and execute directly — but **still inside a fresh worktree** per the Git Workflow above. The worktree requirement has no size exemption.
-
-### Proactive Skill Usage (ECC + rust-skills)
-
-This project bundles 127+ skills from [Everything Claude Code](https://github.com/affaan-m/everything-claude-code). Claude MUST proactively invoke the skills listed in [`.claude/rules/skills.md`](./.claude/rules/skills.md) — that file is the binding routing table for every development task. Read it at the start of each session and follow the phase-based defaults without waiting for explicit user instructions.
-
-Quick reference (see `skills.md` for the full routing table):
-
-- **Plan:** `plan-and-handoff`, `blueprint`, `architecture-decision-records`
-- **Research (before any new code):** `search-first`, `documentation-lookup`
-- **Implement:** `rust-patterns`, `rust-async-patterns`, `rust-skills:coding-guidelines`, `rust-skills:m01-ownership` / `m06-error-handling` / `m07-concurrency` as applicable
-- **Test (TDD first):** `tdd-workflow`, `rust-testing`, `reviewq-e2e` for TUI changes
-- **Review & verify (pre-commit):** `rust-review`, `security-review`, `verification-loop`, `quality-gate`
-- **Ship:** `create-branch`, `commit-oss`, `cleanup-worktree --restore-cwd`
-- **Continuous:** `strategic-compact`, `context-budget`, `continuous-learning-v2`
-
-These rust-skills in particular are NOT auto-triggered by hooks and must be used proactively:
-
-- `rust-skills:sync-crate-skills` — Run after adding/updating dependencies in Cargo.toml
-- `rust-skills:docs` — Use to look up crate API documentation from docs.rs
-- `rust-skills:coding-guidelines` — Reference when reviewing or writing Rust code style
-
-## Code Style
-
-- Rust 2024 edition
-- Use `cargo fmt` for formatting
-- All clippy warnings treated as errors (`-D warnings`)
-
-## Testing
-
-- Run single test: `cargo test test_name`
-- Run all tests: `cargo test` or `make test`
-- Tests located alongside source in same module or in tests/ directory
-
-## Project Structure
-
-<!-- Update as the codebase grows -->
-
-- `src/main.rs` — Application entry point
-
-## Known Mistakes & Lessons Learned
-
-Record AI-generated mistakes and the rules that prevent them from recurring. Update this section after every code review where the AI got something wrong.
-
-<!-- Add entries in reverse-chronological order (newest first) -->
-<!-- Format: ### YYYY-MM-DD: Short description -->
-<!-- - **What happened**: ... -->
-<!-- - **Root cause**: ... -->
-<!-- - **Rule**: The constraint to prevent recurrence -->
-
-## Architecture Decisions
-
-Key design choices and their rationale. Helps AI agents understand *why* things are the way they are, not just *what* they are.
-
-<!-- Add entries as architectural decisions are made -->
-<!-- Format: ### Decision title -->
-<!-- - **Context**: ... -->
-<!-- - **Decision**: ... -->
-<!-- - **Alternatives considered**: ... -->
-<!-- - **Trade-off**: ... -->
+<!-- ### Decision title -->
+<!-- - Context: … -->
+<!-- - Decision: … -->
+<!-- - Trade-off: … -->

@@ -106,16 +106,89 @@ Fix:
 fi
 
 # ---- Class 5: branch hard-delete ----
-if printf '%s' "$cmd" | grep -Eq 'git[[:space:]]+branch[[:space:]]+.*(-D|--delete[[:space:]]+--force)'; then
-    reviewq_block "'git branch -D' (force-delete) detected in: $cmd
+# We want to block `git branch -D` for UNMERGED branches but allow it when
+# the branch was squash-merged to main via a GitHub PR (`git branch -d`
+# refuses those because the SHA history differs even though the content
+# landed). Detection rules in order:
+#
+#   1. `git` must be at a command boundary (start, or after `;`, `&&`,
+#      `||`, `(`, `$(`, or a pipe). This avoids false positives when
+#      "git branch -D" appears inside a quoted string argument to `grep`
+#      or `echo`, which tripped the earlier, looser regex.
+#   2. Extract the target branch name from the command.
+#   3. If we can't parse it, block (conservative default).
+#   4. If a session marker `branch-delete-approved:<name>` exists, allow
+#      (explicit opt-in via /confirm-branch-delete slash command).
+#   5. If `gh pr list --head <name> --state merged` returns a merged PR,
+#      allow and log.
+#   6. Otherwise block with a helpful message that explains both escape
+#      hatches.
+if printf '%s' "$cmd" | grep -Eq '(^|[;&|(]|\$\()[[:space:]]*git[[:space:]]+branch[[:space:]]+[^"'"'"']*(-D|--delete[[:space:]]+--force)'; then
+    # Pull the branch name from the tail of the command. Accept any of:
+    #   git branch -D foo
+    #   git branch -Df foo
+    #   git branch --delete --force foo
+    #   git branch -D foo bar        (multiple — we check the first one)
+    target=$(printf '%s' "$cmd" | \
+        sed -E 's/.*git[[:space:]]+branch[[:space:]]+//' | \
+        awk '{
+            for (i = 1; i <= NF; i++) {
+                if ($i !~ /^-/) { print $i; exit }
+            }
+        }')
 
-Force-deletes branches with unmerged commits, losing the work.
+    allow=0
+    reason=""
 
-Fix:
-  - Use 'git branch -d <branch>' (lowercase) to delete only merged
-    branches; it will refuse to delete unmerged work.
-  - If you really need to discard unmerged work, open a PR first and
-    close it, so the ref is preserved in GitHub."
+    if [[ -z "$target" ]]; then
+        reason="could not parse branch name from command"
+    else
+        # Escape slashes for the marker filename — markers live in a flat
+        # directory so slashes need to become a safe separator.
+        safe_name=${target//\//__}
+
+        if reviewq_has_mark "branch-delete-approved:$safe_name"; then
+            allow=1
+            reason="session opt-in via /confirm-branch-delete"
+        elif command -v gh >/dev/null 2>&1; then
+            # Query GitHub for a merged PR on this branch. Suppress stderr
+            # so network / auth failures do not trip the soft-fail trap.
+            pr_state=$(gh pr list --head "$target" --state merged \
+                --json state --jq '.[0].state // empty' 2>/dev/null || true)
+            if [[ "$pr_state" == "MERGED" ]]; then
+                allow=1
+                reason="gh confirms a merged PR on head=$target"
+            fi
+        fi
+    fi
+
+    if [[ "$allow" -eq 1 ]]; then
+        reviewq_log_event allow "branch -D $target allowed: $reason"
+    else
+        reviewq_block "'git branch -D' (force-delete) detected in: $cmd
+
+Force-deleting a branch with unmerged commits discards work silently.
+The lowercase 'git branch -d <name>' refuses unmerged branches, but
+it also refuses branches that were *squash-merged* via a GitHub PR
+(because the SHAs differ even though the content landed on main).
+
+Fix — pick one depending on the branch state:
+  (a) Regular merge / rebase already landed → 'git branch -d <name>'
+      should already work. If it doesn't, your local main is stale:
+        git fetch origin && git branch -d <name>
+
+  (b) Squash-merged via GitHub PR → this gate will auto-unblock once
+      'gh' confirms the PR is MERGED. Make sure you're authenticated:
+        gh auth status
+        gh pr list --head <name> --state merged
+      Then retry the same 'git branch -D' command.
+
+  (c) Branch is genuinely unmerged and you want to discard the work →
+      run '/confirm-branch-delete <name>' to set the
+      'branch-delete-approved:<name>' session marker, then retry.
+      This is the only explicit opt-in path; it exists so destructive
+      deletes still require a human acknowledgement."
+    fi
 fi
 
 # ---- Class 6: piping remote scripts to a shell ----

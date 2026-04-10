@@ -19,6 +19,15 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 HOOKS="$(cd "$HERE/.." && pwd)"
 REPO="$(cd "$HOOKS/../.." && pwd)"
 
+# Strip any git env vars that a wrapping pre-commit framework may have
+# set. Without this, tests that spin up a throwaway fake repo see the
+# wrapper's GIT_INDEX_FILE / GIT_DIR and look inside the *wrapper's*
+# index instead of the fake one. This caused AGENTS.md size gate tests
+# to spuriously fail when run via make all during a git commit.
+unset GIT_INDEX_FILE GIT_DIR GIT_WORK_TREE GIT_AUTHOR_DATE GIT_COMMITTER_DATE \
+      GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL \
+      GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_PREFIX
+
 export CLAUDE_PROJECT_DIR="$REPO"
 # Isolated session dir — we create a fresh session_id per test case so
 # tests never see stale markers from each other or from a real session.
@@ -222,6 +231,62 @@ runcase "block: 'git commit' from outside a worktree" commit-gate.sh 2 '{
 rm -rf "$FAKE_MAIN"
 cleanup_session "$SID"
 
+# AGENTS.md size budget: build a tiny fake git repo, stage a huge
+# AGENTS.md, and verify commit-gate blocks with a useful message.
+SID=$(scratch_session)
+FAKE_REPO=$(mktemp -d "${TMPDIR:-/tmp}/reviewq-agents-md-XXXXXX")
+# Pretend the repo lives under a .worktree/ path so the worktree check
+# passes and we exercise the size gate specifically.
+FAKE_WT="$FAKE_REPO/.worktree/fake-branch"
+mkdir -p "$FAKE_WT"
+(cd "$FAKE_WT" && git init -q && git config user.email 't@t' && git config user.name 't')
+# Write an AGENTS.md that is deliberately over the default 120-line ceiling.
+printf '# huge agents md\n\n%s\n' "$(yes 'pointer line' | head -200)" > "$FAKE_WT/AGENTS.md"
+(cd "$FAKE_WT" && git add AGENTS.md)
+# With no Rust staged, only the size check should block.
+out=$(printf '%s' '{
+  "session_id":"'"$SID"'",
+  "tool_name":"Bash",
+  "tool_input":{"command":"git commit -m agents-md-grow"},
+  "cwd":"'"$FAKE_WT"'"
+}' | "$HOOKS/commit-gate.sh" 2>&1 >/dev/null)
+rc=$?
+if [[ "$rc" -eq 2 && "$out" == *"AGENTS.md is"* ]]; then
+    printf '  \e[32mPASS\e[0m block: AGENTS.md over size budget\n'
+    PASS=$((PASS + 1))
+else
+    printf '  \e[31mFAIL\e[0m AGENTS.md size gate did not fire (rc=%s)\n' "$rc"
+    FAIL=$((FAIL + 1))
+fi
+rm -rf "$FAKE_REPO"
+cleanup_session "$SID"
+
+# AGENTS.md under the budget should NOT fire the size gate. We still
+# exit non-zero eventually because the fake repo has no Cargo.toml, so
+# we just assert that "AGENTS.md is" does not appear in the output.
+SID=$(scratch_session)
+FAKE_REPO=$(mktemp -d "${TMPDIR:-/tmp}/reviewq-agents-md-XXXXXX")
+FAKE_WT="$FAKE_REPO/.worktree/fake-branch"
+mkdir -p "$FAKE_WT"
+(cd "$FAKE_WT" && git init -q && git config user.email 't@t' && git config user.name 't')
+printf '# small agents md\n\npointer line\n' > "$FAKE_WT/AGENTS.md"
+(cd "$FAKE_WT" && git add AGENTS.md)
+out=$(printf '%s' '{
+  "session_id":"'"$SID"'",
+  "tool_name":"Bash",
+  "tool_input":{"command":"git commit -m agents-md-small"},
+  "cwd":"'"$FAKE_WT"'"
+}' | "$HOOKS/commit-gate.sh" 2>&1 >/dev/null)
+if [[ "$out" != *"AGENTS.md is"* ]]; then
+    printf '  \e[32mPASS\e[0m allow: small AGENTS.md does not trip size gate\n'
+    PASS=$((PASS + 1))
+else
+    printf '  \e[31mFAIL\e[0m small AGENTS.md wrongly tripped size gate\n'
+    FAIL=$((FAIL + 1))
+fi
+rm -rf "$FAKE_REPO"
+cleanup_session "$SID"
+
 echo "== mark-post-tool.sh =="
 
 SID=$(scratch_session)
@@ -404,10 +469,49 @@ runcase "allow: git clean -fd (no -x)" safety-gate.sh 0 '{
 cleanup_session "$SID"
 
 SID=$(scratch_session)
-runcase "block: git branch -D" safety-gate.sh 2 '{
+runcase "block: git branch -D (no approval, no merged PR)" safety-gate.sh 2 '{
   "session_id":"'"$SID"'",
   "tool_name":"Bash",
-  "tool_input":{"command":"git branch -D feat/x"},
+  "tool_input":{"command":"git branch -D feat/definitely-not-a-real-branch-xyz"},
+  "cwd":"'"$REPO"'"
+}'
+cleanup_session "$SID"
+
+SID=$(scratch_session); mark_for_session "$SID" "branch-delete-approved:feat__experimental"
+runcase "allow: git branch -D with session opt-in marker" safety-gate.sh 0 '{
+  "session_id":"'"$SID"'",
+  "tool_name":"Bash",
+  "tool_input":{"command":"git branch -D feat/experimental"},
+  "cwd":"'"$REPO"'"
+}'
+cleanup_session "$SID"
+
+SID=$(scratch_session); mark_for_session "$SID" "branch-delete-approved:chore__harness-iter2"
+runcase "allow: git branch --delete --force with marker" safety-gate.sh 0 '{
+  "session_id":"'"$SID"'",
+  "tool_name":"Bash",
+  "tool_input":{"command":"git branch --delete --force chore/harness-iter2"},
+  "cwd":"'"$REPO"'"
+}'
+cleanup_session "$SID"
+
+# Regression: "git branch -D" inside a quoted argument to grep must NOT
+# trip the gate. This was a real bug in iter1 that blocked grepping
+# historic commit messages, hook source, etc.
+SID=$(scratch_session)
+runcase "allow: grep for literal \"git branch -D\" string" safety-gate.sh 0 '{
+  "session_id":"'"$SID"'",
+  "tool_name":"Bash",
+  "tool_input":{"command":"grep -n \"git branch -D\" .claude/hooks/tests/run-tests.sh"},
+  "cwd":"'"$REPO"'"
+}'
+cleanup_session "$SID"
+
+SID=$(scratch_session)
+runcase "allow: echo of \"git branch -D\" literal" safety-gate.sh 0 '{
+  "session_id":"'"$SID"'",
+  "tool_name":"Bash",
+  "tool_input":{"command":"echo \"safety-gate blocks git branch -D\""},
   "cwd":"'"$REPO"'"
 }'
 cleanup_session "$SID"
