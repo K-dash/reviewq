@@ -106,7 +106,7 @@ pub fn run<S: JobStore>(store: &S, output_dir: &Path, logging_dir: &Path) -> Res
                 Err(e) => {
                     // Cancel DB write failed — suppress the nudge.
                     app.pending_nudge = false;
-                    app.status_message = Some(format!("Failed to request cancel: {e}"));
+                    app.flash(format!("Failed to request cancel: {e}"));
                 }
             }
         }
@@ -120,7 +120,7 @@ pub fn run<S: JobStore>(store: &S, output_dir: &Path, logging_dir: &Path) -> Res
                 Err(e) => {
                     // Retry DB write failed — suppress the nudge.
                     app.pending_nudge = false;
-                    app.status_message = Some(format!("Failed to retry job: {e}"));
+                    app.flash(format!("Failed to retry job: {e}"));
                 }
             }
         }
@@ -132,18 +132,17 @@ pub fn run<S: JobStore>(store: &S, output_dir: &Path, logging_dir: &Path) -> Res
                 Ok(()) => {
                     // Don't overwrite cancel message — only set if no message yet.
                     if app.status_message.is_none() {
-                        app.status_message = Some("Nudged daemon to start review".to_owned());
+                        app.flash("Nudged daemon to start review");
                     }
                 }
                 Err(NudgeError::NotRunning) => {
-                    app.status_message = Some("Daemon is not running".to_owned());
+                    app.flash("Daemon is not running");
                 }
                 Err(NudgeError::PermissionDenied) => {
-                    app.status_message = Some("Permission denied: cannot signal daemon".to_owned());
+                    app.flash("Permission denied: cannot signal daemon");
                 }
                 Err(NudgeError::InvalidPidFile(detail)) => {
-                    app.status_message =
-                        Some(format!("Daemon is not running (PID file: {detail})"));
+                    app.flash(format!("Daemon is not running (PID file: {detail})"));
                 }
             }
         }
@@ -152,8 +151,18 @@ pub fn run<S: JobStore>(store: &S, output_dir: &Path, logging_dir: &Path) -> Res
             break;
         }
 
-        // Periodic refresh from the store
-        app.update_jobs(store.list_jobs(&JobFilter::default())?);
+        // Periodic refresh from the store. If the user pressed R, also emit a
+        // completion flash so they see confirmation that the reload ran.
+        let manual_refresh = std::mem::take(&mut app.pending_refresh);
+        let jobs = store.list_jobs(&JobFilter::default())?;
+        let job_count = jobs.len();
+        app.update_jobs(jobs);
+        if manual_refresh {
+            app.flash(format!("Refreshed ({job_count} jobs)"));
+        }
+
+        // Expire any transient flash messages whose TTL has elapsed.
+        app.tick_status();
     }
 
     // Restore terminal

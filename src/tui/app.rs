@@ -1,8 +1,12 @@
 //! TUI application state and action dispatch.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::types::{Job, JobStatus};
+
+/// Default lifetime for transient status "flash" messages.
+const STATUS_FLASH_TTL: Duration = Duration::from_secs(3);
 
 /// Active view in the TUI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +55,10 @@ pub struct App {
     pub pending_cancel: Option<i64>,
     /// Job ID to retry (deferred to the event loop for DB access).
     pub pending_retry: Option<i64>,
+    /// Whether the user asked for a manual refresh (handled by the event loop).
+    pub pending_refresh: bool,
+    /// When the current `status_message` should auto-clear, if ever.
+    status_expires_at: Option<Instant>,
 }
 
 impl App {
@@ -68,6 +76,33 @@ impl App {
             pending_nudge: false,
             pending_cancel: None,
             pending_retry: None,
+            pending_refresh: false,
+            status_expires_at: None,
+        }
+    }
+
+    /// Set a transient "flash" status message that auto-expires after the
+    /// default TTL. Use this for user feedback that should disappear on its
+    /// own — e.g. "Refreshed", "Copied", "Cancel requested".
+    pub fn flash(&mut self, msg: impl Into<String>) {
+        self.flash_with_ttl(msg, STATUS_FLASH_TTL);
+    }
+
+    /// Flash a status message with a custom TTL. Primarily useful for tests
+    /// that need to force immediate expiry without sleeping.
+    pub fn flash_with_ttl(&mut self, msg: impl Into<String>, ttl: Duration) {
+        self.status_message = Some(msg.into());
+        self.status_expires_at = Some(Instant::now() + ttl);
+    }
+
+    /// Clear the status message if its flash expiry has passed. Called from
+    /// the event loop on every tick so stale messages don't linger.
+    pub fn tick_status(&mut self) {
+        if let Some(expires_at) = self.status_expires_at
+            && Instant::now() >= expires_at
+        {
+            self.status_message = None;
+            self.status_expires_at = None;
         }
     }
 
@@ -115,7 +150,7 @@ impl App {
                             Ok(artifact) => {
                                 // Defer browser open to the event loop (avoids
                                 // opening a browser during tests).
-                                self.status_message = Some(format!(
+                                self.flash(format!(
                                     "Opened review: {}",
                                     artifact.html_path.display()
                                 ));
@@ -131,8 +166,7 @@ impl App {
                         }
                     } else {
                         let job_id = job.id;
-                        self.status_message =
-                            Some(format!("No review output yet for job {job_id}"));
+                        self.flash(format!("No review output yet for job {job_id}"));
                     }
                 }
             }
@@ -145,16 +179,14 @@ impl App {
             Action::CancelJob => {
                 if let Some(job) = self.selected_job() {
                     if job.is_cancel_requested() {
-                        self.status_message =
-                            Some(format!("Cancel already requested for job {}", job.id));
+                        self.flash(format!("Cancel already requested for job {}", job.id));
                     } else if !job.status.is_terminal() {
                         let job_id = job.id;
                         self.pending_cancel = Some(job_id);
                         self.pending_nudge = true;
-                        self.status_message = Some(format!("Cancel requested for job {}", job_id));
+                        self.flash(format!("Cancel requested for job {job_id}"));
                     } else {
-                        self.status_message =
-                            Some(format!("Job {} is already in terminal state", job.id));
+                        self.flash(format!("Job {} is already in terminal state", job.id));
                     }
                 }
             }
@@ -164,10 +196,9 @@ impl App {
                         let job_id = job.id;
                         self.pending_retry = Some(job_id);
                         self.pending_nudge = true;
-                        self.status_message = Some(format!("Retry requested for job {}", job_id));
+                        self.flash(format!("Retry requested for job {job_id}"));
                     } else {
-                        self.status_message =
-                            Some(format!("Job {} is not in a retriable state", job.id));
+                        self.flash(format!("Job {} is not in a retriable state", job.id));
                     }
                 }
             }
@@ -175,10 +206,9 @@ impl App {
                 if let Some(job) = self.selected_job() {
                     if job.status == JobStatus::Queued {
                         self.pending_nudge = true;
-                        self.status_message = Some("Nudging daemon to start review...".to_owned());
+                        self.flash("Nudging daemon to start review...");
                     } else {
-                        self.status_message =
-                            Some(format!("Job {} is not in queued state", job.id));
+                        self.flash(format!("Job {} is not in queued state", job.id));
                     }
                 }
             }
@@ -192,14 +222,14 @@ impl App {
                             .resume_command(sid, job.worktree_path.as_deref());
                         match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(&cmd)) {
                             Ok(()) => {
-                                self.status_message = Some(format!("Copied: {cmd}"));
+                                self.flash(format!("Copied: {cmd}"));
                             }
                             Err(e) => {
-                                self.status_message = Some(format!("Clipboard error: {e}"));
+                                self.flash(format!("Clipboard error: {e}"));
                             }
                         }
                     } else {
-                        self.status_message = Some("No session ID available".to_owned());
+                        self.flash("No session ID available");
                     }
                 }
             }
@@ -216,9 +246,13 @@ impl App {
             Action::GoBack => {
                 self.view = View::Queue;
                 self.status_message = None;
+                self.status_expires_at = None;
             }
             Action::Refresh => {
-                self.status_message = Some("Refreshing...".to_owned());
+                // Defer the actual reload to the event loop; it already has
+                // access to the store. The loop will flash "Refreshed" on
+                // success, which auto-clears after the flash TTL.
+                self.pending_refresh = true;
             }
         }
     }
@@ -512,6 +546,65 @@ mod tests {
         assert_eq!(
             app.status_message.as_deref(),
             Some("No session ID available")
+        );
+    }
+
+    #[test]
+    fn flash_sets_message_and_persists_until_expiry() {
+        let (mut app, _tmp) = make_app();
+        app.flash("hello world");
+        assert_eq!(app.status_message.as_deref(), Some("hello world"));
+        // Not yet expired → tick is a no-op.
+        app.tick_status();
+        assert_eq!(app.status_message.as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn tick_status_clears_expired_flash() {
+        let (mut app, _tmp) = make_app();
+        // Zero-duration TTL expires instantly without sleeping.
+        app.flash_with_ttl("gone soon", Duration::from_millis(0));
+        assert_eq!(app.status_message.as_deref(), Some("gone soon"));
+        app.tick_status();
+        assert!(
+            app.status_message.is_none(),
+            "expired flash should be cleared"
+        );
+    }
+
+    #[test]
+    fn tick_status_is_noop_when_no_message() {
+        let (mut app, _tmp) = make_app();
+        app.tick_status();
+        assert!(app.status_message.is_none());
+    }
+
+    #[test]
+    fn flash_replaces_prior_message_and_resets_expiry() {
+        let (mut app, _tmp) = make_app();
+        app.flash_with_ttl("first", Duration::from_millis(0));
+        // Overwrite with a fresh long-lived flash — prior expiry should not
+        // carry over and clear the new message.
+        app.flash("second");
+        app.tick_status();
+        assert_eq!(app.status_message.as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn refresh_action_sets_pending_refresh_without_stale_status() {
+        let (mut app, _tmp) = make_app();
+        app.dispatch(Action::Refresh);
+        assert!(
+            app.pending_refresh,
+            "Refresh action must set pending_refresh flag"
+        );
+        // Regression guard for the "Refreshing..." stuck-forever bug:
+        // dispatch itself must not leave a stale "Refreshing..." message;
+        // the event loop publishes "Refreshed" after it actually reloads.
+        assert!(
+            app.status_message.is_none(),
+            "Refresh dispatch should not set a stale status message, got {:?}",
+            app.status_message
         );
     }
 }
