@@ -62,9 +62,21 @@ For changes touching **3 or more files** or introducing **new architectural patt
 
 For small, well-scoped changes (single-file fixes, typo corrections, simple bug fixes), skip planning and execute directly.
 
-### Proactive Skill Usage (rust-skills)
+### Proactive Skill Usage (ECC + rust-skills)
 
-The following skills are NOT auto-triggered by hooks and must be used proactively:
+This project bundles 127+ skills from [Everything Claude Code](https://github.com/affaan-m/everything-claude-code). Claude MUST proactively invoke the skills listed in [`.claude/rules/skills.md`](./.claude/rules/skills.md) — that file is the binding routing table for every development task. Read it at the start of each session and follow the phase-based defaults without waiting for explicit user instructions.
+
+Quick reference (see `skills.md` for the full routing table):
+
+- **Plan:** `plan-and-handoff`, `blueprint`, `architecture-decision-records`
+- **Research (before any new code):** `search-first`, `documentation-lookup`
+- **Implement:** `rust-patterns`, `rust-async-patterns`, `rust-skills:coding-guidelines`, `rust-skills:m01-ownership` / `m06-error-handling` / `m07-concurrency` as applicable
+- **Test (TDD first):** `tdd-workflow`, `rust-testing`, `reviewq-e2e` for TUI changes
+- **Review & verify (pre-commit):** `rust-review`, `security-review`, `verification-loop`, `quality-gate`
+- **Ship:** `create-branch`, `commit-oss`, `cleanup-worktree --restore-cwd`
+- **Continuous:** `strategic-compact`, `context-budget`, `continuous-learning-v2`
+
+These rust-skills in particular are NOT auto-triggered by hooks and must be used proactively:
 
 - `rust-skills:sync-crate-skills` — Run after adding/updating dependencies in Cargo.toml
 - `rust-skills:docs` — Use to look up crate API documentation from docs.rs
