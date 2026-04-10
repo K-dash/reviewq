@@ -2,3 +2,7 @@
 /output
 .worktree/*
 .worktrees/*
+
+# Session-scoped state written by .claude/hooks/ — namespaced per session_id
+# and never needed across sessions.
+.claude/.session/
