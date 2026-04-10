@@ -74,6 +74,7 @@ files; their presence encodes workflow state.
 | `e2e-done`              | Skill(reviewq-e2e) | commit-gate | TUI e2e completed |
 | `tests-just-passed`     | commit-gate after `cargo test` | stop-gate | skip redundant check |
 | `config-edit-approved`  | /config-edit slash command | config-protect-gate | config edits unlocked |
+| `branch-delete-approved:<safe_name>` | /confirm-branch-delete slash command | safety-gate (class 5) | force-delete of that specific branch unlocked once |
 
 ## Never bypass
 
