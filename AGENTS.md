@@ -14,7 +14,32 @@ make all          # format + lint + test
 make fmt          # cargo fmt
 make lint         # cargo clippy -- -D warnings
 make test         # cargo test
+
+# Workflow-enforcement hook self-tests (see .claude/hooks/README.md)
+make test-hooks
 ```
+
+## Workflow Enforcement Hooks
+
+`.claude/hooks/` contains **mechanically enforced** gates wired into
+`.claude/settings.json` that block tool calls when the workflow below
+is not being followed. They exist because soft guidance in
+`CLAUDE.md` and `.claude/rules/` was historically skipped.
+
+| Gate | Blocks when … |
+|------|----------------|
+| `worktree-gate.sh` | Editing any file in the main reviewq worktree outside `.worktree/**` (only `.claude/hooks/**` is allowed, for bootstrap). |
+| `agents-md-gate.sh` | Any edit before this `AGENTS.md` has been `Read` in the current session. |
+| `skill-routing-gate.sh` | Editing any `*.rs` file before any `Skill()` call has been made this session. |
+| `commit-gate.sh` | `git commit` when `cargo fmt --check` / `cargo clippy -D warnings` / `cargo test` fails, when the commit is from outside a `.worktree/`, when `*.rs` files are staged without a `rust-review-done` marker, or when `src/tui/**` files are staged without an `e2e-done` marker. |
+
+Markers are set automatically by `mark-post-tool.sh` (a PostToolUse
+dispatcher) when the matching tool runs. They are session-scoped under
+`.claude/.session/<session_id>/` and discarded at session end.
+
+**Never bypass these hooks.** The global `~/.claude/CLAUDE.md` forbids
+`--no-verify` and any hook disable. If a gate is wrong, patch the
+hook in a `chore/` worktree and re-run `make test-hooks`.
 
 ## Git Workflow (MUST FOLLOW)
 
