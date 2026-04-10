@@ -18,27 +18,37 @@ make test         # cargo test
 
 ## Git Workflow (MUST FOLLOW)
 
-⚠️ **NEVER commit directly to main. Always use feature branches.**
+⚠️ **NEVER commit directly to main. Always use a git worktree on a feature branch.**
 
-1. **BEFORE any code changes**: Create a feature branch
+**Every development task — including single-file edits, typo fixes, and docs-only changes — MUST start by creating a dedicated `git worktree` under `.worktree/<branch-name>/`.** Editing files in the main worktree is not allowed, even when the change looks trivial. This is intentional: it keeps main clean, makes parallel work safe, and matches the `cleanup-worktree` rules in the global `~/.claude/CLAUDE.md`.
+
+1. **BEFORE any file edit or code change**: Create a worktree + feature branch
    ```bash
-   git checkout -b feat/your-feature-name
+   # From the repo root (main worktree)
+   git worktree add -b feat/your-feature-name .worktree/feat-your-feature-name
+   cd .worktree/feat-your-feature-name
    ```
-2. **After changes**: Run quality checks
+   - Use `feat/`, `fix/`, `docs/`, `chore/`, `refactor/` prefixes to match Conventional Commits.
+   - The worktree directory name should mirror the branch (slashes replaced with `-`).
+   - If you have already started editing on main by mistake, stop, `git stash push -u`, create the worktree, then `git -C .worktree/<name> stash pop` before continuing.
+2. **Work inside the worktree**: All edits, tests, and builds happen there. Never `cd` back to the main worktree to edit files mid-task.
+3. **After changes**: Run quality checks inside the worktree
    ```bash
    make all  # format + lint + test
    ```
-3. **Update documentation**: If user-facing behavior changes, update README.md
-4. **Commit**: Use conventional commits (feat:, fix:, docs:, etc.)
-5. **Push and create PR**: Never merge directly to main
+4. **Update documentation**: If user-facing behavior changes, update README.md (still inside the worktree).
+5. **Commit**: Use conventional commits (feat:, fix:, docs:, etc.).
+6. **Push and create PR**: Never merge directly to main
    ```bash
    git push -u origin <branch-name>
    gh pr create
    ```
+7. **Cleanup**: When the PR is merged (or abandoned), run `/cleanup-worktree --restore-cwd --delete-branch` from the worktree to remove it. `--restore-cwd` is required per the global CLAUDE.md rule to keep the session's tools alive.
 
 ### Pre-Commit Checklist
 
 Before committing, verify:
+- [ ] Working inside a `.worktree/<branch>` directory (not the main worktree)?
 - [ ] On a feature branch (not main)?
 - [ ] `make all` passes?
 - [ ] README.md updated if needed?
@@ -47,7 +57,8 @@ Before committing, verify:
 ## Instructions for AI Agents
 
 - Before committing, ALWAYS re-read this Workflow section
-- When user says "commit", first check current branch and create feature branch if on main
+- **At the start of every task that touches the filesystem, check `git worktree list` and `git rev-parse --show-toplevel` first. If the cwd is the main worktree (or you are on `main`), stop and create a new worktree per the Git Workflow section before editing anything.**
+- When user says "commit", first verify you are inside a `.worktree/<branch>` directory on a feature branch. If not, create the worktree (stashing any accidental changes) before committing.
 - When user-facing behavior changes, proactively update README.md before committing
 - **All code comments, commit messages, PR titles, PR descriptions, and review comments MUST be written in English**
 
@@ -60,11 +71,23 @@ For changes touching **3 or more files** or introducing **new architectural patt
 3. **Include a verification strategy** — every plan must answer: "How will we verify this works?" (tests, manual checks, CI gates, etc.)
 4. **Stop if scope drifts** — if the implementation diverges from the approved plan, stop and re-plan rather than improvising.
 
-For small, well-scoped changes (single-file fixes, typo corrections, simple bug fixes), skip planning and execute directly.
+For small, well-scoped changes (single-file fixes, typo corrections, simple bug fixes), skip the plan mode step and execute directly — but **still inside a fresh worktree** per the Git Workflow above. The worktree requirement has no size exemption.
 
-### Proactive Skill Usage (rust-skills)
+### Proactive Skill Usage (ECC + rust-skills)
 
-The following skills are NOT auto-triggered by hooks and must be used proactively:
+This project bundles 127+ skills from [Everything Claude Code](https://github.com/affaan-m/everything-claude-code). Claude MUST proactively invoke the skills listed in [`.claude/rules/skills.md`](./.claude/rules/skills.md) — that file is the binding routing table for every development task. Read it at the start of each session and follow the phase-based defaults without waiting for explicit user instructions.
+
+Quick reference (see `skills.md` for the full routing table):
+
+- **Plan:** `plan-and-handoff`, `blueprint`, `architecture-decision-records`
+- **Research (before any new code):** `search-first`, `documentation-lookup`
+- **Implement:** `rust-patterns`, `rust-async-patterns`, `rust-skills:coding-guidelines`, `rust-skills:m01-ownership` / `m06-error-handling` / `m07-concurrency` as applicable
+- **Test (TDD first):** `tdd-workflow`, `rust-testing`, `reviewq-e2e` for TUI changes
+- **Review & verify (pre-commit):** `rust-review`, `security-review`, `verification-loop`, `quality-gate`
+- **Ship:** `create-branch`, `commit-oss`, `cleanup-worktree --restore-cwd`
+- **Continuous:** `strategic-compact`, `context-budget`, `continuous-learning-v2`
+
+These rust-skills in particular are NOT auto-triggered by hooks and must be used proactively:
 
 - `rust-skills:sync-crate-skills` — Run after adding/updating dependencies in Cargo.toml
 - `rust-skills:docs` — Use to look up crate API documentation from docs.rs
