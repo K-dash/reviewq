@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use ratatui::layout::Rect;
 use ratatui::widgets::TableState;
 
+use crate::daemon::DaemonHealth;
 use crate::types::{Job, JobStatus};
 
 /// Default lifetime for transient status "flash" messages.
@@ -47,6 +48,35 @@ pub enum Action {
     ScrollContentPageDown,
 }
 
+impl Action {
+    /// True when the action must not be dispatched unless the daemon is
+    /// known to be alive. This is the declarative source of truth for
+    /// the UX-layer guard inside [`App::dispatch`] — the exhaustive
+    /// match below forces any future `Action` variant to classify
+    /// itself, so a forgotten write action cannot silently bypass the
+    /// guard.
+    pub fn requires_daemon(&self) -> bool {
+        match self {
+            Action::CancelJob | Action::RetryJob => true,
+            Action::Quit
+            | Action::NavigateUp
+            | Action::NavigateDown
+            | Action::SelectJob
+            | Action::ShowPrompt
+            | Action::StartReview
+            | Action::CopySessionId
+            | Action::OpenInBrowser
+            | Action::GoBack
+            | Action::Refresh
+            | Action::SelectRow(_)
+            | Action::ScrollContentUp
+            | Action::ScrollContentDown
+            | Action::ScrollContentPageUp
+            | Action::ScrollContentPageDown => false,
+        }
+    }
+}
+
 /// Application state.
 pub struct App {
     pub view: View,
@@ -82,6 +112,13 @@ pub struct App {
     /// Height of the Review / Prompt content area, in lines. Used to
     /// convert "page" scrolls into line counts.
     pub content_viewport_height: u16,
+    /// Last-observed daemon liveness, refreshed by the TUI event loop
+    /// before each frame. `None` means "not yet evaluated" — the event
+    /// loop guarantees `Some(_)` before the first `draw`, so the
+    /// Unknown state never reaches the renderer in practice. It exists
+    /// purely so tests and guard logic can distinguish "no data yet"
+    /// from "daemon is confirmed dead".
+    pub daemon_status: Option<DaemonHealth>,
     /// When the current `status_message` should auto-clear, if ever.
     status_expires_at: Option<Instant>,
 }
@@ -106,6 +143,7 @@ impl App {
             last_table_area: None,
             content_scroll: 0,
             content_viewport_height: 0,
+            daemon_status: None,
             status_expires_at: None,
         }
     }
@@ -179,6 +217,16 @@ impl App {
 
     /// Handle an action, mutating state.
     pub fn dispatch(&mut self, action: Action) {
+        // Layer 2 — UX guard. Write actions refuse to queue a pending
+        // mutation when the last-known daemon status is not Alive. The
+        // event loop applies a second (authoritative) check right
+        // before flushing the pending mutation, but blocking here gives
+        // the user immediate feedback and stops 99% of cases without
+        // ever touching the store.
+        if action.requires_daemon() && !matches!(self.daemon_status, Some(DaemonHealth::Alive(_))) {
+            self.flash("Daemon is not running — run 'reviewq daemon start'");
+            return;
+        }
         match action {
             Action::Quit => {
                 self.should_quit = true;
@@ -585,9 +633,19 @@ mod tests {
         assert_eq!(app.view, View::Queue);
     }
 
+    /// Convenience: make the app with the daemon already marked Alive.
+    /// The daemon-health guard lives at the top of `App::dispatch`, so
+    /// any existing test that exercises CancelJob / RetryJob needs a
+    /// live daemon status to reach the legacy behavior under test.
+    fn alive_app() -> (App, TempDir) {
+        let (mut app, tmp) = make_app();
+        app.daemon_status = Some(crate::daemon::DaemonHealth::Alive(1));
+        (app, tmp)
+    }
+
     #[test]
     fn retry_job_sets_pending_retry_for_failed() {
-        let (mut app, _tmp) = make_app();
+        let (mut app, _tmp) = alive_app();
         app.update_jobs(vec![make_job(1, JobStatus::Failed)]);
         app.dispatch(Action::RetryJob);
         assert_eq!(app.pending_retry, Some(1));
@@ -602,7 +660,7 @@ mod tests {
 
     #[test]
     fn retry_job_sets_pending_retry_for_canceled() {
-        let (mut app, _tmp) = make_app();
+        let (mut app, _tmp) = alive_app();
         app.update_jobs(vec![make_job(1, JobStatus::Canceled)]);
         app.dispatch(Action::RetryJob);
         assert_eq!(app.pending_retry, Some(1));
@@ -611,7 +669,7 @@ mod tests {
 
     #[test]
     fn retry_job_rejected_for_non_terminal() {
-        let (mut app, _tmp) = make_app();
+        let (mut app, _tmp) = alive_app();
         app.update_jobs(vec![make_job(1, JobStatus::Running)]);
         app.dispatch(Action::RetryJob);
         assert!(app.pending_retry.is_none());
@@ -622,6 +680,103 @@ mod tests {
                 .unwrap()
                 .contains("not in a retriable state")
         );
+    }
+
+    // -------------------------------------------------------------------
+    // daemon health guard (Layer 2 — UX guard inside App::dispatch)
+    //
+    // Regression tests for the "DB write lands even though daemon is
+    // down" bug. The guard must stop RetryJob / CancelJob from queuing
+    // a pending mutation when daemon_status is not Alive, and it must
+    // leave read-only actions completely alone.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn requires_daemon_true_for_cancel_and_retry() {
+        assert!(Action::CancelJob.requires_daemon());
+        assert!(Action::RetryJob.requires_daemon());
+    }
+
+    #[test]
+    fn requires_daemon_false_for_read_only_actions() {
+        assert!(!Action::Quit.requires_daemon());
+        assert!(!Action::NavigateUp.requires_daemon());
+        assert!(!Action::NavigateDown.requires_daemon());
+        assert!(!Action::SelectJob.requires_daemon());
+        assert!(!Action::ShowPrompt.requires_daemon());
+        assert!(!Action::Refresh.requires_daemon());
+        assert!(!Action::OpenInBrowser.requires_daemon());
+        assert!(!Action::GoBack.requires_daemon());
+        assert!(!Action::CopySessionId.requires_daemon());
+        assert!(!Action::StartReview.requires_daemon());
+    }
+
+    #[test]
+    fn dispatch_cancel_blocked_when_daemon_status_none() {
+        let (mut app, _tmp) = make_app();
+        // Default daemon_status is None (not yet evaluated).
+        app.update_jobs(vec![make_job(1, JobStatus::Queued)]);
+        app.dispatch(Action::CancelJob);
+        assert_eq!(app.pending_cancel, None);
+        assert!(!app.pending_nudge);
+        assert!(
+            app.status_message
+                .as_deref()
+                .unwrap()
+                .contains("Daemon is not running"),
+            "expected daemon-down flash, got {:?}",
+            app.status_message
+        );
+    }
+
+    #[test]
+    fn dispatch_cancel_blocked_when_daemon_status_dead() {
+        let (mut app, _tmp) = make_app();
+        app.daemon_status = Some(crate::daemon::DaemonHealth::Dead);
+        app.update_jobs(vec![make_job(1, JobStatus::Queued)]);
+        app.dispatch(Action::CancelJob);
+        assert_eq!(app.pending_cancel, None);
+        assert!(!app.pending_nudge);
+        assert!(
+            app.status_message
+                .as_deref()
+                .unwrap()
+                .contains("Daemon is not running")
+        );
+    }
+
+    #[test]
+    fn dispatch_retry_blocked_when_daemon_status_dead() {
+        let (mut app, _tmp) = make_app();
+        app.daemon_status = Some(crate::daemon::DaemonHealth::Dead);
+        app.update_jobs(vec![make_job(1, JobStatus::Failed)]);
+        app.dispatch(Action::RetryJob);
+        assert_eq!(app.pending_retry, None);
+        assert!(!app.pending_nudge);
+        assert!(
+            app.status_message
+                .as_deref()
+                .unwrap()
+                .contains("Daemon is not running")
+        );
+    }
+
+    #[test]
+    fn dispatch_navigation_still_works_when_daemon_dead() {
+        // Read-only actions must never be blocked by the guard — the
+        // user has to be able to scroll the queue even when the daemon
+        // is down, otherwise they cannot see the jobs they need to
+        // triage after restarting the daemon.
+        let (mut app, _tmp) = make_app();
+        app.daemon_status = Some(crate::daemon::DaemonHealth::Dead);
+        app.update_jobs(vec![
+            make_job(1, JobStatus::Queued),
+            make_job(2, JobStatus::Queued),
+        ]);
+        app.dispatch(Action::NavigateDown);
+        assert_eq!(app.selected_index, 1);
+        // The guard must not leave a stale flash on read-only actions.
+        assert!(app.status_message.is_none());
     }
 
     #[test]

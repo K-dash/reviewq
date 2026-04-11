@@ -9,6 +9,7 @@ use chrono::{DateTime, Utc};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
+use reviewq::daemon::DaemonHealth;
 use reviewq::tui::app::{App, View};
 use reviewq::tui::{prompt_view, queue_view, review_view};
 use reviewq::types::{AgentKind, Job, JobStatus, RepoId};
@@ -92,7 +93,17 @@ fn make_job(id: i64, status: JobStatus, owner: &str, repo: &str) -> Job {
 
 fn make_app() -> (App, TempDir) {
     let tmp = TempDir::new().expect("temp dir");
-    let app = App::new(tmp.path().to_path_buf());
+    let mut app = App::new(tmp.path().to_path_buf());
+    // Default to an alive daemon so the majority of render tests that
+    // do not care about the health badge render a clean title bar.
+    // Tests that specifically exercise the Dead / Unknown paths
+    // override this field after calling make_app().
+    //
+    // This helper intentionally differs from the identically-named
+    // helper in `src/tui/mod.rs` (which leaves `daemon_status = None`
+    // so its dispatch-guard tests can drive the path explicitly).
+    // Do not unify the two — each suite needs a different default.
+    app.daemon_status = Some(DaemonHealth::Alive(1));
     (app, tmp)
 }
 
@@ -128,6 +139,61 @@ fn draw_prompt(term: &mut Terminal<TestBackend>, app: &mut App) {
 fn queue_renders_title_with_zero_jobs_when_empty() {
     let mut term = test_terminal(100, 24);
     let (mut app, _tmp) = make_app();
+    // Mark the daemon as alive so the title bar does NOT get a DOWN
+    // badge in the baseline "title with zero jobs" render.
+    app.daemon_status = Some(DaemonHealth::Alive(1));
+    draw_queue(&mut term, &mut app);
+    assert_buffer_contains(&term, "reviewq queue");
+    assert_buffer_contains(&term, "0 job(s)");
+}
+
+// ---------------------------------------------------------------------------
+// Daemon-health title badge
+//
+// Regression tests for the silent-corruption class of bugs where the TUI
+// gives no visual feedback that the daemon is down. The badge lives
+// inline on the title row so every queue frame advertises daemon state.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn title_bar_shows_daemon_down_when_dead() {
+    let mut term = test_terminal(100, 24);
+    let (mut app, _tmp) = make_app();
+    app.daemon_status = Some(DaemonHealth::Dead);
+    draw_queue(&mut term, &mut app);
+    assert_buffer_contains(&term, "reviewq queue");
+    assert_buffer_contains(&term, "[daemon: DOWN]");
+}
+
+#[test]
+fn title_bar_shows_daemon_down_when_status_unknown() {
+    // `None` (not yet evaluated) defaults to the conservative side so a
+    // startup glitch cannot paint a misleading "alive" title.
+    let mut term = test_terminal(100, 24);
+    let (mut app, _tmp) = make_app();
+    app.daemon_status = None;
+    draw_queue(&mut term, &mut app);
+    assert_buffer_contains(&term, "[daemon: DOWN]");
+}
+
+#[test]
+fn title_bar_hides_daemon_badge_when_alive() {
+    let mut term = test_terminal(100, 24);
+    let (mut app, _tmp) = make_app();
+    app.daemon_status = Some(DaemonHealth::Alive(1234));
+    draw_queue(&mut term, &mut app);
+    assert_buffer_contains(&term, "reviewq queue");
+    assert_buffer_does_not_contain(&term, "[daemon: DOWN]");
+}
+
+#[test]
+fn title_bar_narrow_width_does_not_panic() {
+    // Narrow terminal: 40 columns. The render must not panic and must
+    // still contain the job count. The badge may be truncated on a
+    // very narrow screen but the baseline title must remain intact.
+    let mut term = test_terminal(40, 10);
+    let (mut app, _tmp) = make_app();
+    app.daemon_status = Some(DaemonHealth::Dead);
     draw_queue(&mut term, &mut app);
     assert_buffer_contains(&term, "reviewq queue");
     assert_buffer_contains(&term, "0 job(s)");

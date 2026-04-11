@@ -22,6 +22,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 
 use self::app::{Action, App, View};
+use crate::daemon::{self, DaemonHealth};
 use crate::error::Result;
 use crate::traits::JobStore;
 use crate::types::JobFilter;
@@ -54,6 +55,55 @@ fn nudge_daemon(pid_file: &Path) -> std::result::Result<(), NudgeError> {
     })
 }
 
+/// Flush any pending write mutations (`pending_cancel` / `pending_retry`)
+/// to the store, but only when `health` says the daemon is `Alive`.
+///
+/// This is **Layer 3** of the daemon-health guard — the authoritative
+/// mutation-time check. The UX-layer guard inside [`App::dispatch`]
+/// catches 99% of cases, but the pending mutation queue introduces a
+/// race: the user presses `x`, dispatch observes `Alive`, the event
+/// loop then pumps the pending write on a later tick, and in that
+/// window the daemon might have died. Without this function, that
+/// window leaves the DB in a zombie state (the cancel/retry lands but
+/// nothing ever processes it, matching the original observed bug).
+///
+/// When `health` is not `Alive`, any queued pending mutation is
+/// discarded and a flash is set. When `health` is `Alive`, the helper
+/// falls back to the pre-existing behavior of calling
+/// [`JobStore::request_cancel`] / [`JobStore::retry_job`] directly and
+/// surfacing store errors via flash messages.
+fn process_pending_writes<S: JobStore>(app: &mut App, store: &S, health: &DaemonHealth) {
+    // Short-circuit: nothing to do.
+    if app.pending_cancel.is_none() && app.pending_retry.is_none() {
+        return;
+    }
+
+    // Authoritative health check. If the daemon is not `Alive` right
+    // now (fresh from daemon_health()), drop every pending mutation
+    // without touching the store and suppress the follow-up nudge.
+    if !matches!(health, DaemonHealth::Alive(_)) {
+        app.pending_cancel = None;
+        app.pending_retry = None;
+        app.pending_nudge = false;
+        app.flash("Daemon stopped — request dropped");
+        return;
+    }
+
+    if let Some(job_id) = app.pending_cancel.take()
+        && let Err(e) = store.request_cancel(job_id)
+    {
+        app.pending_nudge = false;
+        app.flash(format!("Failed to request cancel: {e}"));
+    }
+
+    if let Some(job_id) = app.pending_retry.take()
+        && let Err(e) = store.retry_job(job_id)
+    {
+        app.pending_nudge = false;
+        app.flash(format!("Failed to retry job: {e}"));
+    }
+}
+
 /// Run the TUI application.
 pub fn run<S: JobStore>(store: &S, output_dir: &Path, logging_dir: &Path) -> Result<()> {
     let pid_file = logging_dir.join("reviewq.pid");
@@ -79,6 +129,14 @@ pub fn run<S: JobStore>(store: &S, output_dir: &Path, logging_dir: &Path) -> Res
 
     // Event loop
     loop {
+        // Refresh the daemon health snapshot before every frame so the
+        // title bar and the dispatch-time UX guard both see a
+        // consistent "last known" state. The event loop also performs
+        // a second, authoritative read just before flushing pending
+        // writes (see below), which is what closes the dispatch →
+        // pending → flush race.
+        app.daemon_status = Some(daemon::daemon_health(logging_dir));
+
         terminal.draw(|f| draw(f, &mut app))?;
 
         if event::poll(std::time::Duration::from_millis(250))? {
@@ -113,33 +171,15 @@ pub fn run<S: JobStore>(store: &S, output_dir: &Path, logging_dir: &Path) -> Res
             app.content_scroll = 0;
         }
 
-        // Process pending cancel request (DB write BEFORE nudge).
-        if let Some(job_id) = app.pending_cancel.take() {
-            match store.request_cancel(job_id) {
-                Ok(()) => {
-                    // nudge stays true — daemon should wake to process the cancel.
-                }
-                Err(e) => {
-                    // Cancel DB write failed — suppress the nudge.
-                    app.pending_nudge = false;
-                    app.flash(format!("Failed to request cancel: {e}"));
-                }
-            }
-        }
-
-        // Process pending retry request (DB write BEFORE nudge).
-        if let Some(job_id) = app.pending_retry.take() {
-            match store.retry_job(job_id) {
-                Ok(()) => {
-                    // nudge stays true — daemon should wake to process the retried job.
-                }
-                Err(e) => {
-                    // Retry DB write failed — suppress the nudge.
-                    app.pending_nudge = false;
-                    app.flash(format!("Failed to retry job: {e}"));
-                }
-            }
-        }
+        // Authoritative health re-check right before flushing pending
+        // writes. The dispatch-time guard already filtered out most
+        // bad cases, but the daemon could have died in the window
+        // between dispatch and this point. Re-sync app.daemon_status
+        // so the next frame's title bar stays consistent with what we
+        // just observed.
+        let fresh = daemon::daemon_health(logging_dir);
+        app.daemon_status = Some(fresh);
+        process_pending_writes(&mut app, store, &fresh);
 
         // Nudge daemon if dispatch requested it.
         if app.pending_nudge {
@@ -348,6 +388,17 @@ mod tests {
         }
     }
 
+    /// Build an `App` for unit tests inside this file.
+    ///
+    /// Note: this helper intentionally leaves `daemon_status` at its
+    /// default (`None`) so tests that exercise the dispatch-time guard
+    /// or `process_pending_writes` can set the desired health state
+    /// explicitly. The identically-named helper in
+    /// `tests/tui_render.rs` defaults to `Some(Alive(1))` instead, so
+    /// the majority of render tests get a clean title bar without
+    /// per-test boilerplate. Keep the two helpers intentionally
+    /// divergent — this comment exists so a future maintainer does
+    /// not "unify" them and silently break one suite.
     fn make_app() -> App {
         App::new(PathBuf::from("/tmp"))
     }
@@ -544,5 +595,181 @@ mod tests {
             map_mouse(mouse(MouseEventKind::ScrollUp, 0, 0), &app),
             Some(Action::ScrollContentUp)
         ));
+    }
+
+    // -------- process_pending_writes (Layer 3 — authoritative guard) --------
+    //
+    // Regression tests for the silent-corruption race where dispatch
+    // observed Alive but the daemon died before the event loop could
+    // flush the pending mutation. `process_pending_writes` is the
+    // mutation-layer guard that re-checks health against fresh state
+    // and refuses to touch the store when it is not Alive.
+
+    use crate::daemon::DaemonHealth;
+    use crate::db::Database;
+    use crate::types::{AgentKind, JobFilter, JobStatus, NewJob, RepoId};
+
+    fn test_new_job() -> NewJob {
+        NewJob {
+            repo: RepoId::new("owner", "repo"),
+            pr_number: 42,
+            head_sha: "abcd1234".into(),
+            agent_kind: AgentKind::Claude,
+            command: Some("echo".into()),
+            prompt_template: None,
+            max_retries: 3,
+        }
+    }
+
+    #[test]
+    fn pending_cancel_dropped_when_daemon_dead() {
+        let db = Database::open_in_memory().expect("db");
+        let job = db.enqueue(test_new_job()).expect("enqueue");
+
+        let mut app = make_app();
+        app.pending_cancel = Some(job.id);
+        app.pending_nudge = true;
+
+        process_pending_writes(&mut app, &db, &DaemonHealth::Dead);
+
+        assert_eq!(app.pending_cancel, None);
+        assert!(!app.pending_nudge);
+        assert!(
+            app.status_message
+                .as_deref()
+                .is_some_and(|m| m.contains("Daemon"))
+        );
+
+        let jobs = db.list_jobs(&JobFilter::default()).expect("list");
+        assert!(
+            jobs[0].cancel_requested_at.is_none(),
+            "cancel_requested_at must NOT be set when daemon is dead"
+        );
+    }
+
+    #[test]
+    fn pending_retry_dropped_when_daemon_dead() {
+        let db = Database::open_in_memory().expect("db");
+        let job = db.enqueue(test_new_job()).expect("enqueue");
+        // Move the job into a retriable terminal state.
+        db.complete(job.id, JobStatus::Failed, Some(1))
+            .expect("complete");
+
+        let mut app = make_app();
+        app.pending_retry = Some(job.id);
+        app.pending_nudge = true;
+
+        process_pending_writes(&mut app, &db, &DaemonHealth::Dead);
+
+        assert_eq!(app.pending_retry, None);
+        assert!(!app.pending_nudge);
+
+        let jobs = db.list_jobs(&JobFilter::default()).expect("list");
+        assert_eq!(
+            jobs[0].status,
+            JobStatus::Failed,
+            "status must remain Failed — retry_job must NOT have run"
+        );
+    }
+
+    #[test]
+    fn pending_cancel_writes_when_daemon_alive() {
+        let db = Database::open_in_memory().expect("db");
+        let job = db.enqueue(test_new_job()).expect("enqueue");
+
+        let mut app = make_app();
+        app.pending_cancel = Some(job.id);
+        app.pending_nudge = true;
+
+        process_pending_writes(&mut app, &db, &DaemonHealth::Alive(1));
+
+        assert_eq!(app.pending_cancel, None);
+        assert!(
+            app.pending_nudge,
+            "nudge must stay true so the event loop signals the daemon"
+        );
+
+        let jobs = db.list_jobs(&JobFilter::default()).expect("list");
+        assert!(
+            jobs[0].cancel_requested_at.is_some(),
+            "cancel_requested_at must be set when daemon is alive"
+        );
+    }
+
+    #[test]
+    fn pending_retry_writes_when_daemon_alive() {
+        let db = Database::open_in_memory().expect("db");
+        let job = db.enqueue(test_new_job()).expect("enqueue");
+        db.complete(job.id, JobStatus::Failed, Some(1))
+            .expect("complete");
+
+        let mut app = make_app();
+        app.pending_retry = Some(job.id);
+        app.pending_nudge = true;
+
+        process_pending_writes(&mut app, &db, &DaemonHealth::Alive(1));
+
+        assert_eq!(app.pending_retry, None);
+        assert!(app.pending_nudge);
+
+        let jobs = db.list_jobs(&JobFilter::default()).expect("list");
+        assert_eq!(jobs[0].status, JobStatus::Queued);
+    }
+
+    #[test]
+    fn pending_both_cancel_and_retry_dropped_atomically_when_daemon_dead() {
+        // Dispatch never queues both at once in practice, but
+        // `process_pending_writes` iterates them independently — this
+        // test pins the invariant that the dead-path guard clears both
+        // fields in one call so no half-state can leak.
+        let db = Database::open_in_memory().expect("db");
+        let cancel_job = db.enqueue(test_new_job()).expect("enqueue cancel");
+        let mut retry_new = test_new_job();
+        retry_new.head_sha = "deadbeef".into();
+        let retry_job = db.enqueue(retry_new).expect("enqueue retry");
+        db.complete(retry_job.id, JobStatus::Failed, Some(1))
+            .expect("complete retry");
+
+        let mut app = make_app();
+        app.pending_cancel = Some(cancel_job.id);
+        app.pending_retry = Some(retry_job.id);
+        app.pending_nudge = true;
+
+        process_pending_writes(&mut app, &db, &DaemonHealth::Dead);
+
+        assert_eq!(app.pending_cancel, None);
+        assert_eq!(app.pending_retry, None);
+        assert!(!app.pending_nudge);
+
+        let jobs = db.list_jobs(&JobFilter::default()).expect("list");
+        let cancel_row = jobs
+            .iter()
+            .find(|j| j.id == cancel_job.id)
+            .expect("cancel job");
+        let retry_row = jobs
+            .iter()
+            .find(|j| j.id == retry_job.id)
+            .expect("retry job");
+        assert!(cancel_row.cancel_requested_at.is_none());
+        assert_eq!(retry_row.status, JobStatus::Failed);
+    }
+
+    #[test]
+    fn process_pending_writes_is_noop_when_nothing_pending() {
+        // Early-return path: no pending_cancel, no pending_retry.
+        // Even when the daemon is alive, the helper must not touch
+        // the store or mutate any flash state.
+        let db = Database::open_in_memory().expect("db");
+        let mut app = make_app();
+        // Sanity: nothing pending, no pre-existing status message.
+        assert!(app.pending_cancel.is_none());
+        assert!(app.pending_retry.is_none());
+        assert!(app.status_message.is_none());
+
+        process_pending_writes(&mut app, &db, &DaemonHealth::Alive(1));
+
+        assert!(app.pending_cancel.is_none());
+        assert!(app.pending_retry.is_none());
+        assert!(app.status_message.is_none());
     }
 }

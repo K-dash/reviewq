@@ -2,12 +2,13 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Row, Table};
 
 use super::app::App;
 use super::widgets::{self, SELECTED_STYLE, STATUS_STYLE, TITLE_STYLE};
+use crate::daemon::DaemonHealth;
 
 /// Render the queue view.
 pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
@@ -42,9 +43,22 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     ])
     .split(area);
 
-    // 1. Title
-    let title = format!("reviewq queue — {} job(s)", app.jobs.len());
-    f.render_widget(Line::styled(title, TITLE_STYLE), chunks[0]);
+    // 1. Title — inline [daemon: DOWN] badge when the last-known
+    //    health is anything other than Alive. The condition
+    //    deliberately treats `None` (not yet evaluated) as DOWN so a
+    //    startup glitch never paints a misleading Alive title; in
+    //    practice the event loop refreshes daemon_status before every
+    //    draw, so None is never visible to the user.
+    let title_text = format!("reviewq queue — {} job(s)", app.jobs.len());
+    let mut title_spans = vec![Span::styled(title_text, TITLE_STYLE)];
+    if !matches!(app.daemon_status, Some(DaemonHealth::Alive(_))) {
+        title_spans.push(Span::raw("  "));
+        title_spans.push(Span::styled(
+            "[daemon: DOWN]",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+    }
+    f.render_widget(Line::from(title_spans), chunks[0]);
 
     // 2. Status summary
     let status_line = format!(
