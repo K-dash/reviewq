@@ -4,13 +4,13 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, Row, Table, TableState};
+use ratatui::widgets::{Cell, Row, Table};
 
 use super::app::App;
 use super::widgets::{self, SELECTED_STYLE, STATUS_STYLE, TITLE_STYLE};
 
 /// Render the queue view.
-pub fn render(f: &mut Frame, app: &App, area: Rect) {
+pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     // Count jobs by status for the status line.
     let (queued, running, done, failed) = {
         let mut q = 0u32;
@@ -121,9 +121,20 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         .row_highlight_style(SELECTED_STYLE)
         .highlight_symbol("▸ ");
 
-    let mut state = TableState::default();
-    state.select(Some(app.selected_index));
-    f.render_stateful_widget(table, chunks[4], &mut state);
+    // Persist the table rect so mouse click handling can convert screen
+    // coordinates back into absolute job indices, taking into account the
+    // TableState's internal scroll offset.
+    //
+    // INVARIANT: this Table has no `.header(...)` — the header row is
+    // rendered separately into chunks[2]. That means chunks[4] starts at
+    // data row 0 with no header reservation, and
+    // `mod::click_to_row_index` can subtract `area.y` directly without
+    // off-by-one. If a future maintainer adds `.header(...)` to the
+    // Table widget, both the layout split AND the click math need to be
+    // revisited.
+    app.last_table_area = Some(chunks[4]);
+    app.table_state.select(Some(app.selected_index));
+    f.render_stateful_widget(table, chunks[4], &mut app.table_state);
 
     // 6. Scroll indicator
     let visible_rows = chunks[4].height as usize;

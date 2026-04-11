@@ -3,6 +3,9 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use ratatui::layout::Rect;
+use ratatui::widgets::TableState;
+
 use crate::types::{Job, JobStatus};
 
 /// Default lifetime for transient status "flash" messages.
@@ -31,6 +34,17 @@ pub enum Action {
     OpenInBrowser,
     GoBack,
     Refresh,
+    /// Select a row in the queue by absolute index (e.g. from a mouse click).
+    /// The index is clamped to the current job list bounds.
+    SelectRow(usize),
+    /// Scroll the active content view (Review / Prompt) up by one line.
+    ScrollContentUp,
+    /// Scroll the active content view (Review / Prompt) down by one line.
+    ScrollContentDown,
+    /// Scroll the active content view up by one page.
+    ScrollContentPageUp,
+    /// Scroll the active content view down by one page.
+    ScrollContentPageDown,
 }
 
 /// Application state.
@@ -57,6 +71,17 @@ pub struct App {
     pub pending_retry: Option<i64>,
     /// Whether the user asked for a manual refresh (handled by the event loop).
     pub pending_refresh: bool,
+    /// Persistent queue table scroll/selection state, used so mouse clicks
+    /// and scroll events can map between viewport rows and absolute indices.
+    pub table_state: TableState,
+    /// Last-rendered screen rect of the queue table body. Updated by the
+    /// queue view renderer and consumed by the mouse handler.
+    pub last_table_area: Option<Rect>,
+    /// Scroll offset (in lines) for the Review / Prompt content views.
+    pub content_scroll: u16,
+    /// Height of the Review / Prompt content area, in lines. Used to
+    /// convert "page" scrolls into line counts.
+    pub content_viewport_height: u16,
     /// When the current `status_message` should auto-clear, if ever.
     status_expires_at: Option<Instant>,
 }
@@ -77,6 +102,10 @@ impl App {
             pending_cancel: None,
             pending_retry: None,
             pending_refresh: false,
+            table_state: TableState::default(),
+            last_table_area: None,
+            content_scroll: 0,
+            content_viewport_height: 0,
             status_expires_at: None,
         }
     }
@@ -109,6 +138,43 @@ impl App {
     /// Get the currently selected job, if any.
     pub fn selected_job(&self) -> Option<&Job> {
         self.jobs.get(self.selected_index)
+    }
+
+    /// Number of text lines in the content view currently shown. Returns
+    /// 0 for the Queue view. Used to clamp scroll offsets so the user
+    /// cannot scroll past the end of the content.
+    ///
+    /// NOTE: counts logical (source) lines, not display lines after
+    /// word-wrap. Both Review and Prompt views render with
+    /// `Paragraph::wrap`, so the actual scrollable height is at
+    /// least this count and may be larger for content that contains
+    /// long lines. As a result, `clamp_content_scroll` can permit a
+    /// small amount of over-scroll past the last visible display
+    /// line. This is a known UX gap, not a safety issue; ratatui
+    /// 0.29 does not expose a post-layout wrapped-line count through
+    /// its public API, so we cannot compute the exact scrollable
+    /// height at this layer.
+    pub fn content_line_count(&self) -> usize {
+        match self.view {
+            View::Queue => 0,
+            View::Review => self.review_text.lines().count(),
+            View::Prompt => self.command_text.lines().count(),
+        }
+    }
+
+    /// Clamp `content_scroll` so at least one line of content remains visible.
+    /// Call this after render when `content_viewport_height` has been updated.
+    pub fn clamp_content_scroll(&mut self) {
+        // Saturating cast: `ratatui::Paragraph::scroll` takes `(u16, u16)`,
+        // so any logical line count above `u16::MAX` is unrepresentable
+        // at the render layer anyway. Clamping at the cast makes the
+        // truncation deliberate instead of wrapping to zero.
+        let total = self.content_line_count().min(u16::MAX as usize) as u16;
+        let viewport = self.content_viewport_height.max(1);
+        let max_scroll = total.saturating_sub(viewport);
+        if self.content_scroll > max_scroll {
+            self.content_scroll = max_scroll;
+        }
     }
 
     /// Handle an action, mutating state.
@@ -162,6 +228,7 @@ impl App {
                                 self.review_text =
                                     format!("[HTML generation failed: {e}]\n\n{markdown}");
                                 self.view = View::Review;
+                                self.content_scroll = 0;
                             }
                         }
                     } else {
@@ -174,6 +241,7 @@ impl App {
                 if let Some(job) = self.selected_job() {
                     self.command_text = build_prompt_display(job, &self.output_dir);
                     self.view = View::Prompt;
+                    self.content_scroll = 0;
                 }
             }
             Action::CancelJob => {
@@ -247,12 +315,32 @@ impl App {
                 self.view = View::Queue;
                 self.status_message = None;
                 self.status_expires_at = None;
+                self.content_scroll = 0;
             }
             Action::Refresh => {
                 // Defer the actual reload to the event loop; it already has
                 // access to the store. The loop will flash "Refreshed" on
                 // success, which auto-clears after the flash TTL.
                 self.pending_refresh = true;
+            }
+            Action::SelectRow(idx) => {
+                if !self.jobs.is_empty() {
+                    self.selected_index = idx.min(self.jobs.len() - 1);
+                }
+            }
+            Action::ScrollContentUp => {
+                self.content_scroll = self.content_scroll.saturating_sub(1);
+            }
+            Action::ScrollContentDown => {
+                self.content_scroll = self.content_scroll.saturating_add(1);
+            }
+            Action::ScrollContentPageUp => {
+                let page = self.content_viewport_height.max(1);
+                self.content_scroll = self.content_scroll.saturating_sub(page);
+            }
+            Action::ScrollContentPageDown => {
+                let page = self.content_viewport_height.max(1);
+                self.content_scroll = self.content_scroll.saturating_add(page);
             }
         }
     }
@@ -588,6 +676,80 @@ mod tests {
         app.flash("second");
         app.tick_status();
         assert_eq!(app.status_message.as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn select_row_clamps_to_jobs_length() {
+        let (mut app, _tmp) = make_app();
+        app.update_jobs(vec![
+            make_job(1, JobStatus::Queued),
+            make_job(2, JobStatus::Queued),
+        ]);
+        app.dispatch(Action::SelectRow(99));
+        assert_eq!(app.selected_index, 1);
+    }
+
+    #[test]
+    fn select_row_is_noop_when_jobs_empty() {
+        let (mut app, _tmp) = make_app();
+        app.dispatch(Action::SelectRow(5));
+        assert_eq!(app.selected_index, 0);
+    }
+
+    #[test]
+    fn scroll_content_respects_saturating_bounds_and_viewport() {
+        let (mut app, _tmp) = make_app();
+        app.view = View::Prompt;
+        app.command_text = (0..20)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // 20 lines of content
+        assert_eq!(app.content_line_count(), 20);
+
+        // Scroll up from 0 should saturate to 0.
+        app.dispatch(Action::ScrollContentUp);
+        assert_eq!(app.content_scroll, 0);
+
+        // Scroll down increments.
+        app.dispatch(Action::ScrollContentDown);
+        assert_eq!(app.content_scroll, 1);
+
+        // Page down uses viewport height (fallback 1 until the view is rendered).
+        app.content_viewport_height = 5;
+        app.dispatch(Action::ScrollContentPageDown);
+        assert_eq!(app.content_scroll, 6);
+
+        // Clamp does not allow scrolling past (content - viewport).
+        app.content_scroll = 50;
+        app.clamp_content_scroll();
+        assert_eq!(app.content_scroll, 20 - 5);
+
+        // Page up uses viewport height.
+        app.dispatch(Action::ScrollContentPageUp);
+        assert_eq!(app.content_scroll, 10);
+    }
+
+    #[test]
+    fn go_back_resets_content_scroll() {
+        let (mut app, _tmp) = make_app();
+        app.view = View::Review;
+        app.review_text = "a\nb\nc\nd".into();
+        app.content_scroll = 3;
+        app.dispatch(Action::GoBack);
+        assert_eq!(app.view, View::Queue);
+        assert_eq!(app.content_scroll, 0);
+    }
+
+    #[test]
+    fn show_prompt_resets_content_scroll() {
+        let (mut app, _tmp) = make_app();
+        let job = make_job(1, JobStatus::Queued);
+        app.update_jobs(vec![job]);
+        app.content_scroll = 42;
+        app.dispatch(Action::ShowPrompt);
+        assert_eq!(app.view, View::Prompt);
+        assert_eq!(app.content_scroll, 0);
     }
 
     #[test]
