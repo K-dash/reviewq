@@ -17,8 +17,11 @@ This project ships 127+ skills from [Everything Claude Code](https://github.com/
 
 **Mandatory for every task**, no exemptions for "tiny" changes. reviewq requires a dedicated git worktree per feature branch (see `AGENTS.md` → Git Workflow).
 
+The recommended entry point is the **`/begin <task>`** slash command (see `.claude/commands/begin.md`), which walks the agent through Phases 0–6 in order — including the plan-first check that no PreToolUse hook can enforce. The table below covers the same ground, but `/begin` is the proactive form and should be preferred whenever the user is requesting a code change.
+
 | Trigger                                                                             | Skill(s) / Action                                             |
 |-------------------------------------------------------------------------------------|---------------------------------------------------------------|
+| User requests a code change of any size                                             | Prefer `/begin <task>` — it drives every step in this file in order. |
 | First filesystem edit of a task, any size                                           | Verify `git worktree list` + `git rev-parse --show-toplevel`; if in the main worktree, run `git worktree add -b <type>/<slug> .worktree/<type>-<slug>` and `cd` into it before editing. |
 | User asks for a "quick fix" / "one-liner" / "just commit this"                      | Still create a worktree first. There is **no** small-change exemption. |
 | Found yourself editing on `main` by mistake                                         | `git stash push -u`, create the worktree, `git -C .worktree/<name> stash pop`, continue there. |

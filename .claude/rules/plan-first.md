@@ -17,6 +17,25 @@ skip the plan mode step and execute directly — but **still inside a
 fresh worktree** per `.claude/rules/git-workflow.md`. The worktree
 requirement has no size exemption.
 
+## How this rule is enforced
+
+This rule **cannot** be enforced by a PreToolUse hook: `EnterPlanMode`
+is a Claude Code mode transition, not a tool call, so no gate can
+observe whether the agent entered it. Instead, the rule is operationalized
+through the `/begin <task>` slash command (see
+`.claude/commands/begin.md`).
+
+`/begin` Step 3 explicitly asks the agent to estimate scope and
+**requires** plan mode for any task touching ≥3 files or introducing a
+new pattern. The agent must `EnterPlanMode`, draft a plan covering all
+four points above, call `ExitPlanMode`, and **wait for user approval**
+before any Edit/Write happens. Steps 4 onward (worktree creation,
+implementation, review, ship) only run after the user approves.
+
+When you ask the agent to do work, prefer starting with `/begin <task
+description>`. Without that command, this rule degrades to a guideline
+that the agent may forget — the hook layer cannot catch the violation.
+
 ## Why
 
 `plan-and-handoff` / `blueprint` skills exist for this. Without a plan
