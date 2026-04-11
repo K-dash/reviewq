@@ -857,6 +857,66 @@ fi
 rm -f "$scratch_rs"
 cleanup_session "$SID"
 
+echo "== /begin command (entry-point smoke) =="
+
+# /begin is the proactive entry point — see .claude/commands/begin.md
+# and .claude/rules/harness-engineering.md "Two layers" section. We do
+# not exercise the slash command end-to-end (slash commands are
+# Claude-side, not bash-side), but we do guard the contract that the
+# command file exists and references the steps that the rest of the
+# harness depends on.
+BEGIN_MD="$REPO/.claude/commands/begin.md"
+if [[ -f "$BEGIN_MD" ]]; then
+    printf '  \e[32mPASS\e[0m .claude/commands/begin.md exists\n'
+    PASS=$((PASS + 1))
+else
+    printf '  \e[31mFAIL\e[0m .claude/commands/begin.md is missing\n'
+    FAIL=$((FAIL + 1))
+fi
+
+# Required phrases that downstream rules / docs link against. If any of
+# these get renamed in begin.md without updating the rules files, the
+# pro-flow / anti-violation contract is broken.
+required_in_begin=(
+    "Skill(grill-me)"
+    "EnterPlanMode"
+    "ExitPlanMode"
+    "AGENTS.md"
+    "worktree"
+    "rust-review"
+    "/ship"
+    "make all"
+    "Step 4"
+)
+begin_ok=1
+if [[ -f "$BEGIN_MD" ]]; then
+    for needle in "${required_in_begin[@]}"; do
+        if ! grep -qF "$needle" "$BEGIN_MD"; then
+            begin_ok=0
+            printf '  \e[31mFAIL\e[0m begin.md missing required phrase: %s\n' "$needle"
+        fi
+    done
+fi
+if [[ "$begin_ok" -eq 1 && -f "$BEGIN_MD" ]]; then
+    printf '  \e[32mPASS\e[0m begin.md contains all required phrases\n'
+    PASS=$((PASS + 1))
+else
+    [[ -f "$BEGIN_MD" ]] && FAIL=$((FAIL + 1))
+fi
+
+# /begin Step 1 invokes Skill(grill-me), so the project-local copy of
+# the grill-me skill must exist. The skill is intentionally duplicated
+# from the global ~/.claude/skills/ so the project's `/begin` flow does
+# not depend on per-machine global state.
+GRILL_MD="$REPO/.claude/skills/grill-me/SKILL.md"
+if [[ -f "$GRILL_MD" ]]; then
+    printf '  \e[32mPASS\e[0m .claude/skills/grill-me/SKILL.md exists (project-local copy)\n'
+    PASS=$((PASS + 1))
+else
+    printf '  \e[31mFAIL\e[0m grill-me skill is not vendored under .claude/skills/\n'
+    FAIL=$((FAIL + 1))
+fi
+
 echo
 echo "== Summary =="
 printf "  passed: %d\n  failed: %d\n" "$PASS" "$FAIL"

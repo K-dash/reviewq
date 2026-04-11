@@ -40,6 +40,64 @@ into commit-gate. Whenever it exists at commit-gate, ask whether it can
 migrate into the Stop or PostToolUse layer. Faster feedback = smaller
 defect windows = less wasted agent work.
 
+## Two layers: pro-flow and anti-violation
+
+The harness has two distinct enforcement layers that compose:
+
+```
+ユーザー入力
+    ↓
+[/begin <task>]    ← pro-flow      (proactively presents the correct
+    ↓                                workflow before any action)
+agent runs steps 1-13
+    ↓
+[12 hooks]         ← anti-violation (reactively blocks broken actions
+    ↓                                when the agent slips)
+[/ship]            ← exit gate     (push + PR with full preconditions)
+    ↓
+完成
+```
+
+### Anti-violation (the 12 hooks)
+
+The Hook index below catalogs the reactive layer. Each hook fires on a
+specific tool event and blocks the agent if a precondition is missing.
+This layer is **necessary but not sufficient**: it tells the agent
+*after the fact* that something is wrong, which wastes turns and
+produces fragmented error messages spread across the session.
+
+### Pro-flow (the `/begin` command)
+
+`/begin <task>` (`.claude/commands/begin.md`) is the user-invoked
+entry point that hands the agent the entire workflow up front, in
+order, before any action is taken. Steps 1–13 cover: **`Skill(grill-me)`
+to interview the user until requirements are clear** → location check →
+AGENTS.md read → **plan-mode decision** → worktree creation → skill
+routing → write tests first → implement → `make all` → `/rust-review`
+→ commit (with user approval) → `/ship` → cleanup after merge.
+
+`/begin` does **not** bypass any hook. Every Edit/Write/Bash inside
+its steps still passes through the normal PreToolUse gates, the Stop
+hook still runs clippy at turn end, and `/ship` still has its own
+preconditions. The two layers are defense in depth, not alternatives.
+
+### Why both are needed
+
+- Pro-flow alone is **best-effort**: the agent might forget a step
+  mid-task. The hooks catch the slip.
+- Anti-violation alone is **reactive**: the agent has to *try* to do
+  something wrong before being stopped. Pro-flow primes the correct
+  sequence so hooks rarely have to fire.
+- Plan-first specifically **cannot** live in the hook layer because
+  Plan Mode is invisible to PreToolUse hooks. It only lives in
+  `/begin` Step 3. See `.claude/rules/plan-first.md` for the
+  reasoning.
+
+When the user requests a code change, they should start with `/begin
+<task>`. When the agent inevitably slips (forgets to read AGENTS.md,
+edits before invoking a skill, tries to commit without rust-review),
+the hooks catch it.
+
 ## Hook index
 
 | Hook | Event | Purpose |
