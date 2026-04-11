@@ -16,9 +16,6 @@
 #                          or the rust-review skill finished. Unlocks
 #                          the rust-review check in commit-gate.sh.
 #
-#   e2e-done             — reviewq-e2e skill was invoked. Unlocks the
-#                          TUI e2e check in commit-gate.sh.
-#
 #   tdd-tests-written    — tdd-workflow / rust-testing skill was invoked,
 #                          OR a test file has been edited this session.
 #                          Unlocks tdd-gate.sh.
@@ -84,9 +81,6 @@ case "$tool_name" in
             safe=$(printf '%s' "$skill_name" | tr '/:' '__')
             reviewq_mark "skill:$safe"
             case "$skill_name" in
-                reviewq-e2e)
-                    reviewq_mark e2e-done
-                    ;;
                 rust-testing|tdd-workflow)
                     reviewq_mark tdd-tests-written
                     ;;

@@ -198,18 +198,12 @@ finishes, unblocking this gate. Staged Rust files:
 $(printf '  %s\n' $rust_staged)"
 fi
 
-# ---- 5. e2e marker (only when src/tui/** files are staged) --------------
-tui_staged=$(printf '%s\n' "$staged" | grep -E '^src/tui/' || true)
-if [[ -n "$tui_staged" ]] && ! reviewq_has_mark e2e-done; then
-    reviewq_block "TUI files staged but reviewq-e2e has not run this session.
-
-.claude/rules/skills.md → Phase 4: 'TUI behavior changes (src/tui/**) → reviewq-e2e'
-
-Fix: run the e2e workflow, then retry the commit.
-  Skill(reviewq-e2e)
-
-Once the e2e run marker is set, this gate will unblock."
-fi
+# TUI e2e coverage was previously gated via an `e2e-done` session marker
+# set by the reviewq-e2e skill. That marker was only proof that the skill
+# was loaded, not that any interactive test actually ran, so it was
+# trivially bypassable. It has been retired in favor of `tests/tui_render.rs`,
+# which drives every view's render function through ratatui's TestBackend
+# as part of the standard `cargo test` pass above. No marker required.
 
 # All gates passed.
 exit 0

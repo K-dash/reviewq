@@ -60,7 +60,7 @@ This project ships 127+ skills from [Everything Claude Code](https://github.com/
 | Trigger                                                                             | Skill(s)                                                      |
 |-------------------------------------------------------------------------------------|---------------------------------------------------------------|
 | Any new feature or bug fix                                                          | `tdd-workflow`, `rust-testing` (write tests FIRST)            |
-| TUI behavior changes (`src/tui/**`)                                                 | `reviewq-e2e`                                                 |
+| TUI behavior changes (`src/tui/**`)                                                 | Add / update render-layer tests in `tests/tui_render.rs` (TestBackend-based) so `cargo test` covers the change. `reviewq-e2e` is optional for extra interactive verification but no longer required by the commit gate. |
 | Regression risk on existing behavior                                                | `ai-regression-testing`                                       |
 | Coverage check before hand-off                                                      | `test-coverage` command                                       |
 

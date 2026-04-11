@@ -52,7 +52,7 @@ defect windows = less wasted agent work.
 | `tdd-gate.sh`             | PreToolUse Edit/Write on `*.rs` | Require a test file or tdd skill before production Rust edits. |
 | `procrastination-gate.sh` | PreToolUse Edit/Write | Block "TODO: later" / "後で対応" patterns in new content. |
 | `safety-gate.sh`          | PreToolUse Bash | Block `rm -rf /`, `git push --force`, `git reset --hard`, `--no-verify`, `curl \| sh`, Bash-level config writes. |
-| `commit-gate.sh`          | PreToolUse Bash (`git commit`) | Run fmt-check / clippy / test + require `rust-review-done` + `e2e-done` markers where relevant. |
+| `commit-gate.sh`          | PreToolUse Bash (`git commit`) | Run fmt-check / clippy / test + require `rust-review-done` marker when Rust is staged. |
 | `post-edit-rust.sh`       | PostToolUse Edit/Write | Run `rustfmt --check` on edited Rust files and inject the diff back as `additionalContext`. |
 | `mark-post-tool.sh`       | PostToolUse Read/Skill/Agent/Write/Edit | Update session markers so downstream gates can check state. |
 | `stop-gate.sh`            | Stop | Run `cargo check --all-targets` if Rust was edited; emit `{decision: "block"}` on failure. |
@@ -71,7 +71,6 @@ files; their presence encodes workflow state.
 | `tests-edited`          | Edit/Write on test files | *(audit)* | a test file was edited |
 | `tdd-tests-written`     | rust-testing/tdd skill OR test file edit | tdd-gate | TDD prerequisite satisfied |
 | `rust-review-done`      | Agent(rust-reviewer) / Skill(rust-review) | commit-gate | review completed |
-| `e2e-done`              | Skill(reviewq-e2e) | commit-gate | TUI e2e completed |
 | `tests-just-passed`     | commit-gate after `cargo test` | stop-gate | skip redundant check |
 | `config-edit-approved`  | /config-edit slash command | config-protect-gate | config edits unlocked |
 | `branch-delete-approved:<safe_name>` | /confirm-branch-delete slash command | safety-gate (class 5) | force-delete of that specific branch unlocked once |
