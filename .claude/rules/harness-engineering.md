@@ -29,7 +29,7 @@ From nyosegawa's harness-engineering best-practices article:
 ```
   milliseconds   — PostToolUse formatter (post-edit-rust.sh → rustfmt --check)
   seconds        — PreToolUse gates (worktree / agents-md / skill / tdd)
-  seconds        — Stop hook (cargo check --all-targets)
+  ~2 sec         — Stop hook (cargo clippy --all-targets -- -D warnings)
   tens of sec    — commit-gate (cargo fmt --check + clippy + test)
   minutes        — CI (full test matrix, not yet wired)
   hours+         — human review (PR approval, only on risky changes)
@@ -44,7 +44,7 @@ defect windows = less wasted agent work.
 
 | Hook | Event | Purpose |
 |------|-------|---------|
-| `session-start.sh`        | SessionStart | Emit git status / log / worktree list / PROGRESS.md as context so the agent resumes with state. |
+| `session-start.sh`        | SessionStart | Emit git status / log / worktree list / PROGRESS.md as context so the agent resumes with state. Also expires session marker dirs older than 24h to `.claude/.session/.archive/`. |
 | `worktree-gate.sh`        | PreToolUse Edit/Write | Block edits outside `.worktree/` per AGENTS.md. |
 | `agents-md-gate.sh`       | PreToolUse Edit/Write | Require AGENTS.md was Read this session. |
 | `config-protect-gate.sh`  | PreToolUse Edit/Write | Block edits to Cargo.toml / Makefile / CI / linter config unless `/config-edit` unlocks. |
@@ -55,7 +55,7 @@ defect windows = less wasted agent work.
 | `commit-gate.sh`          | PreToolUse Bash (`git commit`) | Run fmt-check / clippy / test + require `rust-review-done` marker when Rust is staged. |
 | `post-edit-rust.sh`       | PostToolUse Edit/Write | Run `rustfmt --check` on edited Rust files and inject the diff back as `additionalContext`. |
 | `mark-post-tool.sh`       | PostToolUse Read/Skill/Agent/Write/Edit | Update session markers so downstream gates can check state. |
-| `stop-gate.sh`            | Stop | Run `cargo check --all-targets` if Rust was edited; emit `{decision: "block"}` on failure. |
+| `stop-gate.sh`            | Stop | Run `cargo clippy --all-targets -- -D warnings` if Rust was edited; emit `{decision: "block"}` on failure. Catches both compile errors and clippy lints (e.g. `clippy::doc_markdown`) at turn boundary instead of letting them escape to commit-gate. |
 
 ## Marker vocabulary
 

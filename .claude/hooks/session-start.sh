@@ -77,6 +77,30 @@ cleanup_log=$(reviewq_session_dir)/session-start-cleanup.log
             echo "removed stale fsmonitor ipc socket"
         fi
     fi
+
+    # --- session marker TTL ---
+    # Without this, a long-lived markers directory accumulates state from
+    # weeks-old sessions and downstream gates (skill-invoked, agents-md-read,
+    # rust-files-edited, ...) can spuriously pass because some prior session
+    # touched the marker. The iter3-iter4 transition hit exactly this:
+    # iter4 inherited iter3's `e2e-done` marker and the e2e gate looked
+    # green when it had not actually run.
+    #
+    # Policy: any session marker dir whose mtime is more than 24h old gets
+    # moved (not deleted) to `.archive/`, preserving forensics for review.
+    # The current session is always kept; `.archive/` itself is skipped.
+    session_root="$cwd/.claude/.session"
+    current_sid=$(reviewq_jq '.session_id')
+    if [[ -d "$session_root" ]]; then
+        archive="$session_root/.archive"
+        mkdir -p "$archive"
+        while IFS= read -r stale; do
+            base=$(basename "$stale")
+            [[ "$base" == ".archive" || "$base" == "$current_sid" ]] && continue
+            mv "$stale" "$archive/" 2>/dev/null && \
+                echo "archived stale session dir (>24h): $base"
+        done < <(find "$session_root" -mindepth 1 -maxdepth 1 -type d -mtime +1 2>/dev/null)
+    fi
 } > "$cleanup_log" 2>&1 || true
 
 # --- collect context snippets --------------------------------------------
@@ -112,8 +136,9 @@ msg+=$'- Production *.rs edits are blocked until a test file or\n'
 msg+=$'  tdd-workflow / rust-testing skill has been touched.\n'
 msg+=$'- `git commit` runs fmt-check / clippy -D warnings / cargo test\n'
 msg+=$'  and requires a rust-review-done marker if *.rs is staged.\n'
-msg+=$'- `cargo check` runs on Stop when *.rs files were edited; you\n'
-msg+=$'  cannot end the turn with a broken build.\n'
+msg+=$'- `cargo clippy --all-targets -D warnings` runs on Stop when *.rs\n'
+msg+=$'  files were edited; you cannot end the turn with a broken build\n'
+msg+=$'  or any clippy warning (including doc-comment lints).\n'
 msg+=$'- Destructive bash (rm -rf wildcards, force-push, --no-verify,\n'
 msg+=$'  git reset --hard) is blocked by safety-gate.sh.\n\n'
 
