@@ -51,6 +51,34 @@ for _ in 1 2 3 4; do
 done
 cwd="$probe"
 
+# --- stale-state cleanup --------------------------------------------------
+# git worktree admin dirs and fsmonitor daemons routinely get left behind
+# when a previous session removed a worktree but git internals did not
+# fully reconcile. Symptoms seen in iter2: `git rev-parse --show-toplevel`
+# returns a deleted worktree path, `git checkout` fails with "fatal: this
+# operation must be run in a work tree", and the AGENTS.md size gate
+# test picks up a stale index from a wrapper framework.
+#
+# Best-effort fixes on every session start:
+#   1. Prune stale worktree admin dirs. Safe and fast.
+#   2. Stop any fsmonitor daemon pointing at a now-deleted path. Only
+#      fires when the daemon is alive; silent no-op otherwise.
+cleanup_log=$(reviewq_session_dir)/session-start-cleanup.log
+{
+    echo "== session-start stale-state cleanup =="
+    (cd "$cwd" && git worktree prune -v 2>&1) || true
+    # `git fsmonitor--daemon stop` exits non-zero if no daemon is running;
+    # `|| true` keeps the session bootstrap from soft-failing open.
+    (cd "$cwd" && git fsmonitor--daemon stop 2>&1) || true
+    # Also remove the IPC socket if it still exists without a live daemon.
+    if [[ -S "$cwd/.git/fsmonitor--daemon.ipc" ]]; then
+        if ! pgrep -f "fsmonitor--daemon.*$cwd" >/dev/null 2>&1; then
+            rm -f "$cwd/.git/fsmonitor--daemon.ipc"
+            echo "removed stale fsmonitor ipc socket"
+        fi
+    fi
+} > "$cleanup_log" 2>&1 || true
+
 # --- collect context snippets --------------------------------------------
 status_lines=$( (cd "$cwd" && git status --short --branch) 2>/dev/null | head -20 )
 log_lines=$( (cd "$cwd" && git log --oneline -15) 2>/dev/null )

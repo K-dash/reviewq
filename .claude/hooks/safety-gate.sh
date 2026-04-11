@@ -32,6 +32,28 @@ tool_name=$(reviewq_jq '.tool_name')
 cmd=$(reviewq_jq '.tool_input.command')
 [[ -z "$cmd" ]] && exit 0
 
+# GIT_SUBCMD_PREFIX matches `git` at a shell-command boundary (start of
+# string, or after `;`, `&&`, `||`, `(`, `$(`, or a pipe), optionally
+# followed by up to 4 whitespace-separated "gap" tokens. The gap tokens
+# exist so the classes below recognise git invocations with global
+# options between `git` and the subcommand — e.g. all of:
+#
+#   git push --force origin main
+#   git -C /some/path push --force
+#   git --git-dir=.git --work-tree=. push --force
+#   git -c user.name=x push --force
+#
+# Gap tokens are constrained to not contain quote characters, so a
+# literal occurrence of "git branch -D" inside an argument to `grep`,
+# `echo`, or `sed` does NOT trip the gate. The 4-token ceiling is a
+# pragmatic bound: if you legitimately need more than 4 global options
+# between git and a destructive subcommand, you are doing something
+# unusual enough that the false-positive block is acceptable.
+#
+# This regex is a string (not a bash variable with special meaning); it
+# is interpolated into each class's grep pattern below.
+GIT_SUBCMD_PREFIX='(^|[;&|(]|\$\()[[:space:]]*git([[:space:]]+[^[:space:]"'"'"']+){0,4}[[:space:]]+'
+
 # ---- Class 1: indiscriminate rm ----
 # Block `rm -rf /`, `rm -rf ~`, `rm -rf *`, `rm -rf /*`, `rm -rf .`.
 # We use word-boundary regex so things like `rmdir` or `./rm` don't trip.
@@ -49,10 +71,10 @@ Fix:
 fi
 
 # ---- Class 2: force-push ----
-if printf '%s' "$cmd" | grep -Eq 'git[[:space:]]+push[[:space:]]+.*(--force([[:space:]]|$)|-f([[:space:]]|$))'; then
+if printf '%s' "$cmd" | grep -Eq "${GIT_SUBCMD_PREFIX}push[[:space:]]+[^\"']*(--force([[:space:]]|\$)|-f([[:space:]]|\$))"; then
     # Allow --force-with-lease (safer) as an escape hatch for intentional
     # rewrites of a feature branch the user owns.
-    if ! printf '%s' "$cmd" | grep -Eq 'git[[:space:]]+push[[:space:]]+.*--force-with-lease'; then
+    if ! printf '%s' "$cmd" | grep -Eq "${GIT_SUBCMD_PREFIX}push[[:space:]]+[^\"']*--force-with-lease"; then
         reviewq_block "'git push --force' / 'git push -f' detected: $cmd
 
 Force-push rewrites remote history and can destroy other contributors'
@@ -80,7 +102,7 @@ Fix:
 fi
 
 # ---- Class 4: hard reset / destructive git clean ----
-if printf '%s' "$cmd" | grep -Eq 'git[[:space:]]+reset[[:space:]]+(--hard|.*[[:space:]]--hard)'; then
+if printf '%s' "$cmd" | grep -Eq "${GIT_SUBCMD_PREFIX}reset[[:space:]]+[^\"']*--hard"; then
     reviewq_block "'git reset --hard' detected in: $cmd
 
 Hard-reset discards uncommitted work and rewrites the index silently.
@@ -93,7 +115,7 @@ Fix:
   - Use 'git reset --keep <ref>' to reset while aborting on conflicts."
 fi
 
-if printf '%s' "$cmd" | grep -Eq 'git[[:space:]]+clean[[:space:]]+.*(-[A-Za-z]*f[A-Za-z]*x|-[A-Za-z]*x[A-Za-z]*f)'; then
+if printf '%s' "$cmd" | grep -Eq "${GIT_SUBCMD_PREFIX}clean[[:space:]]+[^\"']*(-[A-Za-z]*f[A-Za-z]*x|-[A-Za-z]*x[A-Za-z]*f)"; then
     reviewq_block "'git clean -fdx' (or -fx) detected in: $cmd
 
 This deletes EVERY untracked file including .gitignored build artifacts,
@@ -123,14 +145,20 @@ fi
 #      allow and log.
 #   6. Otherwise block with a helpful message that explains both escape
 #      hatches.
-if printf '%s' "$cmd" | grep -Eq '(^|[;&|(]|\$\()[[:space:]]*git[[:space:]]+branch[[:space:]]+[^"'"'"']*(-D|--delete[[:space:]]+--force)'; then
+if printf '%s' "$cmd" | grep -Eq "${GIT_SUBCMD_PREFIX}branch[[:space:]]+[^\"']*(-D|--delete[[:space:]]+--force)"; then
     # Pull the branch name from the tail of the command. Accept any of:
     #   git branch -D foo
+    #   git -C repo branch -D foo
+    #   git --git-dir=.git --work-tree=. branch -D foo
     #   git branch -Df foo
     #   git branch --delete --force foo
     #   git branch -D foo bar        (multiple — we check the first one)
+    #
+    # Strip everything up to and including the `branch` keyword (with
+    # any intervening global options), then take the first positional
+    # token that does not start with `-`.
     target=$(printf '%s' "$cmd" | \
-        sed -E 's/.*git[[:space:]]+branch[[:space:]]+//' | \
+        sed -E 's/.*git([[:space:]]+[^[:space:]"'"'"']+)*[[:space:]]+branch[[:space:]]+//' | \
         awk '{
             for (i = 1; i <= NF; i++) {
                 if ($i !~ /^-/) { print $i; exit }

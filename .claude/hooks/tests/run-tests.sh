@@ -516,6 +516,77 @@ runcase "allow: echo of \"git branch -D\" literal" safety-gate.sh 0 '{
 }'
 cleanup_session "$SID"
 
+# iter3: git with global options between `git` and the subcommand
+# (e.g. `git -C path branch -D foo`, `git --git-dir=X branch -D foo`)
+# must also trip the gate. The iter2 regex required `git branch` to be
+# directly adjacent, which silently let these forms through.
+
+SID=$(scratch_session)
+runcase "block: git -C path branch -D (iter3)" safety-gate.sh 2 '{
+  "session_id":"'"$SID"'",
+  "tool_name":"Bash",
+  "tool_input":{"command":"git -C /tmp/repo branch -D feat/bogus-xyz"},
+  "cwd":"'"$REPO"'"
+}'
+cleanup_session "$SID"
+
+SID=$(scratch_session)
+runcase "block: git --git-dir=X branch -D (iter3)" safety-gate.sh 2 '{
+  "session_id":"'"$SID"'",
+  "tool_name":"Bash",
+  "tool_input":{"command":"git --git-dir=/tmp/r/.git --work-tree=/tmp/r branch -D feat/bogus-xyz"},
+  "cwd":"'"$REPO"'"
+}'
+cleanup_session "$SID"
+
+SID=$(scratch_session)
+runcase "block: git -c key=val push --force (iter3)" safety-gate.sh 2 '{
+  "session_id":"'"$SID"'",
+  "tool_name":"Bash",
+  "tool_input":{"command":"git -c user.name=x push --force origin main"},
+  "cwd":"'"$REPO"'"
+}'
+cleanup_session "$SID"
+
+SID=$(scratch_session)
+runcase "block: git -C path reset --hard (iter3)" safety-gate.sh 2 '{
+  "session_id":"'"$SID"'",
+  "tool_name":"Bash",
+  "tool_input":{"command":"git -C /tmp/repo reset --hard HEAD~3"},
+  "cwd":"'"$REPO"'"
+}'
+cleanup_session "$SID"
+
+SID=$(scratch_session)
+runcase "block: git -C path clean -fdx (iter3)" safety-gate.sh 2 '{
+  "session_id":"'"$SID"'",
+  "tool_name":"Bash",
+  "tool_input":{"command":"git -C /tmp/repo clean -fdx"},
+  "cwd":"'"$REPO"'"
+}'
+cleanup_session "$SID"
+
+SID=$(scratch_session); mark_for_session "$SID" "branch-delete-approved:feat__scoped"
+runcase "allow: git -C path branch -D with marker (iter3)" safety-gate.sh 0 '{
+  "session_id":"'"$SID"'",
+  "tool_name":"Bash",
+  "tool_input":{"command":"git -C /tmp/repo branch -D feat/scoped"},
+  "cwd":"'"$REPO"'"
+}'
+cleanup_session "$SID"
+
+# Regression: `git log` with a non-option argument should NOT trip any
+# class 2/4/5 gate even though it shares the GIT_SUBCMD_PREFIX path —
+# none of the subcommand keywords match.
+SID=$(scratch_session)
+runcase "allow: git log --oneline origin/main (iter3)" safety-gate.sh 0 '{
+  "session_id":"'"$SID"'",
+  "tool_name":"Bash",
+  "tool_input":{"command":"git log --oneline origin/main"},
+  "cwd":"'"$REPO"'"
+}'
+cleanup_session "$SID"
+
 SID=$(scratch_session)
 runcase "block: curl | sh" safety-gate.sh 2 '{
   "session_id":"'"$SID"'",
