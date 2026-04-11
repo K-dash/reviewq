@@ -129,7 +129,14 @@ daemon:
     sigkill_timeout_seconds: 5             # SIGKILL wait after SIGTERM (default: 5)
 
   cleanup:
-    ttl_minutes: 1440                      # Worktree retention period in minutes (default: 1440 = 24h)
+    # Worktree retention period in minutes (default: 1440 = 24h).
+    # The cleanup loop queries the DB for terminal jobs older than this
+    # and `git worktree remove`s each one using its owning repo's
+    # `base_repo_path` (resolved via `repos.defaults` → entry override),
+    # so installs whose `repos.allowlist[]` entries point at different
+    # local clones are all swept correctly. A second "orphan pass"
+    # removes leftover `reviewq-*` directories that have no DB row.
+    ttl_minutes: 1440
     interval_minutes: 30                   # Cleanup check interval in minutes (default: 30)
 
   logging:

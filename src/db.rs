@@ -1,6 +1,6 @@
 //! SQLite-backed state management implementing the [`JobStore`] trait.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use chrono::{DateTime, NaiveDateTime, Utc};
@@ -495,6 +495,55 @@ impl JobStore for Database {
         )?;
         Ok(exists)
     }
+
+    fn expired_terminal_worktrees(&self, ttl_minutes: u64) -> Result<Vec<(RepoId, PathBuf)>> {
+        let conn = self.lock_conn();
+        // `<=` (not `<`) so that jobs whose `updated_at` falls in the
+        // same second as the cutoff are still treated as expired. SQLite
+        // stores datetimes at one-second resolution, so a strict `<`
+        // would miss jobs that completed within the same second the
+        // cleanup loop runs — surprising for callers that pass
+        // `ttl_minutes = 0` in tests.
+        let cutoff = format!("-{ttl_minutes} minutes");
+        let mut stmt = conn.prepare(
+            "SELECT repo_owner, repo_name, worktree_path
+             FROM jobs
+             WHERE status IN ('succeeded', 'failed', 'canceled')
+               AND worktree_path IS NOT NULL
+               AND updated_at <= datetime('now', ?1)
+             ORDER BY updated_at ASC",
+        )?;
+        let rows = stmt.query_map(params![cutoff], |row| {
+            let owner: String = row.get(0)?;
+            let name: String = row.get(1)?;
+            let path_str: String = row.get(2)?;
+            Ok((RepoId::new(owner, name), PathBuf::from(path_str)))
+        })?;
+        let out = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(out)
+    }
+
+    fn known_worktree_paths(&self) -> Result<Vec<PathBuf>> {
+        let conn = self.lock_conn();
+        let mut stmt =
+            conn.prepare("SELECT worktree_path FROM jobs WHERE worktree_path IS NOT NULL")?;
+        let rows = stmt.query_map([], |row| {
+            let path_str: String = row.get(0)?;
+            Ok(PathBuf::from(path_str))
+        })?;
+        let out = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(out)
+    }
+
+    fn clear_worktree_path(&self, path: &Path) -> Result<()> {
+        let conn = self.lock_conn();
+        conn.execute(
+            "UPDATE jobs SET worktree_path = NULL, updated_at = datetime('now')
+             WHERE worktree_path = ?1",
+            params![path.display().to_string()],
+        )?;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -943,5 +992,260 @@ mod tests {
         assert!(jobs[0].pid.is_none());
         assert!(jobs[0].leased_at.is_none());
         assert!(jobs[0].lease_expires.is_none());
+    }
+
+    // -- expired_terminal_worktrees ------------------------------------------
+
+    /// Helper: enqueue + set worktree_path + transition to terminal status
+    /// in one shot, so the jobs have `worktree_path IS NOT NULL` and a
+    /// fresh `updated_at`.
+    fn seed_terminal_job(
+        db: &Database,
+        repo: &RepoId,
+        head_sha: &str,
+        worktree_path: &str,
+        status: JobStatus,
+    ) -> i64 {
+        let new_job = NewJob {
+            repo: repo.clone(),
+            pr_number: 1,
+            head_sha: head_sha.into(),
+            agent_kind: AgentKind::Claude,
+            command: None,
+            prompt_template: None,
+            max_retries: 3,
+        };
+        let job = db.enqueue(new_job).expect("enqueue");
+        db.store_worktree_path(job.id, Path::new(worktree_path))
+            .expect("store worktree_path");
+        let leased = db.lease_next().expect("lease").expect("has job");
+        db.mark_running(leased.id, 1).expect("mark running");
+        db.complete(job.id, status, Some(0)).expect("complete");
+        job.id
+    }
+
+    #[test]
+    fn expired_terminal_worktrees_returns_succeeded_past_ttl() {
+        let db = test_db();
+        let repo = RepoId::new("owner", "repo");
+        seed_terminal_job(&db, &repo, "sha1", "/tmp/wt-1", JobStatus::Succeeded);
+
+        let expired = db
+            .expired_terminal_worktrees(0)
+            .expect("query should succeed");
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].0, repo);
+        assert_eq!(expired[0].1, PathBuf::from("/tmp/wt-1"));
+    }
+
+    #[test]
+    fn expired_terminal_worktrees_includes_failed_and_canceled() {
+        let db = test_db();
+        let repo = RepoId::new("owner", "repo");
+
+        // succeeded, failed, canceled — all three should be returned.
+        seed_terminal_job(&db, &repo, "sha_succ", "/tmp/wt-succ", JobStatus::Succeeded);
+        seed_terminal_job(&db, &repo, "sha_fail", "/tmp/wt-fail", JobStatus::Failed);
+        seed_terminal_job(&db, &repo, "sha_canc", "/tmp/wt-canc", JobStatus::Canceled);
+
+        let expired = db.expired_terminal_worktrees(0).expect("query");
+        let mut paths: Vec<PathBuf> = expired.into_iter().map(|(_, p)| p).collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/tmp/wt-canc"),
+                PathBuf::from("/tmp/wt-fail"),
+                PathBuf::from("/tmp/wt-succ"),
+            ]
+        );
+    }
+
+    #[test]
+    fn expired_terminal_worktrees_excludes_running() {
+        let db = test_db();
+        let repo = RepoId::new("owner", "repo");
+        let job = db
+            .enqueue(NewJob {
+                repo: repo.clone(),
+                pr_number: 7,
+                head_sha: "sha_run".into(),
+                agent_kind: AgentKind::Claude,
+                command: None,
+                prompt_template: None,
+                max_retries: 3,
+            })
+            .expect("enqueue");
+        db.store_worktree_path(job.id, Path::new("/tmp/wt-running"))
+            .expect("store worktree_path");
+        let leased = db.lease_next().expect("lease").expect("has job");
+        db.mark_running(leased.id, 1).expect("mark running");
+        // Do NOT call complete — job stays `running`.
+
+        let expired = db.expired_terminal_worktrees(0).expect("query");
+        assert!(
+            expired.is_empty(),
+            "running jobs must not be returned: {expired:?}"
+        );
+    }
+
+    #[test]
+    fn expired_terminal_worktrees_excludes_queued() {
+        let db = test_db();
+        let repo = RepoId::new("owner", "repo");
+        let job = db
+            .enqueue(NewJob {
+                repo: repo.clone(),
+                pr_number: 11,
+                head_sha: "sha_q".into(),
+                agent_kind: AgentKind::Claude,
+                command: None,
+                prompt_template: None,
+                max_retries: 3,
+            })
+            .expect("enqueue");
+        // Seed a worktree_path even on the queued job so the filter is
+        // *status*, not *worktree_path*.
+        db.store_worktree_path(job.id, Path::new("/tmp/wt-queued"))
+            .expect("store worktree_path");
+
+        let expired = db.expired_terminal_worktrees(0).expect("query");
+        assert!(expired.is_empty());
+    }
+
+    #[test]
+    fn expired_terminal_worktrees_excludes_jobs_without_worktree_path() {
+        let db = test_db();
+        let repo = RepoId::new("owner", "repo");
+        // Complete a job without ever calling store_worktree_path.
+        let job = db
+            .enqueue(NewJob {
+                repo: repo.clone(),
+                pr_number: 99,
+                head_sha: "sha_no_wt".into(),
+                agent_kind: AgentKind::Claude,
+                command: None,
+                prompt_template: None,
+                max_retries: 3,
+            })
+            .expect("enqueue");
+        let leased = db.lease_next().expect("lease").expect("has job");
+        db.mark_running(leased.id, 1).expect("mark running");
+        db.complete(job.id, JobStatus::Succeeded, Some(0))
+            .expect("complete");
+
+        let expired = db.expired_terminal_worktrees(0).expect("query");
+        assert!(expired.is_empty());
+    }
+
+    #[test]
+    fn expired_terminal_worktrees_excludes_jobs_within_ttl() {
+        let db = test_db();
+        let repo = RepoId::new("owner", "repo");
+        seed_terminal_job(&db, &repo, "sha1", "/tmp/wt-recent", JobStatus::Succeeded);
+
+        // The job was updated ~now; asking for "at least 60 minutes old"
+        // should exclude it.
+        let expired = db.expired_terminal_worktrees(60).expect("query");
+        assert!(
+            expired.is_empty(),
+            "recent jobs must not be returned when ttl is 60: {expired:?}"
+        );
+    }
+
+    // -- known_worktree_paths / clear_worktree_path --------------------------
+
+    #[test]
+    fn known_worktree_paths_returns_every_non_null_row() {
+        let db = test_db();
+        let repo = RepoId::new("owner", "repo");
+
+        // Queued job with a worktree_path (simulating an in-flight row).
+        let queued = db
+            .enqueue(NewJob {
+                repo: repo.clone(),
+                pr_number: 1,
+                head_sha: "sha_q".into(),
+                agent_kind: AgentKind::Claude,
+                command: None,
+                prompt_template: None,
+                max_retries: 3,
+            })
+            .expect("enqueue queued");
+        db.store_worktree_path(queued.id, Path::new("/tmp/wt-q"))
+            .expect("store worktree_path");
+
+        // Terminal job with a worktree_path.
+        seed_terminal_job(&db, &repo, "sha_t", "/tmp/wt-t", JobStatus::Succeeded);
+
+        // Terminal job WITHOUT a worktree_path — must be excluded.
+        let bare = db
+            .enqueue(NewJob {
+                repo: repo.clone(),
+                pr_number: 99,
+                head_sha: "sha_bare".into(),
+                agent_kind: AgentKind::Claude,
+                command: None,
+                prompt_template: None,
+                max_retries: 3,
+            })
+            .expect("enqueue bare");
+        let leased = db.lease_next().expect("lease").expect("has job");
+        db.mark_running(leased.id, 1).expect("mark");
+        // Leave the head job still queued so we don't accidentally lease
+        // the queued row below; just complete the bare one.
+        db.complete(bare.id, JobStatus::Failed, Some(1))
+            .expect("complete");
+
+        let mut paths = db.known_worktree_paths().expect("query");
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![PathBuf::from("/tmp/wt-q"), PathBuf::from("/tmp/wt-t")]
+        );
+    }
+
+    #[test]
+    fn clear_worktree_path_nulls_matching_row() {
+        let db = test_db();
+        let repo = RepoId::new("owner", "repo");
+        let id = seed_terminal_job(&db, &repo, "sha1", "/tmp/wt-1", JobStatus::Succeeded);
+
+        // Sanity: row has the path we expect.
+        let before = db.known_worktree_paths().expect("query");
+        assert_eq!(before, vec![PathBuf::from("/tmp/wt-1")]);
+
+        db.clear_worktree_path(Path::new("/tmp/wt-1"))
+            .expect("clear");
+
+        // The row still exists, but its worktree_path is now NULL.
+        let after = db.known_worktree_paths().expect("query");
+        assert!(after.is_empty(), "worktree_path should be NULL: {after:?}");
+
+        // Ensure the row itself wasn't deleted.
+        let jobs = db
+            .list_jobs(&JobFilter {
+                status: Some(JobStatus::Succeeded),
+                ..Default::default()
+            })
+            .expect("list");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, id);
+        assert!(jobs[0].worktree_path.is_none());
+    }
+
+    #[test]
+    fn clear_worktree_path_noop_on_missing_path() {
+        let db = test_db();
+        let repo = RepoId::new("owner", "repo");
+        seed_terminal_job(&db, &repo, "sha1", "/tmp/wt-exists", JobStatus::Succeeded);
+
+        // Clearing a path that no row owns must succeed quietly and
+        // leave the existing row untouched.
+        db.clear_worktree_path(Path::new("/tmp/wt-does-not-exist"))
+            .expect("clear noop");
+
+        let paths = db.known_worktree_paths().expect("query");
+        assert_eq!(paths, vec![PathBuf::from("/tmp/wt-exists")]);
     }
 }
