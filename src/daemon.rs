@@ -97,11 +97,81 @@ impl Drop for PidFile {
 }
 
 /// Check whether a process with the given PID is alive using `kill(pid, 0)`.
-fn is_process_alive(pid: u32) -> bool {
+///
+/// Returns true for `Ok` (signal delivered but not actually sent because
+/// `sig == 0`) and for `EPERM` (process exists but we lack permission to
+/// signal it). Any other error (most commonly `ESRCH`) means the process
+/// is not alive.
+pub(crate) fn is_process_alive(pid: u32) -> bool {
+    use nix::errno::Errno;
     use nix::sys::signal;
     use nix::unistd::Pid;
 
-    signal::kill(Pid::from_raw(pid as i32), None).is_ok()
+    match signal::kill(Pid::from_raw(pid as i32), None) {
+        Ok(()) => true,
+        // EPERM: the process exists but we cannot signal it. From a
+        // liveness perspective the daemon is still running, so return
+        // true — the caller's own permission errors will surface
+        // separately when they try to actually signal the process.
+        Err(Errno::EPERM) => true,
+        Err(_) => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Daemon health check
+// ---------------------------------------------------------------------------
+
+/// Observed daemon liveness, derived from the pidfile at
+/// `<logging_dir>/reviewq.pid`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonHealth {
+    /// The pidfile exists, its contents parse as a valid PID, and
+    /// `kill(pid, 0)` reports the process as reachable (including the
+    /// `EPERM` case — the daemon is running, we just lack permission
+    /// to signal it, which `nudge_daemon` will surface separately).
+    Alive(u32),
+    /// The pidfile is missing, its contents cannot be parsed, or the
+    /// referenced PID is not alive. From the caller's perspective the
+    /// daemon is not running.
+    Dead,
+}
+
+/// Read the pidfile under `logging_dir` and return the observed daemon
+/// liveness. This is a cheap call (one stat + one `kill(pid, 0)`,
+/// μs-range total) and is safe to invoke on every TUI frame.
+///
+/// PID validation is deliberately strict:
+/// - The pidfile is parsed as an `i32`, not a `u32`, so values that
+///   overflow `i32::MAX` fail the parse and map to `Dead` instead of
+///   wrapping into a negative PID.
+/// - `pid <= 0` is rejected as `Dead`. POSIX `kill(0, 0)` targets the
+///   caller's process group and `kill(-N, 0)` targets the group with
+///   ID `N`, so a naive `u32 -> i32` cast of a zero or over-large
+///   pidfile value could make `is_process_alive` report a bogus
+///   `Alive` for a pid the daemon cannot possibly own. Explicitly
+///   rejecting `pid <= 0` here keeps `daemon_health` and
+///   `nudge_daemon` in lock-step — both refuse the same invalid
+///   pidfile states — so the TUI guard layers cannot leak a
+///   fail-open path.
+pub fn daemon_health(logging_dir: &Path) -> DaemonHealth {
+    let path = logging_dir.join("reviewq.pid");
+    let Ok(contents) = fs::read_to_string(&path) else {
+        return DaemonHealth::Dead;
+    };
+    let Ok(pid_i32) = contents.trim().parse::<i32>() else {
+        return DaemonHealth::Dead;
+    };
+    if pid_i32 <= 0 {
+        return DaemonHealth::Dead;
+    }
+    // Safe cast: pid_i32 is strictly positive here, so it fits u32.
+    let pid = pid_i32 as u32;
+    if is_process_alive(pid) {
+        DaemonHealth::Alive(pid)
+    } else {
+        DaemonHealth::Dead
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -243,5 +313,82 @@ mod tests {
     fn is_process_alive_nonexistent() {
         // PID well above typical range
         assert!(!is_process_alive(4_000_000));
+    }
+
+    // ---------------------------------------------------------------
+    // daemon_health / DaemonHealth
+    //
+    // Regression tests for the "TUI fires cancel/retry into the void"
+    // bug where queued mutations got applied to the DB even though the
+    // daemon had been stopped. The health check below is the first
+    // layer of defense the TUI uses to gate write actions.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn daemon_health_returns_alive_for_live_pid() {
+        let dir = TempDir::new().expect("temp dir");
+        // PidFile::acquire writes the current process's PID, which is
+        // alive by construction.
+        let _pid_file = PidFile::acquire(dir.path()).expect("acquire");
+        let health = daemon_health(dir.path());
+        match health {
+            DaemonHealth::Alive(pid) => assert_eq!(pid, std::process::id()),
+            DaemonHealth::Dead => panic!("expected Alive, got Dead"),
+        }
+    }
+
+    #[test]
+    fn daemon_health_returns_dead_when_pidfile_missing() {
+        let dir = TempDir::new().expect("temp dir");
+        assert!(matches!(daemon_health(dir.path()), DaemonHealth::Dead));
+    }
+
+    #[test]
+    fn daemon_health_returns_dead_when_pidfile_unparsable() {
+        let dir = TempDir::new().expect("temp dir");
+        fs::write(dir.path().join("reviewq.pid"), "not-a-pid").expect("write bogus pidfile");
+        assert!(matches!(daemon_health(dir.path()), DaemonHealth::Dead));
+    }
+
+    #[test]
+    fn daemon_health_returns_dead_when_pidfile_points_at_stale_pid() {
+        let dir = TempDir::new().expect("temp dir");
+        // Same well-above-typical PID used by is_process_alive_nonexistent.
+        fs::write(dir.path().join("reviewq.pid"), "4000000").expect("write stale pidfile");
+        assert!(matches!(daemon_health(dir.path()), DaemonHealth::Dead));
+    }
+
+    #[test]
+    fn daemon_health_returns_dead_when_pidfile_contains_zero() {
+        // Regression: a naive `u32 -> i32` cast of "0" would call
+        // `kill(0, 0)`, which POSIX interprets as targeting the
+        // caller's process group and reports success. Without the
+        // explicit `pid <= 0` reject in daemon_health, that would
+        // flip the TUI guard into fail-open and re-open the silent
+        // corruption window this feature is supposed to close.
+        let dir = TempDir::new().expect("temp dir");
+        fs::write(dir.path().join("reviewq.pid"), "0").expect("write zero pidfile");
+        assert!(matches!(daemon_health(dir.path()), DaemonHealth::Dead));
+    }
+
+    #[test]
+    fn daemon_health_returns_dead_when_pidfile_contains_negative_pid() {
+        // `-1` parses as i32, but `pid <= 0` must reject it before it
+        // reaches `is_process_alive`. A raw `kill(-1, 0)` would target
+        // every process the caller owns, which must never count as
+        // "daemon alive".
+        let dir = TempDir::new().expect("temp dir");
+        fs::write(dir.path().join("reviewq.pid"), "-1").expect("write negative pidfile");
+        assert!(matches!(daemon_health(dir.path()), DaemonHealth::Dead));
+    }
+
+    #[test]
+    fn daemon_health_returns_dead_when_pidfile_overflows_i32() {
+        // u32::MAX is outside i32 range, so the parse must fail and
+        // the result must be `Dead` rather than wrapping into a
+        // negative PID.
+        let dir = TempDir::new().expect("temp dir");
+        fs::write(dir.path().join("reviewq.pid"), "9999999999").expect("write overflow pidfile");
+        assert!(matches!(daemon_health(dir.path()), DaemonHealth::Dead));
     }
 }
