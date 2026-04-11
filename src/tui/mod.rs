@@ -562,6 +562,7 @@ mod tests {
                 cancel_requested_at: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
+                completed_at: None,
             })
             .collect();
         app.update_jobs(jobs);

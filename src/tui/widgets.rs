@@ -85,6 +85,16 @@ pub fn format_timestamp(dt: &DateTime<Utc>) -> String {
     dt.format("%Y-%m-%d %H:%M").to_string()
 }
 
+/// Format an optional timestamp. `None` renders as an em dash so the
+/// queue view's Completed column has a visible placeholder for jobs
+/// that have not yet reached a terminal state.
+pub fn format_timestamp_opt(dt: Option<&DateTime<Utc>>) -> String {
+    match dt {
+        Some(d) => format_timestamp(d),
+        None => "—".to_owned(),
+    }
+}
+
 /// Truncate a SHA to 7 characters for display.
 pub fn short_sha(sha: &str) -> &str {
     if sha.len() > 7 { &sha[..7] } else { sha }

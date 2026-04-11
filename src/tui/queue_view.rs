@@ -10,6 +10,11 @@ use super::app::App;
 use super::widgets::{self, SELECTED_STYLE, STATUS_STYLE, TITLE_STYLE};
 use crate::daemon::DaemonHealth;
 
+// Total width of the non-Repo columns, including single-space padding.
+// Repo takes whatever is left over. Sum: ID(6) + PR#(7) + SHA(9) + Agent(8)
+// + Status(9) + Created(18) + Completed(16).
+const FIXED_COL_BUDGET: u16 = 6 + 7 + 9 + 8 + 9 + 18 + 16;
+
 /// Render the queue view.
 pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     // Count jobs by status for the status line.
@@ -67,15 +72,14 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     );
     f.render_widget(Line::styled(status_line, STATUS_STYLE), chunks[1]);
 
-    // 3. Table header (repo width computed after table area is known)
+    // 3. Table header (repo width computed after table area is known).
     // We use chunks[4] width here too; it's available after the layout split.
-    let fixed_cols = 6 + 7 + 9 + 8 + 9 + 18;
     let header_repo_w = (chunks[4].width as usize)
-        .saturating_sub(fixed_cols as usize)
+        .saturating_sub(FIXED_COL_BUDGET as usize)
         .clamp(12, 40);
     let header_spans = vec![Span::styled(
         format!(
-            "  {:<6} {:<rw$} {:<7} {:<9} {:<8} {:<9} {:<18}",
+            "  {:<6} {:<rw$} {:<7} {:<9} {:<8} {:<9} {:<18} {:<16}",
             "ID",
             "Repo",
             "PR#",
@@ -83,6 +87,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
             "Agent",
             "Status",
             "Created",
+            "Completed",
             rw = header_repo_w
         ),
         Style::default()
@@ -110,16 +115,15 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
                 Cell::from(job.agent_kind.to_string()),
                 Cell::from(badge_text).style(badge_style),
                 Cell::from(widgets::format_timestamp(&job.created_at)),
+                Cell::from(widgets::format_timestamp_opt(job.completed_at.as_ref())),
             ])
         })
         .collect();
 
     // Dynamic column widths: fixed columns use Length, Repo gets the remainder.
-    // Fixed total: ID(6) + PR#(7) + SHA(9) + Agent(8) + Status(9) + Created(18) + gaps ≈ 57
-    // Repo gets whatever is left, clamped to a reasonable max.
-    let fixed = 6 + 7 + 9 + 8 + 9 + 18;
+    // Repo gets whatever is left after FIXED_COL_BUDGET, clamped to a reasonable max.
     let table_width = chunks[4].width;
-    let repo_width = table_width.saturating_sub(fixed).clamp(12, 40);
+    let repo_width = table_width.saturating_sub(FIXED_COL_BUDGET).clamp(12, 40);
 
     let widths = [
         Constraint::Length(6),
@@ -129,6 +133,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
         Constraint::Length(8),
         Constraint::Length(9),
         Constraint::Length(18),
+        Constraint::Length(16),
     ];
 
     let table = Table::new(rows, widths)

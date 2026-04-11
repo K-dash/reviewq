@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     cancel_requested_at TEXT,
     created_at    TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    completed_at  TEXT,
     UNIQUE(repo_owner, repo_name, pr_number, head_sha, agent_kind)
 );
 "#;
@@ -139,6 +140,36 @@ impl Database {
         if !has_cancel_requested_at {
             conn.execute_batch("ALTER TABLE jobs ADD COLUMN cancel_requested_at TEXT;")?;
         }
+
+        // Add completed_at column if it doesn't exist. Rows that are already
+        // in a terminal state when the migration runs get backfilled from
+        // updated_at, which is the closest proxy we have for the original
+        // completion moment — the row has not been written since it reached
+        // its terminal state in practice.
+        //
+        // The backfill UPDATE is deliberately run *outside* the `if !has`
+        // block. SQLite auto-commits each DDL statement, so if the process
+        // crashes between the ALTER and a once-only UPDATE, the column
+        // would exist on next open and the backfill would never run again,
+        // leaving historical terminal rows stuck at NULL forever. Running
+        // the UPDATE on every open fixes that recovery window — the WHERE
+        // clause restricts it to rows that are both terminal and still
+        // NULL, so on a healthy database it matches zero rows and is a
+        // cheap no-op.
+        let has_completed_at: bool = conn
+            .prepare("PRAGMA table_info(jobs)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .any(|name| name.as_deref() == Ok("completed_at"));
+
+        if !has_completed_at {
+            conn.execute_batch("ALTER TABLE jobs ADD COLUMN completed_at TEXT;")?;
+        }
+        conn.execute(
+            "UPDATE jobs SET completed_at = updated_at
+             WHERE status IN ('succeeded', 'failed', 'canceled')
+               AND completed_at IS NULL",
+            [],
+        )?;
         Ok(())
     }
 
@@ -168,6 +199,7 @@ fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
     let stderr_path: Option<String> = row.get("stderr_path")?;
     let worktree_path: Option<String> = row.get("worktree_path")?;
     let cancel_requested_at: Option<String> = row.get("cancel_requested_at")?;
+    let completed_at: Option<String> = row.get("completed_at")?;
 
     Ok(Job {
         id: row.get("id")?,
@@ -195,6 +227,7 @@ fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
         cancel_requested_at: cancel_requested_at.map(|s| parse_datetime(&s)),
         created_at: parse_datetime(&created_at),
         updated_at: parse_datetime(&updated_at),
+        completed_at: completed_at.map(|s| parse_datetime(&s)),
     })
 }
 
@@ -256,7 +289,9 @@ impl JobStore for Database {
     fn complete(&self, id: i64, status: JobStatus, exit_code: Option<i32>) -> Result<()> {
         let conn = self.lock_conn();
         let rows = conn.execute(
-            "UPDATE jobs SET status = ?1, exit_code = ?2, updated_at = datetime('now')
+            "UPDATE jobs SET status = ?1, exit_code = ?2,
+                    updated_at = datetime('now'),
+                    completed_at = datetime('now')
              WHERE id = ?3 AND status NOT IN ('succeeded', 'failed', 'canceled')",
             params![status.as_db_str(), exit_code, id],
         )?;
@@ -297,6 +332,7 @@ impl JobStore for Database {
                     stderr_path = NULL,
                     worktree_path = NULL,
                     cancel_requested_at = NULL,
+                    completed_at = NULL,
                     updated_at = datetime('now')
              WHERE id = ?1 AND (
                     status IN ('failed', 'canceled')
@@ -326,7 +362,9 @@ impl JobStore for Database {
     fn cancel_queued_requested(&self) -> Result<Vec<i64>> {
         let conn = self.lock_conn();
         let mut stmt = conn.prepare(
-            "UPDATE jobs SET status = 'canceled', updated_at = datetime('now')
+            "UPDATE jobs SET status = 'canceled',
+                    updated_at = datetime('now'),
+                    completed_at = datetime('now')
              WHERE status = 'queued' AND cancel_requested_at IS NOT NULL
              RETURNING id",
         )?;
@@ -657,6 +695,36 @@ mod tests {
             .expect("list");
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].exit_code, Some(0));
+        assert!(
+            jobs[0].completed_at.is_some(),
+            "complete() must stamp completed_at on terminal transition"
+        );
+    }
+
+    #[test]
+    fn enqueue_leaves_completed_at_none() {
+        // A fresh queued job has not reached a terminal state, so the
+        // completion timestamp must stay NULL until complete() or the
+        // cancel sweep sets it.
+        let db = test_db();
+        let job = db.enqueue(sample_job()).expect("enqueue");
+        assert!(job.completed_at.is_none());
+    }
+
+    #[test]
+    fn cancel_sweep_stamps_completed_at() {
+        let db = test_db();
+        let job = db.enqueue(sample_job()).expect("enqueue");
+        db.request_cancel(job.id).expect("request_cancel");
+        let canceled_ids = db.cancel_queued_requested().expect("sweep");
+        assert_eq!(canceled_ids, vec![job.id]);
+
+        let jobs = db.list_jobs(&JobFilter::default()).expect("list");
+        assert_eq!(jobs[0].status, JobStatus::Canceled);
+        assert!(
+            jobs[0].completed_at.is_some(),
+            "cancel_queued_requested() must stamp completed_at"
+        );
     }
 
     #[test]
@@ -809,6 +877,57 @@ mod tests {
     }
 
     #[test]
+    fn migration_backfills_completed_at_on_reopen() {
+        // Regression test for the partial-failure recovery window. SQLite
+        // auto-commits DDL, so a crash between `ALTER TABLE` and the
+        // backfill `UPDATE` would otherwise leave terminal rows stuck at
+        // NULL forever. The fix is to run the backfill unconditionally on
+        // every open, which this test exercises by creating a terminal
+        // row, wiping its completed_at via a raw connection (simulating
+        // the partial-migration state), then reopening the Database and
+        // asserting the row comes back with a stamped value.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("test.db");
+        let db = Database::open(&db_path).expect("first open");
+        let job = db.enqueue(sample_job()).expect("enqueue");
+        db.complete(job.id, JobStatus::Succeeded, Some(0))
+            .expect("complete");
+
+        // Snapshot the stamped value before dropping it so the backfill
+        // assertion is meaningful.
+        let before = db
+            .list_jobs(&JobFilter::default())
+            .expect("list")
+            .into_iter()
+            .next()
+            .expect("job exists");
+        assert!(before.completed_at.is_some());
+        let updated_at_raw = before.updated_at;
+        drop(db);
+
+        // Simulate the partial-failure state: column exists, row is
+        // terminal, completed_at is NULL.
+        let raw = Connection::open(&db_path).expect("raw open");
+        raw.execute("UPDATE jobs SET completed_at = NULL", [])
+            .expect("wipe completed_at");
+        drop(raw);
+
+        // Reopen → migrate() must backfill from updated_at.
+        let db2 = Database::open(&db_path).expect("reopen");
+        let jobs = db2.list_jobs(&JobFilter::default()).expect("list");
+        assert_eq!(jobs.len(), 1);
+        let after = &jobs[0];
+        assert!(
+            after.completed_at.is_some(),
+            "migrate() must refill completed_at on reopen"
+        );
+        // Backfill source is updated_at, so the two should match to the
+        // second. parse_datetime drops sub-second precision, which is the
+        // same fidelity updated_at is stored at.
+        assert_eq!(after.completed_at.unwrap(), updated_at_raw);
+    }
+
+    #[test]
     fn duplicate_enqueue_rejected() {
         let db = test_db();
         db.enqueue(sample_job()).expect("first enqueue");
@@ -934,6 +1053,10 @@ mod tests {
         assert_eq!(jobs[0].status, JobStatus::Queued);
         assert_eq!(jobs[0].retry_count, 0);
         assert!(jobs[0].cancel_requested_at.is_none());
+        // A retried job is no longer completed — the column must reset
+        // so the TUI renders the em dash placeholder instead of a stale
+        // completion timestamp from the previous run.
+        assert!(jobs[0].completed_at.is_none());
     }
 
     #[test]
