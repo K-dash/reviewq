@@ -106,7 +106,7 @@ This project ships 127+ skills from [Everything Claude Code](https://github.com/
 
 ## Explicitly Out of Scope for reviewq
 
-Do **not** auto-invoke these (wrong stack or off-topic): `django-*`, `laravel-*`, `springboot-*`, `nextjs-turbopack`, `bun-runtime`, `flutter-*`, `kotlin-*`, `swift-*`, `pytorch-*`, `clickhouse-io`, `frontend-*`, `design-system`, `liquid-glass-design`, `energy-procurement`, `customs-trade-compliance`, `carrier-relationship-management`, `investor-*`, `market-research`, `crosspost`, `content-engine`, `article-writing`. They remain installed for ad-hoc use, but must not be part of the default loop.
+Skills for other language stacks (Python/Go/Java/Spring/Kotlin/Swift/PHP/Laravel/Django/Perl/C++/Flutter/JS frontend), unrelated business domains (logistics/fintech/energy/investor/market), and content/marketing workflows have been **removed** from `.claude/skills/` to keep the catalog Rust-focused. If a task genuinely needs one of those stacks, pull it from the global ECC catalog rather than re-adding it here.
 
 ## Escalation
 
