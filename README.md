@@ -94,109 +94,100 @@ reviewq tui
 
 Config file location: `--config` flag > `~/.reviewq/config.yml` (default).
 
+The config is split into two top-level sections:
+
+- `daemon:` — resources that exist once per reviewq installation
+  (state DB, poll loop, auth credential, worktree root, global semaphore,
+  log / output directories). There is no per-repo equivalent.
+- `repos:` — repository-level policy. `repos.defaults` acts as a template
+  for every entry in `repos.allowlist`; individual entries can override
+  any field. Fields that neither `defaults` nor the entry sets fall back
+  to a built-in constant.
+
 Below is a complete reference with all options and their defaults.
 
 ```yaml
 # ──────────────────────────────────────────────
-# repos — Repository allowlist (REQUIRED)
+# daemon — One-per-install resources & daemon behavior
+# ──────────────────────────────────────────────
+daemon:
+  polling:
+    interval_seconds: 300                  # Seconds between detection cycles (default: 300)
+
+  auth:
+    method: gh                             # "gh" uses `gh auth token` (default: "gh")
+    fallback_env: GITHUB_TOKEN             # Env var fallback if gh CLI fails (default: "GITHUB_TOKEN")
+
+  execution:
+    worktree_root: ~/.reviewq/worktrees    # Directory for git worktrees (default: ~/.reviewq/worktrees)
+    max_concurrency: 10                    # Global semaphore: max concurrent review jobs (default: 10)
+    lease_minutes: 5                       # Job lease timeout in minutes (default: 5)
+
+  cancel:
+    sigint_timeout_seconds: 5              # SIGINT grace period (default: 5)
+    sigterm_timeout_seconds: 15            # SIGTERM grace period (default: 15)
+    sigkill_timeout_seconds: 5             # SIGKILL wait after SIGTERM (default: 5)
+
+  cleanup:
+    ttl_minutes: 1440                      # Worktree retention period in minutes (default: 1440 = 24h)
+    interval_minutes: 30                   # Cleanup check interval in minutes (default: 30)
+
+  logging:
+    dir: ~/.reviewq/logs                   # Log directory (default: ~/.reviewq/logs)
+
+  state:
+    sqlite_path: ~/.reviewq/state.db       # SQLite database path (default: ~/.reviewq/state.db)
+
+  output:
+    dir: ~/.reviewq/output                 # Review output directory (default: ~/.reviewq/output)
+
+# ──────────────────────────────────────────────
+# repos — Repository allowlist and policy (REQUIRED)
 # ──────────────────────────────────────────────
 repos:
+  # Optional: defaults for every entry in `allowlist`. Each field here
+  # inherits into allowlist entries that don't set the same field. Anything
+  # neither `defaults` nor the entry sets falls back to the built-in value.
+  defaults:
+    skip_self_authored: true               # Skip PRs you authored (built-in: true)
+    skip_reviewer_check: false             # Process all open PRs regardless of reviewer (built-in: false)
+    review_on_push: true                   # Re-review on every push/force-push (built-in: true)
+    agent: claude                          # Agent: claude | codex (built-in: claude)
+    prompt_template: "Review {pr_url}"     # Prompt template (built-in: structured default)
+    model: claude-sonnet-4-5-20250514      # Model passed via --model (built-in: none)
+    base_repo_path: ~/src                  # Base path for local clones (built-in: none)
+    ignore_prs: []                         # PR numbers to exclude (built-in: [])
+
   allowlist:
-    - repo: owner/repo-name               # "owner/name" format (REQUIRED)
-      skip_self_authored: true             # Skip PRs you authored (default: true)
-      skip_reviewer_check: false           # Process all open PRs regardless of reviewer assignment (default: false)
-      review_on_push: true                 # Re-review on every push/force-push (default: true)
-      agent: claude                        # Per-repo agent override: claude | codex (optional)
-      prompt_template: "Review this PR"    # Per-repo prompt template override (optional)
-      model: claude-sonnet-4-5-20250514    # Per-repo model override (optional)
-      max_concurrency: 3                   # Per-repo concurrency limit (optional, reserved for future use)
-      base_repo_path: /path/to/local/clone # Per-repo local clone path (optional)
-      ignore_prs: [100, 200]               # PR numbers to exclude from review (default: [])
-
-# ──────────────────────────────────────────────
-# polling — GitHub API polling interval
-# ──────────────────────────────────────────────
-polling:
-  interval_seconds: 300                    # Seconds between detection cycles (default: 300)
-
-# ──────────────────────────────────────────────
-# auth — GitHub authentication
-# ──────────────────────────────────────────────
-auth:
-  method: gh                               # "gh" uses `gh auth token` (default: "gh")
-  fallback_env: GITHUB_TOKEN               # Env var fallback if gh CLI fails (default: "GITHUB_TOKEN")
-
-# ──────────────────────────────────────────────
-# execution — Job execution settings
-# ──────────────────────────────────────────────
-execution:
-  base_repo_path: /path/to/repos           # Global base path for local clones (optional)
-  worktree_root: /path/to/worktrees        # Directory for git worktrees (optional, default: ~/.reviewq/worktrees)
-  max_concurrency: 10                      # Max concurrent review jobs (default: 10)
-  lease_minutes: 5                         # Job lease timeout in minutes (default: 5)
-
-# ──────────────────────────────────────────────
-# runner — AI review agent settings
-# ──────────────────────────────────────────────
-runner:
-  agent: claude                            # Default agent: claude | codex (default: claude)
-  prompt_template: "Review {pr_url}"       # Global prompt template (optional)
-  model: claude-sonnet-4-5-20250514        # Model passed via --model flag (optional)
-
-# ──────────────────────────────────────────────
-# cancel — Process cancellation timeouts
-# ──────────────────────────────────────────────
-cancel:
-  sigint_timeout_seconds: 5                # SIGINT grace period (default: 5)
-  sigterm_timeout_seconds: 15              # SIGTERM grace period (default: 15)
-  sigkill_timeout_seconds: 5              # SIGKILL wait after SIGTERM (default: 5)
-
-# ──────────────────────────────────────────────
-# cleanup — Worktree cleanup settings
-# ──────────────────────────────────────────────
-cleanup:
-  ttl_minutes: 1440                        # Worktree retention period in minutes (default: 1440 = 24h)
-  interval_minutes: 30                     # Cleanup check interval in minutes (default: 30)
-
-# ──────────────────────────────────────────────
-# logging — Log file settings
-# ──────────────────────────────────────────────
-logging:
-  dir: ~/.reviewq/logs                     # Log directory (default: ~/.reviewq/logs)
-
-# ──────────────────────────────────────────────
-# state — Persistent state database
-# ──────────────────────────────────────────────
-state:
-  sqlite_path: ~/.reviewq/state.db         # SQLite database path (default: ~/.reviewq/state.db)
-
-# ──────────────────────────────────────────────
-# output — Review output files
-# ──────────────────────────────────────────────
-output:
-  dir: ~/.reviewq/output                   # Review output directory (default: ~/.reviewq/output)
+    - repo: owner/repo-name                # "owner/name" format (REQUIRED)
+      # Any of the fields from `defaults` can be overridden here.
+      agent: codex
+      model: gpt-5.3-codex
+      base_repo_path: /custom/path
+      ignore_prs: [100, 200]
 ```
 
 ### Config sections in detail
 
 #### `repos.allowlist` (required)
 
-At least one repository must be listed. Each entry supports these per-repo overrides:
+At least one repository must be listed. Each entry supports the same
+fields as `repos.defaults`; anything not set here inherits from
+`defaults`, and anything neither sets falls back to the built-in value.
 
-| Field                | Type       | Default | Description |
-|----------------------|------------|---------|-------------|
-| `repo`               | `string`   | &mdash; | Repository in `"owner/name"` format (**required**) |
-| `skip_self_authored`  | `bool`     | `true`  | Skip PRs authored by the authenticated user |
-| `skip_reviewer_check` | `bool`    | `false` | Process all open PRs, not just those with review requested |
-| `review_on_push`      | `bool`    | `true`  | Re-review when a new commit is pushed to the PR |
-| `agent`              | `string`   | &mdash; | Override agent: `claude` or `codex` |
-| `prompt_template`    | `string`   | &mdash; | Override prompt template |
-| `model`              | `string`   | &mdash; | Override model name |
-| `max_concurrency`    | `integer`  | &mdash; | Per-repo concurrency limit (reserved for future use) |
-| `base_repo_path`     | `path`     | &mdash; | Path to local clone of this repo |
-| `ignore_prs`         | `[integer]`| `[]`    | PR numbers to exclude from review |
+| Field                 | Type        | Built-in | Description |
+|-----------------------|-------------|----------|-------------|
+| `repo`                | `string`    | &mdash;  | Repository in `"owner/name"` format (**required**) |
+| `skip_self_authored`  | `bool`      | `true`   | Skip PRs authored by the authenticated user |
+| `skip_reviewer_check` | `bool`      | `false`  | Process all open PRs, not just those with review requested |
+| `review_on_push`      | `bool`      | `true`   | Re-review when a new commit is pushed to the PR |
+| `agent`               | `string`    | `claude` | Agent: `claude` or `codex` |
+| `prompt_template`     | `string`    | built-in | Prompt template (see below) |
+| `model`               | `string`    | none     | Model name for the `--model` flag |
+| `base_repo_path`      | `path`      | none     | Path to local clone of this repo |
+| `ignore_prs`          | `[integer]` | `[]`     | PR numbers to exclude from review |
 
-#### `runner.agent`
+#### `repos.defaults.agent`
 
 Selects the AI review agent. Each agent has a built-in default command:
 
@@ -205,30 +196,30 @@ Selects the AI review agent. Each agent has a built-in default command:
 | `claude` | `claude -p "$(cat "{prompt_file}")" --output-format json --allowedTools Read Grep Glob Bash WebFetch WebSearch Agent Skill` |
 | `codex`  | `codex exec --json --sandbox danger-full-access - < "{prompt_file}"` |
 
-**Priority chain**: per-repo `agent` > global `runner.agent` > `claude` (default).
+**Resolution chain**: `RepoEntry.agent` > `repos.defaults.agent` > built-in `claude`.
 
-#### `runner.model`
+#### `repos.defaults.model`
 
 Specifies the model to pass via the `--model` CLI flag.
 
-**Priority chain**: per-repo `model` > global `runner.model` > omitted (no `--model` flag).
+**Resolution chain**: `RepoEntry.model` > `repos.defaults.model` > omitted (no `--model` flag).
 
 Model names must match `[A-Za-z0-9._:-]+`.
 
 ```yaml
-runner:
-  agent: claude
-  model: claude-sonnet-4-5-20250514    # Default model for all repos
-
 repos:
+  defaults:
+    agent: claude
+    model: claude-sonnet-4-5-20250514    # Inherited by every entry below
+
   allowlist:
-    - repo: org/repo-a                 # Uses claude-sonnet-4-5-20250514
-    - repo: org/repo-b
+    - repo: org/repo-a                   # Uses claude-sonnet-4-5-20250514
+    - repo: org/repo-b                   # Overrides both
       agent: codex
-      model: gpt-5.3-codex             # Override: uses gpt-5.3-codex with codex
+      model: gpt-5.3-codex
 ```
 
-#### `runner.prompt_template`
+#### `repos.defaults.prompt_template`
 
 Custom prompt body appended after the built-in PR info header. Supports template variables:
 
@@ -244,7 +235,7 @@ Custom prompt body appended after the built-in PR info header. Supports template
 
 When no `prompt_template` is set, a built-in default prompt is used that produces structured review output with severity levels.
 
-**Priority chain**: per-repo `prompt_template` > global `runner.prompt_template` > built-in default.
+**Resolution chain**: `RepoEntry.prompt_template` > `repos.defaults.prompt_template` > built-in default.
 
 #### `review_on_push`
 
@@ -309,18 +300,18 @@ kill -HUP $(cat ~/.reviewq/logs/reviewq.pid)
 
 Changes to the following fields take effect immediately:
 - `repos.allowlist` (repos, per-repo settings)
-- `polling.interval_seconds`
-- `runner.prompt_template`, `runner.model`
-- `cleanup` settings
-- `output.dir`
+- `repos.defaults` (prompt_template, model, base_repo_path, etc.)
+- `daemon.polling.interval_seconds`
+- `daemon.cleanup` settings
+- `daemon.output.dir`
 
 Changes to these fields require a restart:
-- `auth`
-- `execution.max_concurrency`
-- `runner.agent`
-- `cancel`
-- `logging`
-- `state`
+- `daemon.auth`
+- `daemon.execution.max_concurrency`
+- `daemon.execution.lease_minutes`
+- `daemon.cancel`
+- `daemon.logging`
+- `daemon.state`
 
 ## Architecture
 

@@ -83,17 +83,15 @@ where
     // Semaphore is created once from the initial config; changing
     // max_concurrency requires a restart.
     let initial_config = config_rx.borrow().clone();
-    let semaphore = Arc::new(Semaphore::new(initial_config.execution.max_concurrency));
+    let semaphore = Arc::new(Semaphore::new(
+        initial_config.daemon.execution.max_concurrency,
+    ));
     let mut job_tasks: JoinSet<()> = JoinSet::new();
 
     loop {
         // Re-read config at each iteration so hot-reloaded values take effect.
         let config = config_rx.borrow_and_update().clone();
-        let global_base_repo =
-            config.execution.base_repo_path.clone().unwrap_or_else(|| {
-                std::env::current_dir().expect("current directory is accessible")
-            });
-        let worktree_root = config.execution.effective_worktree_root();
+        let worktree_root = config.daemon.execution.effective_worktree_root();
         let policies = config.repo_policies();
 
         // Drain completed tasks so JoinSet doesn't grow unboundedly.
@@ -145,7 +143,7 @@ where
                 // Wait for either shutdown, wake signal, or poll interval.
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(
-                        config.polling.interval_seconds,
+                        config.daemon.polling.interval_seconds,
                     )) => {}
                     _ = shutdown_rx.changed() => {}
                     _ = wake.notified() => {
@@ -175,12 +173,14 @@ where
             "leased job for execution"
         );
 
-        // Resolve per-repo base path, falling back to global.
+        // Resolve base_repo from the (already-merged) policy. If neither the
+        // entry nor `repos.defaults` set one, fall back to the process cwd so
+        // the `git -C` invocation still has a valid working directory.
         let base_repo = policies
             .iter()
             .find(|p| p.id == job.repo)
             .and_then(|p| p.base_repo_path.clone())
-            .unwrap_or_else(|| global_base_repo.clone());
+            .unwrap_or_else(|| std::env::current_dir().expect("current directory is accessible"));
 
         // Clone Arcs and paths for the spawned task.
         let store = Arc::clone(&store);

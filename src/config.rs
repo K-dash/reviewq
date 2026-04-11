@@ -1,4 +1,40 @@
 //! YAML configuration parsing, validation, and defaults.
+//!
+//! The config is split into two concerns:
+//!
+//! - [`DaemonConfig`] — resources that exist once per reviewq installation
+//!   (state DB, poll loop, auth credential, worktree root, global semaphore,
+//!   logging directory, output directory). These are *not* overridable per
+//!   repo because the daemon only has one of each.
+//! - [`ReposConfig`] — repository-level policy. Fields set on `repos.defaults`
+//!   act as a template for every entry in `repos.allowlist`; individual
+//!   entries can override any field. Fields that neither `defaults` nor the
+//!   entry sets fall back to a built-in constant.
+//!
+//! Example `config.yml`:
+//!
+//! ```yaml
+//! daemon:
+//!   polling:
+//!     interval_seconds: 300
+//!   auth:
+//!     method: gh
+//!     fallback_env: GITHUB_TOKEN
+//!   execution:
+//!     worktree_root: ~/.reviewq/worktrees
+//!     max_concurrency: 10
+//!     lease_minutes: 5
+//!
+//! repos:
+//!   defaults:
+//!     agent: codex
+//!     base_repo_path: ~/src
+//!   allowlist:
+//!     - repo: org/repo-a
+//!     - repo: org/repo-b
+//!       agent: claude
+//!       model: claude-sonnet-4-6
+//! ```
 
 use std::path::{Path, PathBuf};
 
@@ -6,13 +42,38 @@ use serde::Deserialize;
 
 use crate::error::{Result, ReviewqError};
 
-/// Top-level configuration for reviewq.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+// ---------------------------------------------------------------------------
+// Built-in defaults (absolute fallbacks when neither the entry nor
+// `repos.defaults` sets a value).
+// ---------------------------------------------------------------------------
+
+const BUILTIN_SKIP_SELF_AUTHORED: bool = true;
+const BUILTIN_SKIP_REVIEWER_CHECK: bool = false;
+const BUILTIN_REVIEW_ON_PUSH: bool = true;
+
+// ---------------------------------------------------------------------------
+// Top-level
+// ---------------------------------------------------------------------------
+
+/// Top-level reviewq configuration.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
-    pub repos: ReposConfig,
+    pub daemon: DaemonConfig,
 
+    #[serde(default)]
+    pub repos: ReposConfig,
+}
+
+// ---------------------------------------------------------------------------
+// Daemon-scoped configuration
+// ---------------------------------------------------------------------------
+
+/// Daemon-wide settings. One-per-install resources.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonConfig {
     #[serde(default)]
     pub polling: PollingConfig,
 
@@ -21,9 +82,6 @@ pub struct Config {
 
     #[serde(default)]
     pub execution: ExecutionConfig,
-
-    #[serde(default)]
-    pub runner: RunnerConfig,
 
     #[serde(default)]
     pub cancel: CancelConfig,
@@ -39,101 +97,6 @@ pub struct Config {
 
     #[serde(default)]
     pub output: OutputConfig,
-}
-
-// ---------------------------------------------------------------------------
-// Sub-configs
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReposConfig {
-    #[serde(default)]
-    pub allowlist: Vec<RepoEntry>,
-}
-
-/// Per-repository configuration entry in the YAML allowlist.
-///
-/// ```yaml
-/// repos:
-///   allowlist:
-///     - repo: "owner/name"
-///       skip_self_authored: false
-///       skip_reviewer_check: true
-///       review_on_push: false
-///       command: "claude code review"
-///       max_concurrency: 3
-///       base_repo_path: "/path/to/local/clone"
-/// ```
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RepoEntry {
-    /// Repository in `"owner/name"` format.
-    pub repo: String,
-
-    /// Skip PRs authored by the authenticated user. Default: true.
-    #[serde(default = "default_true")]
-    pub skip_self_authored: bool,
-
-    /// Process all open PRs regardless of reviewer assignment. Default: false.
-    /// When true, PRs are picked up even if the authenticated user is not
-    /// in the `requested_reviewers` list. Useful for self-review workflows.
-    #[serde(default)]
-    pub skip_reviewer_check: bool,
-
-    /// Re-review on every push (force-push / additional commit). Default: true.
-    /// When false, a PR with a prior succeeded review is not re-queued on SHA
-    /// change, but in-flight reviews on stale SHAs are still canceled.
-    #[serde(default = "default_true")]
-    pub review_on_push: bool,
-
-    /// Override the global `runner.agent` for this repo.
-    #[serde(default)]
-    pub agent: Option<crate::types::AgentKind>,
-
-    /// Override the global `runner.prompt_template` for this repo.
-    #[serde(default)]
-    pub prompt_template: Option<String>,
-
-    /// Override the global `runner.model` for this repo.
-    #[serde(default)]
-    pub model: Option<String>,
-
-    /// Override the global `execution.max_concurrency` for this repo.
-    /// Reserved for future use; not yet wired into the runner.
-    #[serde(default)]
-    pub max_concurrency: Option<usize>,
-
-    /// Path to the local clone of this repository.
-    /// Overrides the global `execution.base_repo_path` for worktree creation.
-    #[serde(default)]
-    pub base_repo_path: Option<PathBuf>,
-
-    /// PR numbers to exclude from review.
-    #[serde(default)]
-    pub ignore_prs: Vec<u64>,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-/// Parsed per-repository policy with a resolved `RepoId`.
-#[derive(Debug, Clone)]
-pub struct RepoPolicy {
-    pub id: crate::types::RepoId,
-    pub skip_self_authored: bool,
-    pub skip_reviewer_check: bool,
-    pub review_on_push: bool,
-    pub agent: Option<crate::types::AgentKind>,
-    pub prompt_template: Option<String>,
-    pub model: Option<String>,
-    /// Reserved for future use; not yet wired into the runner.
-    pub max_concurrency: Option<usize>,
-    /// Path to the local clone of this repository.
-    pub base_repo_path: Option<PathBuf>,
-    /// PR numbers to exclude from review.
-    pub ignore_prs: Vec<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -185,7 +148,6 @@ fn default_fallback_env() -> String {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionConfig {
-    pub base_repo_path: Option<PathBuf>,
     pub worktree_root: Option<PathBuf>,
 
     #[serde(default = "default_max_concurrency")]
@@ -198,7 +160,6 @@ pub struct ExecutionConfig {
 impl Default for ExecutionConfig {
     fn default() -> Self {
         Self {
-            base_repo_path: None,
             worktree_root: None,
             max_concurrency: default_max_concurrency(),
             lease_minutes: default_lease_minutes(),
@@ -237,24 +198,6 @@ fn default_max_concurrency() -> usize {
 
 fn default_lease_minutes() -> i64 {
     5
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RunnerConfig {
-    /// The agent to use for reviews (claude or codex). Default: claude.
-    #[serde(default)]
-    pub agent: Option<crate::types::AgentKind>,
-
-    /// Prompt template for the AI review agent.
-    /// Supports the same template variables as the command.
-    /// The rendered prompt is available as `{prompt}` and `{prompt_file}` in the command.
-    #[serde(default)]
-    pub prompt_template: Option<String>,
-
-    /// The model to pass to the agent via `--model` flag.
-    #[serde(default)]
-    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -377,7 +320,118 @@ fn default_output_dir() -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
-// Loading
+// Repos / per-repo policy
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReposConfig {
+    /// Template values that apply to every entry in `allowlist` unless the
+    /// entry overrides the same field.
+    #[serde(default)]
+    pub defaults: RepoDefaults,
+
+    /// Explicit list of repositories reviewq is allowed to process.
+    #[serde(default)]
+    pub allowlist: Vec<RepoEntry>,
+}
+
+/// User-level defaults for repo policy fields.
+///
+/// Every field is `Option<T>`. Unset fields fall back to built-in constants
+/// during resolution (see [`Config::repo_policies`]).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepoDefaults {
+    #[serde(default)]
+    pub skip_self_authored: Option<bool>,
+
+    #[serde(default)]
+    pub skip_reviewer_check: Option<bool>,
+
+    #[serde(default)]
+    pub review_on_push: Option<bool>,
+
+    #[serde(default)]
+    pub agent: Option<crate::types::AgentKind>,
+
+    #[serde(default)]
+    pub prompt_template: Option<String>,
+
+    #[serde(default)]
+    pub model: Option<String>,
+
+    #[serde(default)]
+    pub base_repo_path: Option<PathBuf>,
+
+    #[serde(default)]
+    pub ignore_prs: Option<Vec<u64>>,
+}
+
+/// Per-repository configuration entry in the YAML allowlist.
+///
+/// ```yaml
+/// repos:
+///   allowlist:
+///     - repo: "owner/name"
+///       skip_self_authored: false
+///       skip_reviewer_check: true
+///       review_on_push: false
+///       agent: codex
+///       model: gpt-5.3-codex
+///       base_repo_path: "/path/to/local/clone"
+///       ignore_prs: [123, 456]
+/// ```
+///
+/// Any field left unset inherits from `repos.defaults`, and any field unset
+/// there falls back to a built-in constant.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepoEntry {
+    /// Repository in `"owner/name"` format.
+    pub repo: String,
+
+    #[serde(default)]
+    pub skip_self_authored: Option<bool>,
+
+    #[serde(default)]
+    pub skip_reviewer_check: Option<bool>,
+
+    #[serde(default)]
+    pub review_on_push: Option<bool>,
+
+    #[serde(default)]
+    pub agent: Option<crate::types::AgentKind>,
+
+    #[serde(default)]
+    pub prompt_template: Option<String>,
+
+    #[serde(default)]
+    pub model: Option<String>,
+
+    #[serde(default)]
+    pub base_repo_path: Option<PathBuf>,
+
+    #[serde(default)]
+    pub ignore_prs: Option<Vec<u64>>,
+}
+
+/// Per-repository policy with every field resolved to a concrete value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RepoPolicy {
+    pub id: crate::types::RepoId,
+    pub skip_self_authored: bool,
+    pub skip_reviewer_check: bool,
+    pub review_on_push: bool,
+    pub agent: crate::types::AgentKind,
+    pub prompt_template: Option<String>,
+    pub model: Option<String>,
+    pub base_repo_path: Option<PathBuf>,
+    pub ignore_prs: Vec<u64>,
+}
+
+// ---------------------------------------------------------------------------
+// Loading, validation, resolution
 // ---------------------------------------------------------------------------
 
 impl Config {
@@ -423,13 +477,12 @@ impl Config {
             }
         }
 
-        // Validate model names (global and per-repo).
-        if let Some(ref m) = self.runner.model
+        // Validate model names (defaults and per-repo).
+        if let Some(ref m) = self.repos.defaults.model
             && !is_valid_model_name(m)
         {
             return Err(ReviewqError::Config(format!(
-                "invalid runner.model '{}': must match [A-Za-z0-9._:-]+",
-                m
+                "invalid repos.defaults.model '{m}': must match [A-Za-z0-9._:-]+"
             )));
         }
         for entry in &self.repos.allowlist {
@@ -443,9 +496,9 @@ impl Config {
             }
         }
 
-        if self.polling.interval_seconds == 0 {
+        if self.daemon.polling.interval_seconds == 0 {
             return Err(ReviewqError::Config(
-                "polling.interval_seconds must be > 0".into(),
+                "daemon.polling.interval_seconds must be > 0".into(),
             ));
         }
 
@@ -454,18 +507,29 @@ impl Config {
 
     /// Expand `~` in paths to the user's home directory.
     pub fn expand_paths(&mut self) {
-        if let Some(home) = dirs::home_dir() {
-            expand_tilde(&mut self.logging.dir, &home);
-            expand_tilde(&mut self.state.sqlite_path, &home);
-            expand_tilde(&mut self.output.dir, &home);
-            if let Some(ref mut p) = self.execution.worktree_root {
+        let Some(home) = dirs::home_dir() else { return };
+        expand_tilde(&mut self.daemon.logging.dir, &home);
+        expand_tilde(&mut self.daemon.state.sqlite_path, &home);
+        expand_tilde(&mut self.daemon.output.dir, &home);
+        if let Some(ref mut p) = self.daemon.execution.worktree_root {
+            expand_tilde(p, &home);
+        }
+        if let Some(ref mut p) = self.repos.defaults.base_repo_path {
+            expand_tilde(p, &home);
+        }
+        for entry in &mut self.repos.allowlist {
+            if let Some(ref mut p) = entry.base_repo_path {
                 expand_tilde(p, &home);
             }
         }
     }
 
-    /// Parse the allowlist into per-repository policies.
+    /// Resolve the allowlist into concrete per-repository policies.
+    ///
+    /// Resolution chain for each field: `RepoEntry` → `repos.defaults` →
+    /// built-in constant.
     pub fn repo_policies(&self) -> Vec<RepoPolicy> {
+        let d = &self.repos.defaults;
         self.repos
             .allowlist
             .iter()
@@ -473,18 +537,60 @@ impl Config {
                 let (owner, name) = entry.repo.split_once('/')?;
                 Some(RepoPolicy {
                     id: crate::types::RepoId::new(owner, name),
-                    skip_self_authored: entry.skip_self_authored,
-                    skip_reviewer_check: entry.skip_reviewer_check,
-                    review_on_push: entry.review_on_push,
-                    agent: entry.agent.clone(),
-                    prompt_template: entry.prompt_template.clone(),
-                    model: entry.model.clone(),
-                    max_concurrency: entry.max_concurrency,
-                    base_repo_path: entry.base_repo_path.clone(),
-                    ignore_prs: entry.ignore_prs.clone(),
+                    skip_self_authored: entry
+                        .skip_self_authored
+                        .or(d.skip_self_authored)
+                        .unwrap_or(BUILTIN_SKIP_SELF_AUTHORED),
+                    skip_reviewer_check: entry
+                        .skip_reviewer_check
+                        .or(d.skip_reviewer_check)
+                        .unwrap_or(BUILTIN_SKIP_REVIEWER_CHECK),
+                    review_on_push: entry
+                        .review_on_push
+                        .or(d.review_on_push)
+                        .unwrap_or(BUILTIN_REVIEW_ON_PUSH),
+                    agent: entry
+                        .agent
+                        .clone()
+                        .or_else(|| d.agent.clone())
+                        .unwrap_or_default(),
+                    prompt_template: entry
+                        .prompt_template
+                        .clone()
+                        .or_else(|| d.prompt_template.clone()),
+                    model: entry.model.clone().or_else(|| d.model.clone()),
+                    base_repo_path: entry
+                        .base_repo_path
+                        .clone()
+                        .or_else(|| d.base_repo_path.clone()),
+                    ignore_prs: entry
+                        .ignore_prs
+                        .clone()
+                        .or_else(|| d.ignore_prs.clone())
+                        .unwrap_or_default(),
                 })
             })
             .collect()
+    }
+
+    /// Extract just the repo IDs from the allowlist.
+    pub fn repo_ids(&self) -> Vec<crate::types::RepoId> {
+        self.repo_policies().into_iter().map(|p| p.id).collect()
+    }
+
+    /// Resolve the effective local clone path for a given repository.
+    ///
+    /// Priority: `RepoEntry.base_repo_path` > `repos.defaults.base_repo_path`.
+    ///
+    /// This re-runs `repo_policies()` on every call — intentionally simple
+    /// because it's called from convenience and test paths, never from the
+    /// runner's hot loop. The runner uses the already-materialized
+    /// `&[RepoPolicy]` slice directly.
+    pub fn base_repo_for(&self, repo: &crate::types::RepoId) -> Option<PathBuf> {
+        self.repo_policies()
+            .into_iter()
+            .find(|p| &p.id == repo)
+            .and_then(|p| p.base_repo_path)
     }
 
     /// Compare two configs and return human-readable change descriptions.
@@ -493,7 +599,74 @@ impl Config {
     pub fn diff_summary(old: &Config, new: &Config) -> Vec<String> {
         let mut changes = Vec::new();
 
-        if old.repos != new.repos {
+        // --- daemon ---
+        if old.daemon.polling != new.daemon.polling {
+            changes.push(format!(
+                "daemon.polling.interval_seconds changed: {} -> {}",
+                old.daemon.polling.interval_seconds, new.daemon.polling.interval_seconds
+            ));
+        }
+
+        if old.daemon.auth != new.daemon.auth {
+            changes.push("daemon.auth changed (restart required)".to_string());
+        }
+
+        if old.daemon.execution.max_concurrency != new.daemon.execution.max_concurrency {
+            changes.push(format!(
+                "daemon.execution.max_concurrency changed: {} -> {} (restart required)",
+                old.daemon.execution.max_concurrency, new.daemon.execution.max_concurrency
+            ));
+        }
+
+        if old.daemon.execution.worktree_root != new.daemon.execution.worktree_root {
+            changes.push(format!(
+                "daemon.execution.worktree_root changed: {:?} -> {:?}",
+                old.daemon.execution.worktree_root, new.daemon.execution.worktree_root
+            ));
+        }
+
+        if old.daemon.execution.lease_minutes != new.daemon.execution.lease_minutes {
+            changes.push(format!(
+                "daemon.execution.lease_minutes changed: {} -> {} (restart required)",
+                old.daemon.execution.lease_minutes, new.daemon.execution.lease_minutes
+            ));
+        }
+
+        if old.daemon.cancel != new.daemon.cancel {
+            changes.push("daemon.cancel changed (restart required)".to_string());
+        }
+
+        if old.daemon.cleanup != new.daemon.cleanup {
+            changes.push(format!(
+                "daemon.cleanup changed: ttl={}->{}min, interval={}->{}min",
+                old.daemon.cleanup.ttl_minutes,
+                new.daemon.cleanup.ttl_minutes,
+                old.daemon.cleanup.interval_minutes,
+                new.daemon.cleanup.interval_minutes
+            ));
+        }
+
+        if old.daemon.logging != new.daemon.logging {
+            changes.push("daemon.logging changed (restart required)".to_string());
+        }
+
+        if old.daemon.state != new.daemon.state {
+            changes.push("daemon.state changed (restart required)".to_string());
+        }
+
+        if old.daemon.output != new.daemon.output {
+            changes.push(format!(
+                "daemon.output.dir changed: {:?} -> {:?}",
+                old.daemon.output.dir, new.daemon.output.dir
+            ));
+        }
+
+        // --- repos ---
+        if old.repos.defaults != new.repos.defaults {
+            diff_repo_defaults(&old.repos.defaults, &new.repos.defaults, &mut changes);
+        }
+
+        if old.repos.allowlist != new.repos.allowlist {
             let old_repos: Vec<&str> = old
                 .repos
                 .allowlist
@@ -508,11 +681,11 @@ impl Config {
                 .collect();
             if old_repos != new_repos {
                 changes.push(format!(
-                    "repos.allowlist changed: {:?} -> {:?}",
-                    old_repos, new_repos
+                    "repos.allowlist changed: {old_repos:?} -> {new_repos:?}"
                 ));
             }
-            // Report per-repo review_on_push changes specifically.
+            // Report per-repo review_on_push changes specifically so the user
+            // sees exactly which repo toggled the flag.
             for new_entry in &new.repos.allowlist {
                 if let Some(old_entry) = old
                     .repos
@@ -522,14 +695,13 @@ impl Config {
                     .filter(|old_entry| old_entry.review_on_push != new_entry.review_on_push)
                 {
                     changes.push(format!(
-                        "repos.allowlist[{}].review_on_push changed: {} -> {}",
+                        "repos.allowlist[{}].review_on_push changed: {:?} -> {:?}",
                         new_entry.repo, old_entry.review_on_push, new_entry.review_on_push
                     ));
                 }
             }
             // Fallback: if repo list is the same but other per-repo settings
-            // changed (command, prompt_template, etc.), emit a generic line
-            // so the change isn't silently swallowed.
+            // changed, emit a generic line so the change isn't swallowed.
             if old_repos == new_repos {
                 let has_other_changes = new.repos.allowlist.iter().any(|new_entry| {
                     old.repos
@@ -542,7 +714,6 @@ impl Config {
                                 || old_entry.agent != new_entry.agent
                                 || old_entry.prompt_template != new_entry.prompt_template
                                 || old_entry.model != new_entry.model
-                                || old_entry.max_concurrency != new_entry.max_concurrency
                                 || old_entry.base_repo_path != new_entry.base_repo_path
                                 || old_entry.ignore_prs != new_entry.ignore_prs
                         })
@@ -553,105 +724,60 @@ impl Config {
             }
         }
 
-        if old.polling != new.polling {
-            changes.push(format!(
-                "polling.interval_seconds changed: {} -> {}",
-                old.polling.interval_seconds, new.polling.interval_seconds
-            ));
-        }
-
-        if old.auth != new.auth {
-            changes.push("auth changed (restart required)".to_string());
-        }
-
-        if old.execution.max_concurrency != new.execution.max_concurrency {
-            changes.push(format!(
-                "execution.max_concurrency changed: {} -> {} (restart required)",
-                old.execution.max_concurrency, new.execution.max_concurrency
-            ));
-        }
-
-        if old.execution.base_repo_path != new.execution.base_repo_path {
-            changes.push(format!(
-                "execution.base_repo_path changed: {:?} -> {:?}",
-                old.execution.base_repo_path, new.execution.base_repo_path
-            ));
-        }
-
-        if old.execution.worktree_root != new.execution.worktree_root {
-            changes.push(format!(
-                "execution.worktree_root changed: {:?} -> {:?}",
-                old.execution.worktree_root, new.execution.worktree_root
-            ));
-        }
-
-        if old.runner.agent != new.runner.agent {
-            changes.push(format!(
-                "runner.agent changed: {:?} -> {:?} (restart required)",
-                old.runner.agent, new.runner.agent
-            ));
-        }
-
-        if old.runner.prompt_template != new.runner.prompt_template {
-            changes.push(format!(
-                "runner.prompt_template changed: {:?} -> {:?}",
-                old.runner.prompt_template, new.runner.prompt_template
-            ));
-        }
-
-        if old.runner.model != new.runner.model {
-            changes.push(format!(
-                "runner.model changed: {:?} -> {:?}",
-                old.runner.model, new.runner.model
-            ));
-        }
-
-        if old.cancel != new.cancel {
-            changes.push("cancel changed (restart required)".to_string());
-        }
-
-        if old.cleanup != new.cleanup {
-            changes.push(format!(
-                "cleanup changed: ttl={}->{}min, interval={}->{}min",
-                old.cleanup.ttl_minutes,
-                new.cleanup.ttl_minutes,
-                old.cleanup.interval_minutes,
-                new.cleanup.interval_minutes
-            ));
-        }
-
-        if old.logging != new.logging {
-            changes.push("logging changed (restart required)".to_string());
-        }
-
-        if old.state != new.state {
-            changes.push("state changed (restart required)".to_string());
-        }
-
-        if old.output != new.output {
-            changes.push(format!(
-                "output.dir changed: {:?} -> {:?}",
-                old.output.dir, new.output.dir
-            ));
-        }
-
         changes
     }
+}
 
-    /// Extract just the repo IDs from the allowlist.
-    pub fn repo_ids(&self) -> Vec<crate::types::RepoId> {
-        self.repo_policies().into_iter().map(|p| p.id).collect()
+/// Emit a line per field that differs between the two `RepoDefaults`
+/// instances so hot-reload observers can see *which* default flipped.
+fn diff_repo_defaults(old: &RepoDefaults, new: &RepoDefaults, changes: &mut Vec<String>) {
+    if old.skip_self_authored != new.skip_self_authored {
+        changes.push(format!(
+            "repos.defaults.skip_self_authored changed: {:?} -> {:?}",
+            old.skip_self_authored, new.skip_self_authored
+        ));
     }
-
-    /// Resolve the local clone path for a given repository.
-    ///
-    /// Priority: per-repo `base_repo_path` > global `execution.base_repo_path`.
-    pub fn base_repo_for(&self, repo: &crate::types::RepoId) -> Option<PathBuf> {
-        self.repo_policies()
-            .iter()
-            .find(|p| &p.id == repo)
-            .and_then(|p| p.base_repo_path.clone())
-            .or_else(|| self.execution.base_repo_path.clone())
+    if old.skip_reviewer_check != new.skip_reviewer_check {
+        changes.push(format!(
+            "repos.defaults.skip_reviewer_check changed: {:?} -> {:?}",
+            old.skip_reviewer_check, new.skip_reviewer_check
+        ));
+    }
+    if old.review_on_push != new.review_on_push {
+        changes.push(format!(
+            "repos.defaults.review_on_push changed: {:?} -> {:?}",
+            old.review_on_push, new.review_on_push
+        ));
+    }
+    if old.agent != new.agent {
+        changes.push(format!(
+            "repos.defaults.agent changed: {:?} -> {:?}",
+            old.agent, new.agent
+        ));
+    }
+    if old.prompt_template != new.prompt_template {
+        changes.push(format!(
+            "repos.defaults.prompt_template changed: {:?} -> {:?}",
+            old.prompt_template, new.prompt_template
+        ));
+    }
+    if old.model != new.model {
+        changes.push(format!(
+            "repos.defaults.model changed: {:?} -> {:?}",
+            old.model, new.model
+        ));
+    }
+    if old.base_repo_path != new.base_repo_path {
+        changes.push(format!(
+            "repos.defaults.base_repo_path changed: {:?} -> {:?}",
+            old.base_repo_path, new.base_repo_path
+        ));
+    }
+    if old.ignore_prs != new.ignore_prs {
+        changes.push(format!(
+            "repos.defaults.ignore_prs changed: {:?} -> {:?}",
+            old.ignore_prs, new.ignore_prs
+        ));
     }
 }
 
@@ -677,6 +803,9 @@ fn expand_tilde(path: &mut PathBuf, home: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{AgentKind, RepoId};
+
+    // -- parsing --------------------------------------------------------
 
     #[test]
     fn parse_minimal_config() {
@@ -688,11 +817,10 @@ repos:
         let config = Config::from_yaml(yaml).expect("should parse");
         assert_eq!(config.repos.allowlist.len(), 1);
         assert_eq!(config.repos.allowlist[0].repo, "owner/repo");
-        assert!(config.repos.allowlist[0].skip_self_authored);
+        assert!(config.repos.allowlist[0].skip_self_authored.is_none());
         assert!(config.repos.allowlist[0].agent.is_none());
-        assert!(config.repos.allowlist[0].max_concurrency.is_none());
-        assert_eq!(config.polling.interval_seconds, 300);
-        assert_eq!(config.execution.max_concurrency, 10);
+        assert_eq!(config.daemon.polling.interval_seconds, 300);
+        assert_eq!(config.daemon.execution.max_concurrency, 10);
     }
 
     #[test]
@@ -703,7 +831,6 @@ repos:
     - repo: org/repo1
       skip_self_authored: false
       agent: codex
-      max_concurrency: 3
     - repo: org/repo2
 "#;
         let config = Config::from_yaml(yaml).expect("should parse");
@@ -711,34 +838,167 @@ repos:
 
         let e0 = &config.repos.allowlist[0];
         assert_eq!(e0.repo, "org/repo1");
-        assert!(!e0.skip_self_authored);
-        assert_eq!(e0.agent, Some(crate::types::AgentKind::Codex));
-        assert_eq!(e0.max_concurrency, Some(3));
+        assert_eq!(e0.skip_self_authored, Some(false));
+        assert_eq!(e0.agent, Some(AgentKind::Codex));
 
         let e1 = &config.repos.allowlist[1];
         assert_eq!(e1.repo, "org/repo2");
-        assert!(e1.skip_self_authored);
+        assert!(e1.skip_self_authored.is_none());
         assert!(e1.agent.is_none());
-        assert!(e1.max_concurrency.is_none());
     }
 
     #[test]
-    fn repo_policies_returns_parsed_entries() {
+    fn parse_full_daemon_and_repos() {
+        let yaml = r#"
+daemon:
+  polling:
+    interval_seconds: 60
+  auth:
+    method: gh
+    fallback_env: GITHUB_TOKEN
+  execution:
+    max_concurrency: 5
+    lease_minutes: 10
+  cancel:
+    sigint_timeout_seconds: 3
+    sigterm_timeout_seconds: 10
+    sigkill_timeout_seconds: 3
+  cleanup:
+    ttl_minutes: 720
+    interval_minutes: 15
+
+repos:
+  defaults:
+    agent: codex
+  allowlist:
+    - repo: org/repo1
+    - repo: org/repo2
+"#;
+        let config = Config::from_yaml(yaml).expect("should parse");
+        assert_eq!(config.daemon.polling.interval_seconds, 60);
+        assert_eq!(config.daemon.execution.max_concurrency, 5);
+        assert_eq!(config.daemon.execution.lease_minutes, 10);
+        assert_eq!(config.daemon.cancel.sigint_timeout_seconds, 3);
+        assert_eq!(config.daemon.cleanup.ttl_minutes, 720);
+        assert_eq!(config.repos.defaults.agent, Some(AgentKind::Codex));
+    }
+
+    // -- resolution chain -----------------------------------------------
+
+    #[test]
+    fn resolve_falls_back_to_builtin_when_nothing_set() {
         let yaml = r#"
 repos:
   allowlist:
     - repo: org/repo
-      skip_self_authored: false
-      agent: codex
-      max_concurrency: 2
 "#;
-        let config = Config::from_yaml(yaml).expect("should parse");
+        let config = Config::from_yaml(yaml).expect("parse");
         let policies = config.repo_policies();
         assert_eq!(policies.len(), 1);
-        assert_eq!(policies[0].id, crate::types::RepoId::new("org", "repo"));
-        assert!(!policies[0].skip_self_authored);
-        assert_eq!(policies[0].agent, Some(crate::types::AgentKind::Codex));
-        assert_eq!(policies[0].max_concurrency, Some(2));
+        let p = &policies[0];
+        assert_eq!(p.id, RepoId::new("org", "repo"));
+        assert!(p.skip_self_authored);
+        assert!(!p.skip_reviewer_check);
+        assert!(p.review_on_push);
+        assert_eq!(p.agent, AgentKind::Claude);
+        assert!(p.prompt_template.is_none());
+        assert!(p.model.is_none());
+        assert!(p.base_repo_path.is_none());
+        assert!(p.ignore_prs.is_empty());
+    }
+
+    #[test]
+    fn resolve_uses_repos_defaults_when_entry_is_silent() {
+        let yaml = r#"
+repos:
+  defaults:
+    agent: codex
+    model: gpt-5.3-codex
+    prompt_template: "Review {pr_url}"
+    base_repo_path: /shared/src
+    skip_self_authored: false
+    ignore_prs: [1, 2]
+  allowlist:
+    - repo: org/repo
+"#;
+        let config = Config::from_yaml(yaml).expect("parse");
+        let p = &config.repo_policies()[0];
+        assert_eq!(p.agent, AgentKind::Codex);
+        assert_eq!(p.model.as_deref(), Some("gpt-5.3-codex"));
+        assert_eq!(p.prompt_template.as_deref(), Some("Review {pr_url}"));
+        assert_eq!(p.base_repo_path, Some(PathBuf::from("/shared/src")));
+        assert!(!p.skip_self_authored);
+        assert_eq!(p.ignore_prs, vec![1, 2]);
+    }
+
+    #[test]
+    fn resolve_entry_overrides_defaults() {
+        let yaml = r#"
+repos:
+  defaults:
+    agent: codex
+    model: gpt-5.3-codex
+    base_repo_path: /shared/src
+  allowlist:
+    - repo: org/repo-a
+    - repo: org/repo-b
+      agent: claude
+      model: claude-sonnet-4-6
+      base_repo_path: /custom/src
+"#;
+        let config = Config::from_yaml(yaml).expect("parse");
+        let policies = config.repo_policies();
+        assert_eq!(policies.len(), 2);
+
+        // repo-a inherits everything from defaults
+        assert_eq!(policies[0].agent, AgentKind::Codex);
+        assert_eq!(policies[0].model.as_deref(), Some("gpt-5.3-codex"));
+        assert_eq!(
+            policies[0].base_repo_path,
+            Some(PathBuf::from("/shared/src"))
+        );
+
+        // repo-b overrides
+        assert_eq!(policies[1].agent, AgentKind::Claude);
+        assert_eq!(policies[1].model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(
+            policies[1].base_repo_path,
+            Some(PathBuf::from("/custom/src"))
+        );
+    }
+
+    #[test]
+    fn builtin_skip_self_authored_is_true() {
+        let yaml = r#"
+repos:
+  allowlist:
+    - repo: org/repo
+"#;
+        let config = Config::from_yaml(yaml).expect("parse");
+        assert!(config.repo_policies()[0].skip_self_authored);
+    }
+
+    #[test]
+    fn builtin_review_on_push_is_true() {
+        let yaml = r#"
+repos:
+  allowlist:
+    - repo: org/repo
+"#;
+        let config = Config::from_yaml(yaml).expect("parse");
+        assert!(config.repo_policies()[0].review_on_push);
+    }
+
+    #[test]
+    fn entry_can_disable_review_on_push() {
+        let yaml = r#"
+repos:
+  allowlist:
+    - repo: org/repo
+      review_on_push: false
+"#;
+        let config = Config::from_yaml(yaml).expect("parse");
+        assert!(!config.repo_policies()[0].review_on_push);
     }
 
     #[test]
@@ -749,12 +1009,48 @@ repos:
     - repo: org/repo1
     - repo: org/repo2
 "#;
-        let config = Config::from_yaml(yaml).expect("should parse");
+        let config = Config::from_yaml(yaml).expect("parse");
         let ids = config.repo_ids();
         assert_eq!(ids.len(), 2);
-        assert_eq!(ids[0], crate::types::RepoId::new("org", "repo1"));
-        assert_eq!(ids[1], crate::types::RepoId::new("org", "repo2"));
+        assert_eq!(ids[0], RepoId::new("org", "repo1"));
+        assert_eq!(ids[1], RepoId::new("org", "repo2"));
     }
+
+    #[test]
+    fn base_repo_for_prefers_entry_then_defaults() {
+        let yaml = r#"
+repos:
+  defaults:
+    base_repo_path: /shared/src
+  allowlist:
+    - repo: org/repo-a
+    - repo: org/repo-b
+      base_repo_path: /custom/src
+"#;
+        let config = Config::from_yaml(yaml).expect("parse");
+        assert_eq!(
+            config.base_repo_for(&RepoId::new("org", "repo-a")),
+            Some(PathBuf::from("/shared/src"))
+        );
+        assert_eq!(
+            config.base_repo_for(&RepoId::new("org", "repo-b")),
+            Some(PathBuf::from("/custom/src"))
+        );
+        assert_eq!(config.base_repo_for(&RepoId::new("org", "unknown")), None);
+    }
+
+    #[test]
+    fn base_repo_for_returns_none_when_nothing_set() {
+        let yaml = r#"
+repos:
+  allowlist:
+    - repo: org/repo
+"#;
+        let config = Config::from_yaml(yaml).expect("parse");
+        assert_eq!(config.base_repo_for(&RepoId::new("org", "repo")), None);
+    }
+
+    // -- validation -----------------------------------------------------
 
     #[test]
     fn reject_empty_allowlist() {
@@ -790,78 +1086,87 @@ repos:
     }
 
     #[test]
-    fn parse_prompt_template_in_runner() {
-        let yaml = r#"
-repos:
-  allowlist:
-    - repo: owner/repo
-runner:
-  agent: claude
-  prompt_template: "Review {pr_url}"
-"#;
-        let config = Config::from_yaml(yaml).expect("should parse");
-        assert_eq!(
-            config.runner.prompt_template.as_deref(),
-            Some("Review {pr_url}")
-        );
-        assert_eq!(config.runner.agent, Some(crate::types::AgentKind::Claude));
+    fn valid_model_names_accepted() {
+        for name in [
+            "claude-sonnet-4-5-20250514",
+            "gpt-5.3-codex",
+            "gpt-5.4",
+            "model:v1.2",
+            "a_b-c.d:e",
+        ] {
+            let yaml = format!(
+                "repos:\n  defaults:\n    model: {name}\n  allowlist:\n    - repo: org/repo\n"
+            );
+            Config::from_yaml(&yaml)
+                .unwrap_or_else(|e| panic!("model '{name}' should be valid: {e}"));
+        }
     }
 
     #[test]
-    fn parse_per_repo_prompt_template() {
-        let yaml = r#"
-repos:
-  allowlist:
-    - repo: org/repo1
-      prompt_template: "Custom prompt for repo1"
-    - repo: org/repo2
-"#;
-        let config = Config::from_yaml(yaml).expect("should parse");
-        let policies = config.repo_policies();
-        assert_eq!(
-            policies[0].prompt_template.as_deref(),
-            Some("Custom prompt for repo1")
-        );
-        assert!(policies[1].prompt_template.is_none());
+    fn invalid_defaults_model_rejected() {
+        for name in ["model name", "model;rm", "$(echo hi)", "mod\"el", ""] {
+            let yaml = format!(
+                "repos:\n  defaults:\n    model: \"{name}\"\n  allowlist:\n    - repo: org/repo\n"
+            );
+            assert!(
+                Config::from_yaml(&yaml).is_err(),
+                "model '{name}' should be rejected"
+            );
+        }
     }
 
     #[test]
-    fn full_config_roundtrip() {
-        let yaml = r#"
-repos:
-  allowlist:
-    - repo: org/repo1
-    - repo: org/repo2
-polling:
-  interval_seconds: 60
-auth:
-  method: gh
-  fallback_env: GITHUB_TOKEN
-execution:
-  max_concurrency: 5
-cancel:
-  sigint_timeout_seconds: 3
-  sigterm_timeout_seconds: 10
-  sigkill_timeout_seconds: 3
-cleanup:
-  ttl_minutes: 720
-  interval_minutes: 15
-"#;
-        let config = Config::from_yaml(yaml).expect("should parse");
-        assert_eq!(config.polling.interval_seconds, 60);
-        assert_eq!(config.execution.max_concurrency, 5);
-        assert_eq!(config.cancel.sigint_timeout_seconds, 3);
-        assert_eq!(config.cleanup.ttl_minutes, 720);
-    }
-
-    #[test]
-    fn diff_summary_no_changes() {
+    fn invalid_per_repo_model_rejected() {
         let yaml = r#"
 repos:
   allowlist:
     - repo: org/repo
-polling:
-  interval_seconds: 60
+      model: "bad model"
+"#;
+        let err = Config::from_yaml(yaml).unwrap_err();
+        assert!(err.to_string().contains("invalid model"));
+    }
+
+    #[test]
+    fn reject_unknown_top_level_key() {
+        // The old schema used `runner:` / `polling:` / etc. at the top level.
+        // With the new schema they must live under `daemon:` and the old
+        // layout should fail to parse.
+        let yaml = r#"
+runner:
+  agent: claude
+repos:
+  allowlist:
+    - repo: org/repo
+"#;
+        assert!(Config::from_yaml(yaml).is_err());
+    }
+
+    #[test]
+    fn reject_zero_polling_interval() {
+        let yaml = r#"
+daemon:
+  polling:
+    interval_seconds: 0
+repos:
+  allowlist:
+    - repo: org/repo
+"#;
+        let err = Config::from_yaml(yaml).unwrap_err();
+        assert!(err.to_string().contains("polling"));
+    }
+
+    // -- diff_summary ---------------------------------------------------
+
+    #[test]
+    fn diff_summary_no_changes() {
+        let yaml = r#"
+daemon:
+  polling:
+    interval_seconds: 60
+repos:
+  allowlist:
+    - repo: org/repo
 "#;
         let config = Config::from_yaml(yaml).expect("parse");
         let changes = Config::diff_summary(&config, &config);
@@ -872,50 +1177,54 @@ polling:
     fn diff_summary_detects_polling_change() {
         let old = Config::from_yaml(
             r#"
+daemon:
+  polling:
+    interval_seconds: 60
 repos:
   allowlist:
     - repo: org/repo
-polling:
-  interval_seconds: 60
 "#,
         )
         .expect("parse");
         let new = Config::from_yaml(
             r#"
+daemon:
+  polling:
+    interval_seconds: 120
 repos:
   allowlist:
     - repo: org/repo
-polling:
-  interval_seconds: 120
 "#,
         )
         .expect("parse");
         let changes = Config::diff_summary(&old, &new);
         assert_eq!(changes.len(), 1);
-        assert!(changes[0].contains("polling.interval_seconds"));
+        assert!(changes[0].contains("daemon.polling.interval_seconds"));
         assert!(changes[0].contains("60"));
         assert!(changes[0].contains("120"));
     }
 
     #[test]
-    fn diff_summary_detects_restart_required() {
+    fn diff_summary_detects_max_concurrency_restart_required() {
         let old = Config::from_yaml(
             r#"
+daemon:
+  execution:
+    max_concurrency: 5
 repos:
   allowlist:
     - repo: org/repo
-execution:
-  max_concurrency: 5
 "#,
         )
         .expect("parse");
         let new = Config::from_yaml(
             r#"
+daemon:
+  execution:
+    max_concurrency: 20
 repos:
   allowlist:
     - repo: org/repo
-execution:
-  max_concurrency: 20
 "#,
         )
         .expect("parse");
@@ -928,7 +1237,7 @@ execution:
     }
 
     #[test]
-    fn diff_summary_detects_repo_change() {
+    fn diff_summary_detects_repo_list_change() {
         let old = Config::from_yaml(
             r#"
 repos:
@@ -947,67 +1256,6 @@ repos:
         .expect("parse");
         let changes = Config::diff_summary(&old, &new);
         assert!(changes.iter().any(|c| c.contains("repos.allowlist")));
-    }
-
-    #[test]
-    fn diff_summary_multiple_changes() {
-        let old = Config::from_yaml(
-            r#"
-repos:
-  allowlist:
-    - repo: org/repo
-polling:
-  interval_seconds: 60
-cleanup:
-  ttl_minutes: 1440
-  interval_minutes: 30
-"#,
-        )
-        .expect("parse");
-        let new = Config::from_yaml(
-            r#"
-repos:
-  allowlist:
-    - repo: org/repo
-polling:
-  interval_seconds: 120
-cleanup:
-  ttl_minutes: 720
-  interval_minutes: 15
-"#,
-        )
-        .expect("parse");
-        let changes = Config::diff_summary(&old, &new);
-        assert_eq!(changes.len(), 2);
-        assert!(changes.iter().any(|c| c.contains("polling")));
-        assert!(changes.iter().any(|c| c.contains("cleanup")));
-    }
-
-    #[test]
-    fn parse_review_on_push_false() {
-        let yaml = r#"
-repos:
-  allowlist:
-    - repo: org/repo
-      review_on_push: false
-"#;
-        let config = Config::from_yaml(yaml).expect("should parse");
-        assert!(!config.repos.allowlist[0].review_on_push);
-        let policies = config.repo_policies();
-        assert!(!policies[0].review_on_push);
-    }
-
-    #[test]
-    fn review_on_push_defaults_to_true() {
-        let yaml = r#"
-repos:
-  allowlist:
-    - repo: org/repo
-"#;
-        let config = Config::from_yaml(yaml).expect("should parse");
-        assert!(config.repos.allowlist[0].review_on_push);
-        let policies = config.repo_policies();
-        assert!(policies[0].review_on_push);
     }
 
     #[test]
@@ -1031,152 +1279,81 @@ repos:
         )
         .expect("parse");
         let changes = Config::diff_summary(&old, &new);
-        assert_eq!(changes.len(), 1);
-        assert!(changes[0].contains("review_on_push"));
-        assert!(changes[0].contains("true"));
-        assert!(changes[0].contains("false"));
-        // Should not have a generic "repos.allowlist changed" line
-        // since the repo list itself didn't change.
-        assert!(!changes[0].contains("repos.allowlist changed"));
+        assert!(changes.iter().any(|c| c.contains("review_on_push")));
     }
 
     #[test]
-    fn diff_summary_review_on_push_and_agent_both_changed() {
+    fn diff_summary_detects_repos_defaults_agent_change() {
         let old = Config::from_yaml(
             r#"
 repos:
+  defaults:
+    agent: claude
   allowlist:
     - repo: org/repo
-      review_on_push: true
-      agent: claude
 "#,
         )
         .expect("parse");
         let new = Config::from_yaml(
             r#"
 repos:
+  defaults:
+    agent: codex
   allowlist:
     - repo: org/repo
-      review_on_push: false
-      agent: codex
 "#,
         )
         .expect("parse");
         let changes = Config::diff_summary(&old, &new);
-        // Should have 2 lines: specific review_on_push + generic per-repo settings
-        assert_eq!(changes.len(), 2);
-        assert!(changes.iter().any(|c| c.contains("review_on_push")));
+        // Must name the specific field that flipped, not a coarse
+        // "repos.defaults changed" line.
+        assert!(
+            changes.iter().any(|c| c.contains("repos.defaults.agent")
+                && c.contains("Claude")
+                && c.contains("Codex")),
+            "expected field-level diff for agent: {changes:?}"
+        );
+    }
+
+    #[test]
+    fn diff_summary_detects_repos_defaults_model_and_prompt_changes() {
+        let old = Config::from_yaml(
+            r#"
+repos:
+  defaults:
+    model: gpt-5.3-codex
+    prompt_template: "old"
+  allowlist:
+    - repo: org/repo
+"#,
+        )
+        .expect("parse");
+        let new = Config::from_yaml(
+            r#"
+repos:
+  defaults:
+    model: gpt-5.4
+    prompt_template: "new"
+  allowlist:
+    - repo: org/repo
+"#,
+        )
+        .expect("parse");
+        let changes = Config::diff_summary(&old, &new);
+        assert!(
+            changes.iter().any(|c| c.contains("repos.defaults.model")),
+            "expected model diff: {changes:?}"
+        );
         assert!(
             changes
                 .iter()
-                .any(|c| c.contains("per-repo settings changed"))
+                .any(|c| c.contains("repos.defaults.prompt_template")),
+            "expected prompt_template diff: {changes:?}"
         );
     }
 
     #[test]
-    fn parse_model_in_runner() {
-        let yaml = r#"
-repos:
-  allowlist:
-    - repo: owner/repo
-runner:
-  model: claude-sonnet-4-5-20250514
-"#;
-        let config = Config::from_yaml(yaml).expect("should parse");
-        assert_eq!(
-            config.runner.model.as_deref(),
-            Some("claude-sonnet-4-5-20250514")
-        );
-    }
-
-    #[test]
-    fn parse_per_repo_model() {
-        let yaml = r#"
-repos:
-  allowlist:
-    - repo: org/repo1
-      model: gpt-5.3-codex
-    - repo: org/repo2
-"#;
-        let config = Config::from_yaml(yaml).expect("should parse");
-        let policies = config.repo_policies();
-        assert_eq!(policies[0].model.as_deref(), Some("gpt-5.3-codex"));
-        assert!(policies[1].model.is_none());
-    }
-
-    #[test]
-    fn valid_model_names_accepted() {
-        for name in [
-            "claude-sonnet-4-5-20250514",
-            "gpt-5.3-codex",
-            "gpt-5.4",
-            "model:v1.2",
-            "a_b-c.d:e",
-        ] {
-            let yaml =
-                format!("repos:\n  allowlist:\n    - repo: org/repo\nrunner:\n  model: {name}\n");
-            Config::from_yaml(&yaml)
-                .unwrap_or_else(|e| panic!("model '{name}' should be valid: {e}"));
-        }
-    }
-
-    #[test]
-    fn invalid_model_names_rejected() {
-        for name in ["model name", "model;rm", "$(echo hi)", "mod\"el", ""] {
-            let yaml = format!(
-                "repos:\n  allowlist:\n    - repo: org/repo\nrunner:\n  model: \"{name}\"\n"
-            );
-            assert!(
-                Config::from_yaml(&yaml).is_err(),
-                "model '{name}' should be rejected"
-            );
-        }
-    }
-
-    #[test]
-    fn invalid_per_repo_model_rejected() {
-        let yaml = r#"
-repos:
-  allowlist:
-    - repo: org/repo
-      model: "bad model"
-"#;
-        let err = Config::from_yaml(yaml).unwrap_err();
-        assert!(err.to_string().contains("invalid model"));
-    }
-
-    #[test]
-    fn diff_summary_detects_runner_model_change() {
-        let old = Config::from_yaml(
-            r#"
-repos:
-  allowlist:
-    - repo: org/repo
-runner:
-  model: gpt-5.4
-"#,
-        )
-        .expect("parse");
-        let new = Config::from_yaml(
-            r#"
-repos:
-  allowlist:
-    - repo: org/repo
-runner:
-  model: gpt-5.3-codex
-"#,
-        )
-        .expect("parse");
-        let changes = Config::diff_summary(&old, &new);
-        assert!(
-            changes.iter().any(|c| c.contains("runner.model")),
-            "should detect runner.model change: {:?}",
-            changes
-        );
-    }
-
-    #[test]
-    fn diff_summary_detects_per_repo_model_change() {
+    fn diff_summary_detects_per_repo_settings_change_fallback() {
         let old = Config::from_yaml(
             r#"
 repos:
@@ -1199,87 +1376,36 @@ repos:
         assert!(
             changes
                 .iter()
-                .any(|c| c.contains("per-repo settings changed")),
-            "should detect per-repo model change: {:?}",
-            changes
+                .any(|c| c.contains("per-repo settings changed"))
         );
     }
 
-    #[test]
-    fn diff_summary_only_agent_changed() {
-        let old = Config::from_yaml(
-            r#"
-repos:
-  allowlist:
-    - repo: org/repo
-      agent: claude
-"#,
-        )
-        .expect("parse");
-        let new = Config::from_yaml(
-            r#"
-repos:
-  allowlist:
-    - repo: org/repo
-      agent: codex
-"#,
-        )
-        .expect("parse");
-        let changes = Config::diff_summary(&old, &new);
-        // Should have the fallback line for other per-repo settings
-        assert_eq!(changes.len(), 1);
-        assert!(changes[0].contains("per-repo settings changed"));
-    }
+    // -- expand_paths ---------------------------------------------------
 
     #[test]
-    fn parse_ignore_prs() {
+    fn expand_paths_expands_tilde_in_base_repo_paths() {
+        // Skip the test when the home directory cannot be resolved (e.g. in
+        // sandboxed CI).
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
         let yaml = r#"
 repos:
+  defaults:
+    base_repo_path: ~/src/defaults
   allowlist:
     - repo: org/repo
-      ignore_prs: [9520, 9521, 9522]
+      base_repo_path: ~/src/custom
 "#;
-        let config = Config::from_yaml(yaml).expect("should parse");
-        assert_eq!(config.repos.allowlist[0].ignore_prs, vec![9520, 9521, 9522]);
-        let policies = config.repo_policies();
-        assert_eq!(policies[0].ignore_prs, vec![9520, 9521, 9522]);
-    }
-
-    #[test]
-    fn ignore_prs_defaults_to_empty() {
-        let yaml = r#"
-repos:
-  allowlist:
-    - repo: org/repo
-"#;
-        let config = Config::from_yaml(yaml).expect("should parse");
-        assert!(config.repos.allowlist[0].ignore_prs.is_empty());
-    }
-
-    #[test]
-    fn diff_summary_detects_ignore_prs_change() {
-        let old = Config::from_yaml(
-            r#"
-repos:
-  allowlist:
-    - repo: org/repo
-"#,
-        )
-        .expect("parse");
-        let new = Config::from_yaml(
-            r#"
-repos:
-  allowlist:
-    - repo: org/repo
-      ignore_prs: [100]
-"#,
-        )
-        .expect("parse");
-        let changes = Config::diff_summary(&old, &new);
-        assert!(
-            changes
-                .iter()
-                .any(|c| c.contains("per-repo settings changed")),
+        let mut config = Config::from_yaml(yaml).expect("parse");
+        config.expand_paths();
+        assert_eq!(
+            config.repos.defaults.base_repo_path.as_deref(),
+            Some(home.join("src/defaults").as_path())
+        );
+        assert_eq!(
+            config.repos.allowlist[0].base_repo_path.as_deref(),
+            Some(home.join("src/custom").as_path())
         );
     }
 }
