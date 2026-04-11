@@ -75,20 +75,20 @@ async fn run(cli: Cli) -> reviewq::error::Result<()> {
 
     match cli.command {
         Some(Commands::Status { status, repo }) => {
-            let db = reviewq::db::Database::open(&config.state.sqlite_path)?;
+            let db = reviewq::db::Database::open(&config.daemon.state.sqlite_path)?;
             reviewq::cli::status(&db, status.as_deref(), repo.as_deref())
         }
         Some(Commands::Tail { job_id }) => {
-            let db = reviewq::db::Database::open(&config.state.sqlite_path)?;
-            reviewq::cli::tail(&db, job_id, &config.output.dir)
+            let db = reviewq::db::Database::open(&config.daemon.state.sqlite_path)?;
+            reviewq::cli::tail(&db, job_id, &config.daemon.output.dir)
         }
         Some(Commands::Open { target }) => {
-            let db = reviewq::db::Database::open(&config.state.sqlite_path)?;
+            let db = reviewq::db::Database::open(&config.daemon.state.sqlite_path)?;
             reviewq::cli::open_target(&db, &target)
         }
         Some(Commands::Tui) => {
-            let db = reviewq::db::Database::open(&config.state.sqlite_path)?;
-            reviewq::tui::run(&db, &config.output.dir, &config.logging.dir)
+            let db = reviewq::db::Database::open(&config.daemon.state.sqlite_path)?;
+            reviewq::tui::run(&db, &config.daemon.output.dir, &config.daemon.logging.dir)
         }
         None => run_daemon(config, config_path).await,
     }
@@ -100,30 +100,32 @@ async fn run_daemon(
     config_path: PathBuf,
 ) -> reviewq::error::Result<()> {
     // Initialize logging (hold guard for program lifetime).
-    let _log_guard = reviewq::logging::init(Some(&config.logging.dir));
+    let _log_guard = reviewq::logging::init(Some(&config.daemon.logging.dir));
 
     info!("starting reviewq daemon");
 
     // Single-instance enforcement via PID file.
-    let _pid_file = reviewq::daemon::PidFile::acquire(&config.logging.dir)?;
+    let _pid_file = reviewq::daemon::PidFile::acquire(&config.daemon.logging.dir)?;
 
     // Open database with configured lease duration.
     let db = Arc::new(
-        reviewq::db::Database::open(&config.state.sqlite_path)?
-            .with_lease_minutes(config.execution.lease_minutes),
+        reviewq::db::Database::open(&config.daemon.state.sqlite_path)?
+            .with_lease_minutes(config.daemon.execution.lease_minutes),
     );
 
     // Resolve GitHub token and create API client.
-    let token = reviewq::auth::resolve_token(&config.auth.method, &config.auth.fallback_env)?;
+    let token =
+        reviewq::auth::resolve_token(&config.daemon.auth.method, &config.daemon.auth.fallback_env)?;
     let github = reviewq::github::GitHubApi::new(token);
 
-    // Create the review executor.
-    let default_agent = config.runner.agent.clone().unwrap_or_default();
-    let default_command = default_agent.default_command(config.runner.model.as_deref());
+    // Create the review executor with a built-in fallback command. Each job
+    // carries its own resolved command (see detector), so this default only
+    // applies to legacy or test paths that bypass the detector.
+    let default_command = reviewq::types::AgentKind::default().default_command(None);
     let executor = Arc::new(reviewq::executor::CommandExecutor::new(
         default_command,
-        config.cancel.clone(),
-        config.output.dir.clone(),
+        config.daemon.cancel.clone(),
+        config.daemon.output.dir.clone(),
     ));
 
     // Set up signal handlers for graceful shutdown.
@@ -278,18 +280,33 @@ fn reload_config(
 }
 
 /// Periodically remove expired worktrees.
+///
+/// Uses a single `base_repo` for `git worktree remove` calls, falling back
+/// through `repos.defaults.base_repo_path` → process cwd. This matches the
+/// pre-refactor behavior and intentionally does **not** sweep every distinct
+/// per-repo `base_repo_path`, because `worktree::cleanup` currently scans a
+/// shared `worktree_root` and has no way to pair each reviewq worktree with
+/// its owning repo. Supporting multiple clone locations correctly requires
+/// owner tracking and is tracked as a follow-up (see plan: `cleanup
+/// semantics` in Phase 3).
 async fn worktree_cleanup_loop(mut config_rx: watch::Receiver<Arc<reviewq::config::Config>>) {
     loop {
         let config = config_rx.borrow_and_update().clone();
-        let base_repo =
-            config.execution.base_repo_path.clone().unwrap_or_else(|| {
-                std::env::current_dir().expect("current directory is accessible")
-            });
-        let worktree_root = config.execution.effective_worktree_root();
-        let interval = std::time::Duration::from_secs(config.cleanup.interval_minutes * 60);
+        let base_repo = config
+            .repos
+            .defaults
+            .base_repo_path
+            .clone()
+            .unwrap_or_else(|| std::env::current_dir().expect("current directory is accessible"));
+        let worktree_root = config.daemon.execution.effective_worktree_root();
+        let interval = std::time::Duration::from_secs(config.daemon.cleanup.interval_minutes * 60);
 
         tokio::time::sleep(interval).await;
-        match reviewq::worktree::cleanup(&base_repo, &worktree_root, config.cleanup.ttl_minutes) {
+        match reviewq::worktree::cleanup(
+            &base_repo,
+            &worktree_root,
+            config.daemon.cleanup.ttl_minutes,
+        ) {
             Ok(removed) if !removed.is_empty() => {
                 info!(count = removed.len(), "cleaned up expired worktrees");
             }
@@ -307,7 +324,7 @@ mod tests {
     use std::io::Write;
 
     fn minimal_yaml() -> &'static str {
-        "repos:\n  allowlist:\n    - repo: org/repo\npolling:\n  interval_seconds: 60\n"
+        "repos:\n  allowlist:\n    - repo: org/repo\ndaemon:\n  polling:\n    interval_seconds: 60\n"
     }
 
     fn write_config(dir: &std::path::Path, yaml: &str) -> PathBuf {
@@ -329,13 +346,13 @@ mod tests {
         // Rewrite with changed polling interval
         write_config(
             dir.path(),
-            "repos:\n  allowlist:\n    - repo: org/repo\npolling:\n  interval_seconds: 120\n",
+            "repos:\n  allowlist:\n    - repo: org/repo\ndaemon:\n  polling:\n    interval_seconds: 120\n",
         );
 
         reload_config(&config_path, &config_tx);
 
         let updated = config_rx.borrow().clone();
-        assert_eq!(updated.polling.interval_seconds, 120);
+        assert_eq!(updated.daemon.polling.interval_seconds, 120);
     }
 
     #[test]
@@ -354,7 +371,7 @@ mod tests {
 
         // Old config should be retained
         let current = config_rx.borrow().clone();
-        assert_eq!(current.polling.interval_seconds, 60);
+        assert_eq!(current.daemon.polling.interval_seconds, 60);
     }
 
     #[test]

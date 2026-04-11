@@ -34,7 +34,7 @@ where
         let policies = config.repo_policies();
         let repo_ids: Vec<RepoId> = policies.iter().map(|p| p.id.clone()).collect();
 
-        match detect_once(github, store, &config, &username, &repo_ids, &policies).await {
+        match detect_once(github, store, &username, &repo_ids, &policies).await {
             Ok(count) => info!(new_jobs = count, "detection cycle complete"),
             Err(e) => {
                 if e.is_retryable() {
@@ -44,7 +44,7 @@ where
                 }
             }
         }
-        sleep(Duration::from_secs(config.polling.interval_seconds)).await;
+        sleep(Duration::from_secs(config.daemon.polling.interval_seconds)).await;
     }
 }
 
@@ -52,7 +52,6 @@ where
 async fn detect_once<G, S>(
     github: &G,
     store: &S,
-    config: &Config,
     username: &str,
     repo_ids: &[RepoId],
     policies: &[RepoPolicy],
@@ -92,11 +91,15 @@ where
 
     info!(pr_count = prs.len(), "fetched PRs from GitHub");
 
-    let global_agent = config.runner.agent.clone().unwrap_or_default();
     let mut enqueued = 0;
 
     for pr in &prs {
-        // Look up per-repo policy.
+        // Look up per-repo policy. Every field here is already resolved
+        // through `RepoEntry -> repos.defaults -> built-in` in
+        // `Config::repo_policies`, so no merge logic is needed at this
+        // layer. The `Option` only exists because a PR could, in theory,
+        // arrive for a repo that isn't in the allowlist — in practice the
+        // detector only fetches PRs for allowlisted repos.
         let policy = policies.iter().find(|p| p.id == pr.repo);
         let skip_self = policy.is_none_or(|p| p.skip_self_authored);
         let skip_reviewer = policy.is_some_and(|p| p.skip_reviewer_check);
@@ -115,10 +118,8 @@ where
             continue;
         }
 
-        // Resolve agent kind: per-repo override > global config > default (Claude).
-        let agent_kind = policy
-            .and_then(|p| p.agent.clone())
-            .unwrap_or_else(|| global_agent.clone());
+        // Resolve agent kind directly from the policy (already merged).
+        let agent_kind = policy.map(|p| p.agent.clone()).unwrap_or_default();
 
         // Handle SHA changes (cancel stale jobs) — always runs regardless
         // of review_on_push to prevent stale reviews from completing.
@@ -143,18 +144,13 @@ where
             continue;
         }
 
-        // Resolve model: per-repo override > global runner.model.
-        let model = policy
-            .and_then(|p| p.model.clone())
-            .or_else(|| config.runner.model.clone());
+        // Model and prompt_template are already resolved in the policy.
+        let model = policy.and_then(|p| p.model.clone());
 
         // Generate command from resolved agent kind and model.
         let command = Some(agent_kind.default_command(model.as_deref()));
 
-        // Resolve prompt_template: per-repo override > global runner.prompt_template.
-        let prompt_template = policy
-            .and_then(|p| p.prompt_template.clone())
-            .or_else(|| config.runner.prompt_template.clone());
+        let prompt_template = policy.and_then(|p| p.prompt_template.clone());
 
         // Enqueue new job
         let new_job = NewJob {
@@ -238,8 +234,9 @@ mod tests {
 repos:
   allowlist:
     - repo: org/repo
-polling:
-  interval_seconds: 60
+daemon:
+  polling:
+    interval_seconds: 60
 "#,
         )
         .expect("config should parse")
@@ -252,8 +249,9 @@ repos:
   allowlist:
     - repo: org/repo
       skip_self_authored: false
-polling:
-  interval_seconds: 60
+daemon:
+  polling:
+    interval_seconds: 60
 "#,
         )
         .expect("config should parse")
@@ -283,7 +281,7 @@ polling:
         let policies = config.repo_policies();
         let repo_ids = config.repo_ids();
 
-        let count = detect_once(&github, &db, &config, "bob", &repo_ids, &policies)
+        let count = detect_once(&github, &db, "bob", &repo_ids, &policies)
             .await
             .expect("should succeed");
         assert_eq!(count, 1);
@@ -306,13 +304,13 @@ polling:
         let repo_ids = config.repo_ids();
 
         // First cycle should enqueue
-        let count1 = detect_once(&github, &db, &config, "bob", &repo_ids, &policies)
+        let count1 = detect_once(&github, &db, "bob", &repo_ids, &policies)
             .await
             .expect("should succeed");
         assert_eq!(count1, 1);
 
         // Second cycle should skip (idempotent)
-        let count2 = detect_once(&github, &db, &config, "bob", &repo_ids, &policies)
+        let count2 = detect_once(&github, &db, "bob", &repo_ids, &policies)
             .await
             .expect("should succeed");
         assert_eq!(count2, 0);
@@ -329,7 +327,7 @@ polling:
         let policies = config.repo_policies();
         let repo_ids = config.repo_ids();
 
-        let count = detect_once(&github, &db, &config, "alice", &repo_ids, &policies)
+        let count = detect_once(&github, &db, "alice", &repo_ids, &policies)
             .await
             .expect("should succeed");
         assert_eq!(count, 0);
@@ -348,7 +346,7 @@ polling:
         let policies = config.repo_policies();
         let repo_ids = config.repo_ids();
 
-        let count = detect_once(&github, &db, &config, "alice", &repo_ids, &policies)
+        let count = detect_once(&github, &db, "alice", &repo_ids, &policies)
             .await
             .expect("should succeed");
         assert_eq!(count, 1);
@@ -364,20 +362,21 @@ polling:
         let config = Config::from_yaml(
             r#"
 repos:
+  defaults:
+    agent: claude
   allowlist:
     - repo: org/repo
       agent: codex
-runner:
-  agent: claude
-polling:
-  interval_seconds: 60
+daemon:
+  polling:
+    interval_seconds: 60
 "#,
         )
         .expect("config");
         let policies = config.repo_policies();
         let repo_ids = config.repo_ids();
 
-        let count = detect_once(&github, &db, &config, "bob", &repo_ids, &policies)
+        let count = detect_once(&github, &db, "bob", &repo_ids, &policies)
             .await
             .expect("should succeed");
         assert_eq!(count, 1);
@@ -401,19 +400,20 @@ polling:
         let config = Config::from_yaml(
             r#"
 repos:
+  defaults:
+    agent: codex
   allowlist:
     - repo: org/repo
-runner:
-  agent: codex
-polling:
-  interval_seconds: 60
+daemon:
+  polling:
+    interval_seconds: 60
 "#,
         )
         .expect("config");
         let policies = config.repo_policies();
         let repo_ids = config.repo_ids();
 
-        let count = detect_once(&github, &db, &config, "bob", &repo_ids, &policies)
+        let count = detect_once(&github, &db, "bob", &repo_ids, &policies)
             .await
             .expect("should succeed");
         assert_eq!(count, 1);
@@ -437,20 +437,21 @@ polling:
         let config = Config::from_yaml(
             r#"
 repos:
+  defaults:
+    prompt_template: "global-prompt"
   allowlist:
     - repo: org/repo
       prompt_template: "per-repo-prompt"
-runner:
-  prompt_template: "global-prompt"
-polling:
-  interval_seconds: 60
+daemon:
+  polling:
+    interval_seconds: 60
 "#,
         )
         .expect("config");
         let policies = config.repo_policies();
         let repo_ids = config.repo_ids();
 
-        let count = detect_once(&github, &db, &config, "bob", &repo_ids, &policies)
+        let count = detect_once(&github, &db, "bob", &repo_ids, &policies)
             .await
             .expect("should succeed");
         assert_eq!(count, 1);
@@ -469,19 +470,20 @@ polling:
         let config = Config::from_yaml(
             r#"
 repos:
+  defaults:
+    prompt_template: "global-prompt"
   allowlist:
     - repo: org/repo
-runner:
-  prompt_template: "global-prompt"
-polling:
-  interval_seconds: 60
+daemon:
+  polling:
+    interval_seconds: 60
 "#,
         )
         .expect("config");
         let policies = config.repo_policies();
         let repo_ids = config.repo_ids();
 
-        let count = detect_once(&github, &db, &config, "bob", &repo_ids, &policies)
+        let count = detect_once(&github, &db, "bob", &repo_ids, &policies)
             .await
             .expect("should succeed");
         assert_eq!(count, 1);
@@ -501,7 +503,7 @@ polling:
         let policies = config.repo_policies();
         let repo_ids = config.repo_ids();
 
-        let count = detect_once(&github, &db, &config, "bob", &repo_ids, &policies)
+        let count = detect_once(&github, &db, "bob", &repo_ids, &policies)
             .await
             .expect("should succeed");
         assert_eq!(count, 1);
@@ -523,7 +525,7 @@ polling:
         let policies = config.repo_policies();
         let repo_ids = config.repo_ids();
 
-        let count = detect_once(&github, &db, &config, "bob", &repo_ids, &policies)
+        let count = detect_once(&github, &db, "bob", &repo_ids, &policies)
             .await
             .expect("should succeed");
         assert_eq!(count, 0);
@@ -541,7 +543,7 @@ polling:
             username: "bob".into(),
             prs: vec![make_pr(1, "old_sha")],
         };
-        let count1 = detect_once(&github1, &db, &config, "bob", &repo_ids, &policies)
+        let count1 = detect_once(&github1, &db, "bob", &repo_ids, &policies)
             .await
             .expect("should succeed");
         assert_eq!(count1, 1);
@@ -551,7 +553,7 @@ polling:
             username: "bob".into(),
             prs: vec![make_pr(1, "new_sha")],
         };
-        let count2 = detect_once(&github2, &db, &config, "bob", &repo_ids, &policies)
+        let count2 = detect_once(&github2, &db, "bob", &repo_ids, &policies)
             .await
             .expect("should succeed");
         assert_eq!(count2, 1);
@@ -572,7 +574,7 @@ polling:
         let policies = config.repo_policies();
         let repo_ids = config.repo_ids();
 
-        let count = detect_once(&github, &db, &config, "bob", &repo_ids, &policies)
+        let count = detect_once(&github, &db, "bob", &repo_ids, &policies)
             .await
             .expect("should succeed");
         assert_eq!(count, 0);
@@ -586,8 +588,9 @@ repos:
     - repo: org/repo
       skip_self_authored: false
       skip_reviewer_check: true
-polling:
-  interval_seconds: 60
+daemon:
+  polling:
+    interval_seconds: 60
 "#,
         )
         .expect("config should parse")
@@ -610,7 +613,7 @@ polling:
         let policies = config.repo_policies();
         let repo_ids = config.repo_ids();
 
-        let count = detect_once(&github, &db, &config, "alice", &repo_ids, &policies)
+        let count = detect_once(&github, &db, "alice", &repo_ids, &policies)
             .await
             .expect("should succeed");
         assert_eq!(count, 1);
@@ -627,8 +630,9 @@ repos:
   allowlist:
     - repo: org/repo
       review_on_push: false
-polling:
-  interval_seconds: 60
+daemon:
+  polling:
+    interval_seconds: 60
 "#,
         )
         .expect("config should parse")
@@ -646,7 +650,7 @@ polling:
             username: "bob".into(),
             prs: vec![make_pr(1, "old_sha")],
         };
-        let count1 = detect_once(&github1, &db, &config, "bob", &repo_ids, &policies)
+        let count1 = detect_once(&github1, &db, "bob", &repo_ids, &policies)
             .await
             .expect("should succeed");
         assert_eq!(count1, 1);
@@ -661,7 +665,7 @@ polling:
             username: "bob".into(),
             prs: vec![make_pr(1, "new_sha")],
         };
-        let count2 = detect_once(&github2, &db, &config, "bob", &repo_ids, &policies)
+        let count2 = detect_once(&github2, &db, "bob", &repo_ids, &policies)
             .await
             .expect("should succeed");
         assert_eq!(count2, 0, "succeeded PR should not be re-queued");
@@ -679,7 +683,7 @@ polling:
             username: "bob".into(),
             prs: vec![make_pr(1, "old_sha")],
         };
-        let count1 = detect_once(&github1, &db, &config, "bob", &repo_ids, &policies)
+        let count1 = detect_once(&github1, &db, "bob", &repo_ids, &policies)
             .await
             .expect("should succeed");
         assert_eq!(count1, 1);
@@ -690,7 +694,7 @@ polling:
             username: "bob".into(),
             prs: vec![make_pr(1, "new_sha")],
         };
-        let count2 = detect_once(&github2, &db, &config, "bob", &repo_ids, &policies)
+        let count2 = detect_once(&github2, &db, "bob", &repo_ids, &policies)
             .await
             .expect("should succeed");
         assert_eq!(
@@ -708,7 +712,7 @@ polling:
         db.cancel_queued_requested().expect("sweep");
 
         // Third cycle: now the old job is canceled, new job should be enqueued.
-        let count3 = detect_once(&github2, &db, &config, "bob", &repo_ids, &policies)
+        let count3 = detect_once(&github2, &db, "bob", &repo_ids, &policies)
             .await
             .expect("should succeed");
         assert_eq!(
@@ -729,7 +733,7 @@ polling:
             username: "bob".into(),
             prs: vec![make_pr(1, "old_sha")],
         };
-        let count1 = detect_once(&github1, &db, &config, "bob", &repo_ids, &policies)
+        let count1 = detect_once(&github1, &db, "bob", &repo_ids, &policies)
             .await
             .expect("should succeed");
         assert_eq!(count1, 1);
@@ -743,7 +747,7 @@ polling:
             username: "bob".into(),
             prs: vec![make_pr(1, "new_sha")],
         };
-        let count2 = detect_once(&github2, &db, &config, "bob", &repo_ids, &policies)
+        let count2 = detect_once(&github2, &db, "bob", &repo_ids, &policies)
             .await
             .expect("should succeed");
         assert_eq!(count2, 1, "failed job should allow retry");
@@ -762,7 +766,7 @@ polling:
             username: "bob".into(),
             prs: vec![make_pr(1, "old_sha")],
         };
-        let count1 = detect_once(&github1, &db, &config, "bob", &repo_ids, &policies)
+        let count1 = detect_once(&github1, &db, "bob", &repo_ids, &policies)
             .await
             .expect("should succeed");
         assert_eq!(count1, 1);
@@ -776,7 +780,7 @@ polling:
             username: "bob".into(),
             prs: vec![make_pr(1, "new_sha")],
         };
-        let count2 = detect_once(&github2, &db, &config, "bob", &repo_ids, &policies)
+        let count2 = detect_once(&github2, &db, "bob", &repo_ids, &policies)
             .await
             .expect("should succeed");
         assert_eq!(count2, 1, "default behavior should re-queue on SHA change");
@@ -794,7 +798,7 @@ polling:
             username: "bob".into(),
             prs: vec![make_pr(1, "old_sha")],
         };
-        let count1 = detect_once(&github1, &db, &config, "bob", &repo_ids, &policies)
+        let count1 = detect_once(&github1, &db, "bob", &repo_ids, &policies)
             .await
             .expect("should succeed");
         assert_eq!(count1, 1);
@@ -809,7 +813,7 @@ polling:
             username: "bob".into(),
             prs: vec![make_pr(1, "new_sha")],
         };
-        let count2 = detect_once(&github2, &db, &config, "bob", &repo_ids, &policies)
+        let count2 = detect_once(&github2, &db, "bob", &repo_ids, &policies)
             .await
             .expect("should succeed");
         assert_eq!(
@@ -828,7 +832,7 @@ polling:
             .expect("complete canceled");
 
         // Third cycle: now the old job is canceled, new job should be enqueued.
-        let count3 = detect_once(&github2, &db, &config, "bob", &repo_ids, &policies)
+        let count3 = detect_once(&github2, &db, "bob", &repo_ids, &policies)
             .await
             .expect("should succeed");
         assert_eq!(
@@ -847,20 +851,21 @@ polling:
         let config = Config::from_yaml(
             r#"
 repos:
+  defaults:
+    model: gpt-5.4
   allowlist:
     - repo: org/repo
       model: gpt-5.3-codex
-runner:
-  model: gpt-5.4
-polling:
-  interval_seconds: 60
+daemon:
+  polling:
+    interval_seconds: 60
 "#,
         )
         .expect("config");
         let policies = config.repo_policies();
         let repo_ids = config.repo_ids();
 
-        let count = detect_once(&github, &db, &config, "bob", &repo_ids, &policies)
+        let count = detect_once(&github, &db, "bob", &repo_ids, &policies)
             .await
             .expect("should succeed");
         assert_eq!(count, 1);
@@ -887,19 +892,20 @@ polling:
         let config = Config::from_yaml(
             r#"
 repos:
+  defaults:
+    model: gpt-5.4
   allowlist:
     - repo: org/repo
-runner:
-  model: gpt-5.4
-polling:
-  interval_seconds: 60
+daemon:
+  polling:
+    interval_seconds: 60
 "#,
         )
         .expect("config");
         let policies = config.repo_policies();
         let repo_ids = config.repo_ids();
 
-        let count = detect_once(&github, &db, &config, "bob", &repo_ids, &policies)
+        let count = detect_once(&github, &db, "bob", &repo_ids, &policies)
             .await
             .expect("should succeed");
         assert_eq!(count, 1);
@@ -927,7 +933,7 @@ polling:
         let policies = config.repo_policies();
         let repo_ids = config.repo_ids();
 
-        let count = detect_once(&github, &db, &config, "bob", &repo_ids, &policies)
+        let count = detect_once(&github, &db, "bob", &repo_ids, &policies)
             .await
             .expect("should succeed");
         assert_eq!(count, 1);
@@ -952,7 +958,7 @@ polling:
             username: "bob".into(),
             prs: vec![make_pr(1, "old_sha")],
         };
-        let count1 = detect_once(&github1, &db, &config, "bob", &repo_ids, &policies)
+        let count1 = detect_once(&github1, &db, "bob", &repo_ids, &policies)
             .await
             .expect("should succeed");
         assert_eq!(count1, 1);
@@ -967,7 +973,7 @@ polling:
             username: "bob".into(),
             prs: vec![make_pr(1, "new_sha")],
         };
-        let count2 = detect_once(&github2, &db, &config, "bob", &repo_ids, &policies)
+        let count2 = detect_once(&github2, &db, "bob", &repo_ids, &policies)
             .await
             .expect("should succeed");
         assert_eq!(
@@ -986,7 +992,7 @@ polling:
             .expect("complete canceled");
 
         // Third cycle: now the old job is canceled, new job should be enqueued.
-        let count3 = detect_once(&github2, &db, &config, "bob", &repo_ids, &policies)
+        let count3 = detect_once(&github2, &db, "bob", &repo_ids, &policies)
             .await
             .expect("should succeed");
         assert_eq!(
@@ -1002,8 +1008,9 @@ repos:
   allowlist:
     - repo: org/repo
       ignore_prs: [1, 42]
-polling:
-  interval_seconds: 60
+daemon:
+  polling:
+    interval_seconds: 60
 "#,
         )
         .expect("config should parse")
@@ -1020,7 +1027,7 @@ polling:
         let policies = config.repo_policies();
         let repo_ids = config.repo_ids();
 
-        let count = detect_once(&github, &db, &config, "bob", &repo_ids, &policies)
+        let count = detect_once(&github, &db, "bob", &repo_ids, &policies)
             .await
             .expect("should succeed");
         assert_eq!(count, 0, "ignored PR should not be enqueued");
@@ -1040,7 +1047,7 @@ polling:
         let policies = config.repo_policies();
         let repo_ids = config.repo_ids();
 
-        let count = detect_once(&github, &db, &config, "bob", &repo_ids, &policies)
+        let count = detect_once(&github, &db, "bob", &repo_ids, &policies)
             .await
             .expect("should succeed");
         assert_eq!(count, 1, "non-ignored PR should be enqueued");
