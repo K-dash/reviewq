@@ -79,6 +79,7 @@ This project ships 127+ skills from [Everything Claude Code](https://github.com/
 |-------------------------------------------------------------------------------------|---------------------------------------------------------------|
 | Starting work on main                                                               | `create-branch`                                               |
 | Staged changes ready                                                                | `commit-oss` (Conventional Commits)                           |
+| Branch is committed and ready to open a PR                                          | `/ship` command (runs `make all`, pushes, drafts PR title/body, opens PR) |
 | PR review requested on an existing PR                                               | `pr-review`                                                   |
 | Worktree session wrapping up                                                        | `cleanup-worktree` (with `--restore-cwd` per global CLAUDE.md)|
 
@@ -101,12 +102,13 @@ This project ships 127+ skills from [Everything Claude Code](https://github.com/
 5. `rust-review` + `security-review` → review before commit.
 6. `verification-loop` → run `make all`, fix fallout.
 7. `commit-oss` → conventional commit on the feature branch.
-8. `continuous-learning-v2` → capture reusable instincts before ending the session.
-9. After merge: `/cleanup-worktree --restore-cwd --delete-branch`.
+8. `/ship` → `make all`, push, draft PR title/body, open the PR.
+9. `continuous-learning-v2` → capture reusable instincts before ending the session.
+10. After merge: `/cleanup-worktree --restore-cwd --delete-branch`.
 
 ## Explicitly Out of Scope for reviewq
 
-Do **not** auto-invoke these (wrong stack or off-topic): `django-*`, `laravel-*`, `springboot-*`, `nextjs-turbopack`, `bun-runtime`, `flutter-*`, `kotlin-*`, `swift-*`, `pytorch-*`, `clickhouse-io`, `frontend-*`, `design-system`, `liquid-glass-design`, `energy-procurement`, `customs-trade-compliance`, `carrier-relationship-management`, `investor-*`, `market-research`, `crosspost`, `content-engine`, `article-writing`. They remain installed for ad-hoc use, but must not be part of the default loop.
+Skills for other language stacks (Python/Go/Java/Spring/Kotlin/Swift/PHP/Laravel/Django/Perl/C++/Flutter/JS frontend), unrelated business domains (logistics/fintech/energy/investor/market), and content/marketing workflows have been **removed** from `.claude/skills/` to keep the catalog Rust-focused. If a task genuinely needs one of those stacks, pull it from the global ECC catalog rather than re-adding it here.
 
 ## Escalation
 
