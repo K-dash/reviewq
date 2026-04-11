@@ -145,6 +145,7 @@ fn make_test_job(id: i64, command: Option<&str>) -> reviewq::types::Job {
         cancel_requested_at: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        completed_at: None,
     }
 }
 

@@ -88,6 +88,7 @@ fn make_job(id: i64, status: JobStatus, owner: &str, repo: &str) -> Job {
         cancel_requested_at: None,
         created_at: fixed_time(),
         updated_at: fixed_time(),
+        completed_at: None,
     }
 }
 
@@ -214,6 +215,40 @@ fn queue_renders_status_summary_counts_by_state() {
     assert_buffer_contains(&term, "Running: 1");
     assert_buffer_contains(&term, "Done: 1");
     assert_buffer_contains(&term, "Failed: 1");
+}
+
+#[test]
+fn queue_shows_completed_header_and_em_dash_for_unfinished_jobs() {
+    // The queue table should expose a "Completed" column header so users
+    // can see at a glance when a review finished. Non-terminal jobs have
+    // no completion time, so the cell must render an em dash placeholder
+    // instead of a blank or "N/A" string. This guards both the header
+    // label and the placeholder rendering in one pass.
+    let mut term = test_terminal(120, 24);
+    let (mut app, _tmp) = make_app();
+    app.update_jobs(vec![make_job(1, JobStatus::Queued, "o", "r")]);
+    draw_queue(&mut term, &mut app);
+    assert_buffer_contains(&term, "Completed");
+    assert_buffer_contains(&term, "—");
+}
+
+#[test]
+fn queue_renders_completed_timestamp_for_succeeded_job() {
+    // A terminal (Succeeded) job with a concrete completion time must
+    // render the formatted "YYYY-MM-DD HH:MM" value in the Completed
+    // column, not the em dash placeholder. This catches the regression
+    // where the column is wired up but the timestamp is silently dropped.
+    let mut term = test_terminal(120, 24);
+    let (mut app, _tmp) = make_app();
+    let completion = DateTime::parse_from_rfc3339("2026-02-03T04:05:06Z")
+        .expect("valid rfc3339 literal")
+        .with_timezone(&Utc);
+    app.update_jobs(vec![Job {
+        completed_at: Some(completion),
+        ..make_job(1, JobStatus::Succeeded, "o", "r")
+    }]);
+    draw_queue(&mut term, &mut app);
+    assert_buffer_contains(&term, "2026-02-03 04:05");
 }
 
 #[test]

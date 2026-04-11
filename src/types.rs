@@ -378,6 +378,11 @@ pub struct Job {
     pub cancel_requested_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Wall-clock time at which the job first reached a terminal state
+    /// (Succeeded / Failed / Canceled). `None` while the job is queued,
+    /// leased, or running. Surfaced in the TUI queue view so users can
+    /// see when each review actually finished.
+    pub completed_at: Option<DateTime<Utc>>,
 }
 
 impl Job {
