@@ -279,6 +279,11 @@ impl JobStore for Database {
 
     fn retry_job(&self, id: i64) -> Result<()> {
         let conn = self.lock_conn();
+        // The CANCELING UI state is a composite — status is non-terminal
+        // (running/queued/leased) AND cancel_requested_at is set. A row
+        // stuck in that state after the runner died mid-cancel must be
+        // recoverable, so the WHERE clause accepts it alongside the
+        // plain Failed / Canceled rows.
         let rows = conn.execute(
             "UPDATE jobs SET status = 'queued',
                     retry_count = 0,
@@ -293,14 +298,17 @@ impl JobStore for Database {
                     worktree_path = NULL,
                     cancel_requested_at = NULL,
                     updated_at = datetime('now')
-             WHERE id = ?1 AND status IN ('failed', 'canceled')",
+             WHERE id = ?1 AND (
+                    status IN ('failed', 'canceled')
+                    OR (status IN ('running', 'queued', 'leased')
+                        AND cancel_requested_at IS NOT NULL)
+             )",
             params![id],
         )?;
         if rows == 0 {
-            tracing::warn!(
-                job_id = id,
-                "retry_job() matched 0 rows — job may not be in a retriable state"
-            );
+            // Surface the no-op so the TUI can flash a clear message
+            // instead of a false-positive "Retry requested".
+            return Err(ReviewqError::Database(rusqlite::Error::QueryReturnedNoRows));
         }
         Ok(())
     }
@@ -880,12 +888,63 @@ mod tests {
     }
 
     #[test]
-    fn retry_noop_on_non_terminal() {
+    fn retry_promotes_canceling_row_back_to_queued() {
+        // A job stuck in the CANCELING composite state (status=running with
+        // cancel_requested_at set) must be retriable: the runner may have
+        // died mid-cancel and the user should be able to recover the row.
+        let db = test_db();
+        let job = db.enqueue(sample_job()).expect("enqueue");
+        let leased = db.lease_next().expect("lease").expect("has job");
+        db.mark_running(leased.id, 4321).expect("mark running");
+        db.request_cancel(job.id).expect("request_cancel");
+
+        db.retry_job(job.id).expect("retry");
+
+        let jobs = db.list_jobs(&JobFilter::default()).expect("list");
+        assert_eq!(jobs[0].status, JobStatus::Queued);
+        assert_eq!(jobs[0].retry_count, 0);
+        assert!(jobs[0].cancel_requested_at.is_none());
+        assert!(jobs[0].pid.is_none());
+        assert!(jobs[0].leased_at.is_none());
+        assert!(jobs[0].lease_expires.is_none());
+        assert!(jobs[0].worktree_path.is_none());
+    }
+
+    #[test]
+    fn retry_promotes_queued_cancel_requested_row_back_to_queued() {
+        // Mirror of retry_promotes_canceling_row_back_to_queued but
+        // for the queued-side branch of the CANCELING composite:
+        // request_cancel on a freshly-enqueued job leaves status=queued
+        // with cancel_requested_at set, which the SQL predicate also
+        // covers.
+        let db = test_db();
+        let job = db.enqueue(sample_job()).expect("enqueue");
+        db.request_cancel(job.id).expect("request_cancel");
+
+        db.retry_job(job.id).expect("retry");
+
+        let jobs = db.list_jobs(&JobFilter::default()).expect("list");
+        assert_eq!(jobs[0].status, JobStatus::Queued);
+        assert!(jobs[0].cancel_requested_at.is_none());
+    }
+
+    #[test]
+    fn retry_errors_on_non_terminal_without_cancel_request() {
+        // A plain running/queued/leased job with no cancel request is
+        // actively owned by the runner — retry must not silently no-op.
         let db = test_db();
         let job = db.enqueue(sample_job()).expect("enqueue");
 
-        // Job is queued — retry should be a no-op.
-        db.retry_job(job.id).expect("retry");
+        let err = db
+            .retry_job(job.id)
+            .expect_err("retry on non-terminal without cancel request must error");
+        assert!(
+            matches!(
+                err,
+                ReviewqError::Database(rusqlite::Error::QueryReturnedNoRows)
+            ),
+            "unexpected error variant: {err:?}",
+        );
 
         let jobs = db.list_jobs(&JobFilter::default()).expect("list");
         assert_eq!(jobs[0].status, JobStatus::Queued);
@@ -893,16 +952,34 @@ mod tests {
     }
 
     #[test]
-    fn retry_noop_on_succeeded() {
+    fn retry_errors_on_succeeded() {
         let db = test_db();
         let job = db.enqueue(sample_job()).expect("enqueue");
         db.complete(job.id, JobStatus::Succeeded, Some(0))
             .expect("complete");
 
-        db.retry_job(job.id).expect("retry");
+        let err = db
+            .retry_job(job.id)
+            .expect_err("retry on succeeded must error");
+        assert!(matches!(
+            err,
+            ReviewqError::Database(rusqlite::Error::QueryReturnedNoRows)
+        ));
 
         let jobs = db.list_jobs(&JobFilter::default()).expect("list");
         assert_eq!(jobs[0].status, JobStatus::Succeeded);
+    }
+
+    #[test]
+    fn retry_errors_when_job_does_not_exist() {
+        let db = test_db();
+        let err = db
+            .retry_job(9999)
+            .expect_err("retry on missing id must error");
+        assert!(matches!(
+            err,
+            ReviewqError::Database(rusqlite::Error::QueryReturnedNoRows)
+        ));
     }
 
     #[test]

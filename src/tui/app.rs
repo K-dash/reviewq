@@ -308,7 +308,16 @@ impl App {
             }
             Action::RetryJob => {
                 if let Some(job) = self.selected_job() {
-                    if job.status == JobStatus::Failed || job.status == JobStatus::Canceled {
+                    // Retry is allowed for terminal Failed/Canceled rows and
+                    // for the CANCELING composite (non-terminal + cancel
+                    // requested) so a user can recover a row stranded by a
+                    // runner that died mid-cancel. Pure non-terminal rows
+                    // without a cancel request are still actively owned by
+                    // the runner and stay protected.
+                    let retriable = job.status == JobStatus::Failed
+                        || job.status == JobStatus::Canceled
+                        || (!job.status.is_terminal() && job.is_cancel_requested());
+                    if retriable {
                         let job_id = job.id;
                         self.pending_retry = Some(job_id);
                         self.pending_nudge = true;
@@ -670,6 +679,8 @@ mod tests {
     #[test]
     fn retry_job_rejected_for_non_terminal() {
         let (mut app, _tmp) = alive_app();
+        // Pure Running — no cancel request — is actively owned by the
+        // runner and must stay protected from retry at the dispatch layer.
         app.update_jobs(vec![make_job(1, JobStatus::Running)]);
         app.dispatch(Action::RetryJob);
         assert!(app.pending_retry.is_none());
@@ -680,6 +691,37 @@ mod tests {
                 .unwrap()
                 .contains("not in a retriable state")
         );
+    }
+
+    #[test]
+    fn retry_job_allows_canceling_state() {
+        // CANCELING is a composite UI state: status is non-terminal
+        // (running/leased/queued) AND cancel_requested_at is set. The
+        // user must be able to recover such a row via retry when the
+        // runner has died mid-cancel and nothing else will move it.
+        let (mut app, _tmp) = alive_app();
+        let mut job = make_job(1, JobStatus::Running);
+        job.cancel_requested_at = Some(Utc::now());
+        app.update_jobs(vec![job]);
+        app.dispatch(Action::RetryJob);
+        assert_eq!(app.pending_retry, Some(1));
+        assert!(app.pending_nudge);
+        assert!(
+            app.status_message
+                .as_deref()
+                .unwrap()
+                .contains("Retry requested")
+        );
+    }
+
+    #[test]
+    fn retry_job_allows_canceling_state_when_leased() {
+        let (mut app, _tmp) = alive_app();
+        let mut job = make_job(1, JobStatus::Leased);
+        job.cancel_requested_at = Some(Utc::now());
+        app.update_jobs(vec![job]);
+        app.dispatch(Action::RetryJob);
+        assert_eq!(app.pending_retry, Some(1));
     }
 
     // -------------------------------------------------------------------
