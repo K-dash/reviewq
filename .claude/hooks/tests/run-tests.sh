@@ -752,6 +752,25 @@ runcase "allow: Stop with tests-just-passed marker" stop-gate.sh 0 '{
 }'
 cleanup_session "$SID"
 
+# Stop with rust-files-edited marker actually runs `cargo clippy --all-targets
+# -- -D warnings` against the repo. The repo is clippy-clean (otherwise the
+# whole hook test suite would already be failing), so this should pass and
+# also set the tests-just-passed marker as a side effect.
+SID=$(scratch_session); mark_for_session "$SID" rust-files-edited
+runcase "allow: Stop runs clippy on a clean tree" stop-gate.sh 0 '{
+  "session_id":"'"$SID"'",
+  "hook_event_name":"Stop",
+  "cwd":"'"$REPO"'"
+}'
+if [[ -f "$REPO/.claude/.session/$SID/tests-just-passed" ]]; then
+    printf '  \e[32mPASS\e[0m Stop sets tests-just-passed after clippy success\n'
+    PASS=$((PASS + 1))
+else
+    printf '  \e[31mFAIL\e[0m Stop did not set tests-just-passed marker\n'
+    FAIL=$((FAIL + 1))
+fi
+cleanup_session "$SID"
+
 echo "== session-start.sh =="
 
 # session-start emits JSON on stdout; just verify exit code and that the
@@ -770,6 +789,52 @@ else
     FAIL=$((FAIL + 1))
 fi
 cleanup_session "$SID"
+
+# session-start should archive marker dirs older than 24h while preserving
+# the current session and any dirs that are still fresh. We seed three
+# scratch dirs:
+#   - one with mtime in the year 2000  → expected: archived
+#   - one with current mtime           → expected: kept in place
+#   - the current session              → expected: kept in place
+STALE_SID="iter5-ttl-stale-$$-$RANDOM"
+FRESH_SID="iter5-ttl-fresh-$$-$RANDOM"
+CURRENT_SID="iter5-ttl-current-$$-$RANDOM"
+mkdir -p "$REPO/.claude/.session/$STALE_SID" \
+         "$REPO/.claude/.session/$FRESH_SID" \
+         "$REPO/.claude/.session/$CURRENT_SID"
+# Year 2000 → unambiguously older than 24h regardless of clock skew.
+touch -t 200001010000 "$REPO/.claude/.session/$STALE_SID"
+# (Fresh and current dirs already have mtime = now from mkdir.)
+
+printf '%s' '{
+  "session_id":"'"$CURRENT_SID"'",
+  "hook_event_name":"SessionStart",
+  "cwd":"'"$REPO"'"
+}' | "$HOOKS/session-start.sh" >/dev/null 2>&1
+
+ttl_ok=1
+if [[ ! -d "$REPO/.claude/.session/.archive/$STALE_SID" ]]; then
+    ttl_ok=0
+    printf '  \e[31mFAIL\e[0m stale session dir was not archived\n'
+fi
+if [[ ! -d "$REPO/.claude/.session/$FRESH_SID" ]]; then
+    ttl_ok=0
+    printf '  \e[31mFAIL\e[0m fresh session dir was incorrectly archived\n'
+fi
+if [[ ! -d "$REPO/.claude/.session/$CURRENT_SID" ]]; then
+    ttl_ok=0
+    printf '  \e[31mFAIL\e[0m current session dir was incorrectly archived\n'
+fi
+if [[ "$ttl_ok" -eq 1 ]]; then
+    printf '  \e[32mPASS\e[0m session marker TTL archives stale dirs only\n'
+    PASS=$((PASS + 1))
+else
+    FAIL=$((FAIL + 1))
+fi
+# Cleanup all three plus the archived stale dir.
+rm -rf "$REPO/.claude/.session/.archive/$STALE_SID" \
+       "$REPO/.claude/.session/$FRESH_SID" \
+       "$REPO/.claude/.session/$CURRENT_SID"
 
 echo "== post-edit-rust.sh =="
 

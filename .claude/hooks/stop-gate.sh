@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Stop hook: when the agent signals "done", verify the build actually
-# compiles before letting the turn end. Emits a JSON `{"decision":"block"}`
-# response when the check fails so Claude is forced to keep working.
+# compiles AND passes clippy before letting the turn end. Emits a JSON
+# `{"decision":"block"}` response when the check fails so Claude is
+# forced to keep working.
 #
 # Rationale (from harness-engineering articles):
 #
@@ -14,14 +15,19 @@
 # Policy:
 #   - If no Rust source files were edited this session (no
 #     rust-files-edited marker), exit 0 (nothing to verify).
-#   - Otherwise run `cargo check --quiet` from the session's cwd.
-#     We use `check`, not `test`, because:
-#       * check catches ~95% of "silent done" lies (compile errors,
-#         missing imports, broken signatures),
-#       * test is slow enough that running it on every turn would make
-#         the agent loop sluggish,
-#       * commit-gate.sh already enforces full `cargo test` before a
-#         commit can land, which is the real quality gate.
+#   - Otherwise run `cargo clippy --quiet --all-targets -- -D warnings`
+#     from the session's cwd. We use clippy (not bare `cargo check`)
+#     because:
+#       * clippy is a strict superset of check — it catches every compile
+#         error AND every clippy lint, including doc-comment markdown
+#         violations (`clippy::doc_markdown`) that bare `check` misses,
+#       * the iter3→iter4 transition hit exactly this gap: a `>=` inside
+#         a doc comment escaped Stop and only failed at commit-gate after
+#         several minutes of wasted work,
+#       * benchmarked at ~1.5–2.2s on warm-cache reviewq, which is well
+#         within Stop-hook latency budget,
+#       * `cargo test` is still owned by commit-gate.sh — we don't run
+#         the full suite on every Stop, only the lint-and-typecheck pass.
 #   - On failure, emit `{"decision":"block","reason":...}` JSON so Claude
 #     sees it and keeps working.
 #   - Also honor a `tests-just-passed` marker: if the commit-gate (or a
@@ -73,16 +79,16 @@ if [[ ! -f "$cwd/Cargo.toml" ]]; then
 fi
 
 log_file="$(reviewq_session_dir)/stop-gate-check.log"
-if (cd "$cwd" && cargo check --quiet --all-targets) >"$log_file" 2>&1; then
+if (cd "$cwd" && cargo clippy --quiet --all-targets -- -D warnings) >"$log_file" 2>&1; then
     reviewq_mark tests-just-passed
-    reviewq_log_event allow "Stop: cargo check passed"
+    reviewq_log_event allow "Stop: cargo clippy passed"
     exit 0
 fi
 
 tail_output=$(tail -40 "$log_file")
-reason=$(printf 'Stop blocked: `cargo check` does not compile. You cannot claim "done" while the build is broken.\n\nLast 40 lines:\n%s\n\nFix the compile errors (and their root causes — do not #[allow] them) before ending the turn. The commit-gate will additionally enforce full clippy + test on git commit.' "$tail_output")
+reason=$(printf 'Stop blocked: `cargo clippy --all-targets -- -D warnings` failed. You cannot claim "done" while the build is broken or clippy reports warnings.\n\nLast 40 lines:\n%s\n\nFix the underlying issue (do not `#[allow]` it) before ending the turn. The commit-gate will additionally enforce full `cargo test` on git commit.' "$tail_output")
 
-reviewq_log_event block "Stop: cargo check failed"
+reviewq_log_event block "Stop: cargo clippy failed"
 
 # Emit Stop-hook JSON on stdout so Claude treats this as a block-with-
 # guidance rather than a fatal error.
