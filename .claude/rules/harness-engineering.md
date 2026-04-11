@@ -98,3 +98,34 @@ the current session at any time. The log is session-scoped and does
 not persist across sessions — for long-lived debugging, copy relevant
 lines into `.claude/state/PROGRESS.md`.
 
+## Known git worktree gotchas
+
+Removing a worktree does **not** always clean up git's internal state
+cleanly on macOS:
+
+- **fsmonitor daemon survival**: if `git worktree remove` runs while a
+  per-worktree `fsmonitor--daemon` is still alive, the daemon keeps
+  running and pointing at the deleted path. Subsequent `git rev-parse
+  --show-toplevel` calls from anywhere in the repo may return the
+  deleted path, and `git checkout -- .` fails with *"fatal: this
+  operation must be run in a work tree"*.
+- **stale admin dir**: the `.git/worktrees/<name>/` dir can be left
+  behind with dangling `gitdir` pointer.
+- **stale IPC socket**: `.git/fsmonitor--daemon.ipc` can point at a
+  dead daemon.
+
+`session-start.sh` now runs a best-effort cleanup on every session
+bootstrap: `git worktree prune`, `git fsmonitor--daemon stop`, and
+removal of a dangling IPC socket. Output is logged under
+`.claude/.session/<session_id>/session-start-cleanup.log`.
+
+If you hit this mid-session, the manual recovery is:
+
+```bash
+git worktree prune
+git fsmonitor--daemon stop || true
+rm -f .git/fsmonitor--daemon.ipc
+# Or: disable fsmonitor on this repo entirely
+git config core.fsmonitor false
+```
+
