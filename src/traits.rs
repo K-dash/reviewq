@@ -127,6 +127,53 @@ pub trait JobStore: Send + Sync {
     /// Returns true when a non-failed, non-canceled job exists for the
     /// (repo, pr_number, agent) triple, regardless of head SHA.
     fn is_pr_reviewed(&self, repo: &RepoId, pr_number: u64, agent: &AgentKind) -> Result<bool>;
+
+    /// Return `(repo, worktree_path)` pairs for terminal jobs whose
+    /// `worktree_path` is set and whose `updated_at` is at least
+    /// `ttl_minutes` old. Excludes jobs still `queued` / `leased` /
+    /// `running`.
+    ///
+    /// Used by the worktree cleanup loop to resolve each expired
+    /// worktree back to its owning repo so `git worktree remove` can
+    /// be called against the correct base clone.
+    fn expired_terminal_worktrees(
+        &self,
+        ttl_minutes: u64,
+    ) -> Result<Vec<(RepoId, std::path::PathBuf)>>;
+
+    /// Return every `worktree_path` currently known to the DB, across
+    /// all job statuses (queued / leased / running / terminal).
+    ///
+    /// Used by the cleanup loop to protect worktrees that belong to
+    /// in-flight jobs from being reaped by the orphan pass before
+    /// their owning row has transitioned to a terminal status.
+    ///
+    /// This is **intentionally a separate call** from
+    /// `expired_terminal_worktrees`: the cleanup loop issues both
+    /// back-to-back under two different `Mutex` locks, which creates
+    /// a theoretical race where a job that starts between the two
+    /// queries is absent from both snapshots. The filesystem mtime
+    /// guard inside `worktree::cleanup_by_owner`'s orphan pass is the
+    /// backstop: a just-created directory cannot yet be old enough
+    /// to trigger TTL expiry unless the operator configures
+    /// `daemon.cleanup.ttl_minutes = 0`, which is not a supported
+    /// production configuration.
+    fn known_worktree_paths(&self) -> Result<Vec<std::path::PathBuf>>;
+
+    /// Clear the `worktree_path` column for any job whose current
+    /// value matches `path`.
+    ///
+    /// Called after a successful `git worktree remove` so the next
+    /// cleanup cycle does not re-query the same row and reissue a
+    /// removal that will fail because the directory is already gone.
+    ///
+    /// In practice each path is unique (the runner names worktrees
+    /// `reviewq-{job_id}`), so this matches at most one row. The SQL
+    /// filter (`WHERE worktree_path = ?1`) is written as an
+    /// unrestricted `UPDATE` so future schema changes that relax
+    /// uniqueness still produce well-defined behavior — all matching
+    /// rows are cleared.
+    fn clear_worktree_path(&self, path: &std::path::Path) -> Result<()>;
 }
 
 // ---------------------------------------------------------------------------

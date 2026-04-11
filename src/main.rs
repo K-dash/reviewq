@@ -1,7 +1,9 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
+use reviewq::traits::JobStore;
 use tokio::sync::watch;
 use tracing::{error, info, warn};
 
@@ -161,8 +163,9 @@ async fn run_daemon(
 
     // Spawn the worktree cleanup loop.
     let cleanup_config_rx = config_rx.clone();
+    let cleanup_db = Arc::clone(&db);
     let mut cleanup_handle =
-        tokio::spawn(async move { worktree_cleanup_loop(cleanup_config_rx).await });
+        tokio::spawn(async move { worktree_cleanup_loop(cleanup_config_rx, cleanup_db).await });
 
     // Wait for shutdown signal, reload signal, or any task failure/exit.
     // Track which task already resolved to avoid double-await.
@@ -281,39 +284,121 @@ fn reload_config(
 
 /// Periodically remove expired worktrees.
 ///
-/// Uses a single `base_repo` for `git worktree remove` calls, falling back
-/// through `repos.defaults.base_repo_path` → process cwd. This matches the
-/// pre-refactor behavior and intentionally does **not** sweep every distinct
-/// per-repo `base_repo_path`, because `worktree::cleanup` currently scans a
-/// shared `worktree_root` and has no way to pair each reviewq worktree with
-/// its owning repo. Supporting multiple clone locations correctly requires
-/// owner tracking and is tracked as a follow-up (see plan: `cleanup
-/// semantics` in Phase 3).
-async fn worktree_cleanup_loop(mut config_rx: watch::Receiver<Arc<reviewq::config::Config>>) {
+/// DB-driven: queries `JobStore::expired_terminal_worktrees` to get
+/// `(repo, worktree_path)` pairs for every terminal job whose TTL has
+/// elapsed, resolves each `repo` back to its
+/// `RepoPolicy.base_repo_path` via the policy chain, and hands the
+/// list to `worktree::cleanup_by_owner` so `git worktree remove` runs
+/// against the correct base clone.
+///
+/// The set of **currently-known** worktree paths (all statuses, not
+/// just expired terminal) is passed through as `protected` so the
+/// orphan pass inside `cleanup_by_owner` cannot reap a directory
+/// belonging to an in-flight job whose status has not yet transitioned
+/// to terminal.
+///
+/// After each successful tracked removal, the loop clears the
+/// corresponding `jobs.worktree_path` column so the next cycle does
+/// not re-query the same row and reissue a removal against a
+/// directory that is already gone.
+async fn worktree_cleanup_loop(
+    mut config_rx: watch::Receiver<Arc<reviewq::config::Config>>,
+    store: Arc<reviewq::db::Database>,
+) {
     loop {
         let config = config_rx.borrow_and_update().clone();
-        let base_repo = config
+        let worktree_root = config.daemon.execution.effective_worktree_root();
+        let interval = std::time::Duration::from_secs(config.daemon.cleanup.interval_minutes * 60);
+        let ttl_minutes = config.daemon.cleanup.ttl_minutes;
+
+        // Fallback base repo for the orphan pass only. Tracked
+        // worktrees resolve their own base repo per-policy below —
+        // rows for which that resolution fails are skipped, not
+        // silently retargeted at this fallback.
+        let orphan_base_repo = config
             .repos
             .defaults
             .base_repo_path
             .clone()
             .unwrap_or_else(|| std::env::current_dir().expect("current directory is accessible"));
-        let worktree_root = config.daemon.execution.effective_worktree_root();
-        let interval = std::time::Duration::from_secs(config.daemon.cleanup.interval_minutes * 60);
 
         tokio::time::sleep(interval).await;
-        match reviewq::worktree::cleanup(
-            &base_repo,
+
+        // Snapshot every worktree path the DB currently knows about.
+        // The orphan pass inside `cleanup_by_owner` must exclude all
+        // of these so it cannot reap an in-flight job's worktree.
+        //
+        // This snapshot is taken *before* the `expired_terminal_worktrees`
+        // query below, and the two calls run under separate mutex
+        // locks. A job that starts between them will be missing from
+        // both sets — the mtime guard inside `cleanup_by_owner` is the
+        // backstop (a just-created directory cannot satisfy a
+        // sensibly-configured TTL). See `JobStore::known_worktree_paths`
+        // for the full atomicity argument.
+        let mut protected: HashSet<PathBuf> = match store.known_worktree_paths() {
+            Ok(paths) => paths.into_iter().collect(),
+            Err(e) => {
+                warn!(error = %e, "failed to snapshot known worktree paths");
+                continue;
+            }
+        };
+
+        // Pull the expired terminal worktrees and pair each with its
+        // owning base repo. If `base_repo_for` returns `None` (the
+        // repo was dropped from the allowlist between job completion
+        // and cleanup), skip the row and keep it in `protected` so
+        // the orphan pass does not pick it up with a wrong base.
+        let owned: Vec<(PathBuf, PathBuf)> = match store.expired_terminal_worktrees(ttl_minutes) {
+            Ok(rows) => {
+                let mut out = Vec::with_capacity(rows.len());
+                for (repo, wt_path) in rows {
+                    match config.base_repo_for(&repo) {
+                        Some(base) => out.push((base, wt_path)),
+                        None => {
+                            warn!(
+                                repo = %repo,
+                                path = %wt_path.display(),
+                                "base_repo_path not configured for repo; skipping worktree cleanup"
+                            );
+                            protected.insert(wt_path);
+                        }
+                    }
+                }
+                out
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to query expired worktrees");
+                continue;
+            }
+        };
+
+        match reviewq::worktree::cleanup_by_owner(
+            &owned,
             &worktree_root,
-            config.daemon.cleanup.ttl_minutes,
+            ttl_minutes,
+            &orphan_base_repo,
+            &protected,
         ) {
-            Ok(removed) if !removed.is_empty() => {
-                info!(count = removed.len(), "cleaned up expired worktrees");
+            Ok(removed) => {
+                if !removed.is_empty() {
+                    info!(count = removed.len(), "cleaned up expired worktrees");
+                }
+                // NULL out the `worktree_path` column for every path
+                // we successfully removed (tracked and orphan), so
+                // the next cycle's DB query does not return them.
+                for path in &removed {
+                    if let Err(e) = store.clear_worktree_path(path) {
+                        warn!(
+                            path = %path.display(),
+                            error = %e,
+                            "failed to clear worktree_path after removal"
+                        );
+                    }
+                }
             }
             Err(e) => {
                 warn!(error = %e, "worktree cleanup failed");
             }
-            _ => {}
         }
     }
 }
