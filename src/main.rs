@@ -282,7 +282,7 @@ fn reload_config(
     info!("config reloaded successfully");
 }
 
-/// Periodically remove expired worktrees.
+/// Execute one full worktree cleanup pass.
 ///
 /// DB-driven: queries `JobStore::expired_terminal_worktrees` to get
 /// `(repo, worktree_path)` pairs for every terminal job whose TTL has
@@ -292,114 +292,150 @@ fn reload_config(
 /// against the correct base clone.
 ///
 /// The set of **currently-known** worktree paths (all statuses, not
-/// just expired terminal) is passed through as `protected` so the
+/// just expired terminal) is snapshotted into `protected` so the
 /// orphan pass inside `cleanup_by_owner` cannot reap a directory
 /// belonging to an in-flight job whose status has not yet transitioned
 /// to terminal.
 ///
-/// After each successful tracked removal, the loop clears the
-/// corresponding `jobs.worktree_path` column so the next cycle does
-/// not re-query the same row and reissue a removal against a
-/// directory that is already gone.
+/// Rows whose repo is no longer in the allowlist (the user edited
+/// config between job completion and cleanup) are **skipped** with a
+/// `warn!` rather than silently retargeted at a fallback base. Their
+/// paths are folded into `protected` so the orphan pass will not pick
+/// them up with the wrong base either.
+///
+/// After each successful tracked or orphan removal, the corresponding
+/// `jobs.worktree_path` column is cleared so the next cycle's query
+/// does not re-issue a removal against a directory that is already
+/// gone.
+///
+/// This is a synchronous function pulled out of the async loop so it
+/// can be unit-tested without standing up a tokio runtime. The async
+/// loop calls it via `tokio::task::spawn_blocking` because the
+/// underlying work — `git worktree remove` subprocesses and
+/// filesystem walks — would otherwise stall a runtime worker.
+fn cleanup_once(
+    store: &reviewq::db::Database,
+    config: &reviewq::config::Config,
+) -> reviewq::error::Result<Vec<PathBuf>> {
+    let worktree_root = config.daemon.execution.effective_worktree_root();
+    let ttl_minutes = config.daemon.cleanup.ttl_minutes;
+
+    // Fallback base repo for the orphan pass only. Tracked
+    // worktrees resolve their own base repo per-policy below —
+    // rows for which that resolution fails are skipped, not
+    // silently retargeted at this fallback. The CWD lookup is
+    // a `?` rather than an `expect()` because `cleanup_once`
+    // runs inside `spawn_blocking`, and a panic there would
+    // surface as a `JoinError` which is harder to debug than
+    // a normal `Err` log line.
+    let orphan_base_repo = match config.repos.defaults.base_repo_path.clone() {
+        Some(p) => p,
+        None => std::env::current_dir().map_err(|e| {
+            reviewq::error::ReviewqError::Process(format!(
+                "failed to read current directory for orphan-pass fallback: {e}"
+            ))
+        })?,
+    };
+
+    // Snapshot every worktree path the DB currently knows about.
+    // The orphan pass inside `cleanup_by_owner` must exclude all
+    // of these so it cannot reap an in-flight job's worktree.
+    //
+    // This snapshot is taken *before* the `expired_terminal_worktrees`
+    // query below, and the two calls run under separate mutex
+    // locks. A job that starts between them will be missing from
+    // both sets — the mtime guard inside `cleanup_by_owner` is the
+    // backstop (a just-created directory cannot satisfy a
+    // sensibly-configured TTL). See `JobStore::known_worktree_paths`
+    // for the full atomicity argument.
+    let mut protected: HashSet<PathBuf> = store.known_worktree_paths()?.into_iter().collect();
+
+    // Pull the expired terminal worktrees and pair each with its
+    // owning base repo. If `base_repo_for` returns `None` (the
+    // repo was dropped from the allowlist between job completion
+    // and cleanup), skip the row and keep it in `protected` so
+    // the orphan pass does not pick it up with a wrong base.
+    let mut owned: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for (repo, wt_path) in store.expired_terminal_worktrees(ttl_minutes)? {
+        match config.base_repo_for(&repo) {
+            Some(base) => owned.push((base, wt_path)),
+            None => {
+                warn!(
+                    repo = %repo,
+                    path = %wt_path.display(),
+                    "base_repo_path not configured for repo; skipping worktree cleanup"
+                );
+                protected.insert(wt_path);
+            }
+        }
+    }
+
+    let removed = reviewq::worktree::cleanup_by_owner(
+        &owned,
+        &worktree_root,
+        ttl_minutes,
+        &orphan_base_repo,
+        &protected,
+    )?;
+
+    // NULL out the `worktree_path` column for every path we
+    // successfully removed (tracked and orphan), so the next
+    // cycle's DB query does not return them.
+    for path in &removed {
+        if let Err(e) = store.clear_worktree_path(path) {
+            warn!(
+                path = %path.display(),
+                error = %e,
+                "failed to clear worktree_path after removal"
+            );
+        }
+    }
+
+    Ok(removed)
+}
+
+/// Periodically remove expired worktrees.
+///
+/// Calls `cleanup_once` once per iteration, then sleeps for
+/// `daemon.cleanup.interval_minutes`. The sleep happens at the **end**
+/// of the loop body so the first sweep runs immediately on daemon
+/// startup — without that, daemon installs that are restarted before
+/// the first interval elapses would never sweep at all (a real bug
+/// for users who run reviewq intermittently).
+///
+/// `cleanup_once` is invoked through `tokio::task::spawn_blocking`
+/// because it spawns `git worktree remove` subprocesses and walks
+/// the filesystem; running that work directly on the async loop
+/// would stall a runtime worker.
 async fn worktree_cleanup_loop(
     mut config_rx: watch::Receiver<Arc<reviewq::config::Config>>,
     store: Arc<reviewq::db::Database>,
 ) {
     loop {
         let config = config_rx.borrow_and_update().clone();
-        let worktree_root = config.daemon.execution.effective_worktree_root();
         let interval = std::time::Duration::from_secs(config.daemon.cleanup.interval_minutes * 60);
-        let ttl_minutes = config.daemon.cleanup.ttl_minutes;
 
-        // Fallback base repo for the orphan pass only. Tracked
-        // worktrees resolve their own base repo per-policy below —
-        // rows for which that resolution fails are skipped, not
-        // silently retargeted at this fallback.
-        let orphan_base_repo = config
-            .repos
-            .defaults
-            .base_repo_path
-            .clone()
-            .unwrap_or_else(|| std::env::current_dir().expect("current directory is accessible"));
+        let store_for_blocking = Arc::clone(&store);
+        let config_for_blocking = Arc::clone(&config);
+        let join = tokio::task::spawn_blocking(move || {
+            cleanup_once(&store_for_blocking, &config_for_blocking)
+        })
+        .await;
+
+        // None of these arms break the loop — every error path
+        // logs and falls through to the sleep, so transient DB
+        // hiccups or one-off subprocess failures cannot wedge
+        // cleanup until the next daemon restart.
+        match join {
+            Ok(Ok(removed)) if !removed.is_empty() => {
+                info!(count = removed.len(), "cleaned up expired worktrees");
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => warn!(error = %e, "worktree cleanup failed"),
+            Err(e) => warn!(error = %e, "cleanup task panicked or was cancelled"),
+        }
 
         tokio::time::sleep(interval).await;
-
-        // Snapshot every worktree path the DB currently knows about.
-        // The orphan pass inside `cleanup_by_owner` must exclude all
-        // of these so it cannot reap an in-flight job's worktree.
-        //
-        // This snapshot is taken *before* the `expired_terminal_worktrees`
-        // query below, and the two calls run under separate mutex
-        // locks. A job that starts between them will be missing from
-        // both sets — the mtime guard inside `cleanup_by_owner` is the
-        // backstop (a just-created directory cannot satisfy a
-        // sensibly-configured TTL). See `JobStore::known_worktree_paths`
-        // for the full atomicity argument.
-        let mut protected: HashSet<PathBuf> = match store.known_worktree_paths() {
-            Ok(paths) => paths.into_iter().collect(),
-            Err(e) => {
-                warn!(error = %e, "failed to snapshot known worktree paths");
-                continue;
-            }
-        };
-
-        // Pull the expired terminal worktrees and pair each with its
-        // owning base repo. If `base_repo_for` returns `None` (the
-        // repo was dropped from the allowlist between job completion
-        // and cleanup), skip the row and keep it in `protected` so
-        // the orphan pass does not pick it up with a wrong base.
-        let owned: Vec<(PathBuf, PathBuf)> = match store.expired_terminal_worktrees(ttl_minutes) {
-            Ok(rows) => {
-                let mut out = Vec::with_capacity(rows.len());
-                for (repo, wt_path) in rows {
-                    match config.base_repo_for(&repo) {
-                        Some(base) => out.push((base, wt_path)),
-                        None => {
-                            warn!(
-                                repo = %repo,
-                                path = %wt_path.display(),
-                                "base_repo_path not configured for repo; skipping worktree cleanup"
-                            );
-                            protected.insert(wt_path);
-                        }
-                    }
-                }
-                out
-            }
-            Err(e) => {
-                warn!(error = %e, "failed to query expired worktrees");
-                continue;
-            }
-        };
-
-        match reviewq::worktree::cleanup_by_owner(
-            &owned,
-            &worktree_root,
-            ttl_minutes,
-            &orphan_base_repo,
-            &protected,
-        ) {
-            Ok(removed) => {
-                if !removed.is_empty() {
-                    info!(count = removed.len(), "cleaned up expired worktrees");
-                }
-                // NULL out the `worktree_path` column for every path
-                // we successfully removed (tracked and orphan), so
-                // the next cycle's DB query does not return them.
-                for path in &removed {
-                    if let Err(e) = store.clear_worktree_path(path) {
-                        warn!(
-                            path = %path.display(),
-                            error = %e,
-                            "failed to clear worktree_path after removal"
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(error = %e, "worktree cleanup failed");
-            }
-        }
     }
 }
 
@@ -492,5 +528,368 @@ mod tests {
 
         // No assertion on value since it stays the same; this test verifies
         // no panic and the "no changes detected" path executes.
+    }
+
+    // ----------------------------------------------------------------
+    // cleanup_once / worktree_cleanup_loop test helpers
+    // ----------------------------------------------------------------
+    //
+    // These mirror the helpers in `src/worktree.rs::tests`. Duplication
+    // is intentional: cargo `cfg(test)` is per-crate, so the binary's
+    // test build cannot import test-only items from the lib.
+
+    fn run_git(cwd: &std::path::Path, args: &[&str]) {
+        let mut cmd = std::process::Command::new("git");
+        cmd.env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE");
+        let output = cmd.args(args).current_dir(cwd).output().expect("git spawn");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn init_repo(path: &std::path::Path) {
+        std::fs::create_dir_all(path).expect("create repo dir");
+        run_git(path, &["init", "-q"]);
+        run_git(path, &["config", "user.email", "test@example.com"]);
+        run_git(path, &["config", "user.name", "test"]);
+        run_git(path, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(path.join("README.md"), "init\n").expect("write README");
+        run_git(path, &["add", "README.md"]);
+        run_git(path, &["commit", "-q", "-m", "init"]);
+    }
+
+    fn head_sha(repo: &std::path::Path) -> String {
+        let mut cmd = std::process::Command::new("git");
+        cmd.env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE");
+        let output = cmd
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo)
+            .output()
+            .expect("git rev-parse");
+        String::from_utf8(output.stdout)
+            .expect("utf8")
+            .trim()
+            .to_owned()
+    }
+
+    /// Insert a job, attach its worktree path, and mark it succeeded.
+    /// Returns the new job id.
+    fn enqueue_terminal_job_with_worktree(
+        db: &reviewq::db::Database,
+        owner: &str,
+        name: &str,
+        pr_number: u64,
+        head_sha: &str,
+        worktree_path: &std::path::Path,
+    ) -> i64 {
+        use reviewq::types::{AgentKind, JobStatus, NewJob, RepoId};
+        let new_job = NewJob {
+            repo: RepoId::new(owner, name),
+            pr_number,
+            head_sha: head_sha.to_owned(),
+            agent_kind: AgentKind::Claude,
+            command: Some("echo".into()),
+            prompt_template: None,
+            max_retries: 3,
+        };
+        let job = db.enqueue(new_job).expect("enqueue");
+        db.store_worktree_path(job.id, worktree_path)
+            .expect("store worktree path");
+        db.complete(job.id, JobStatus::Succeeded, Some(0))
+            .expect("complete");
+        job.id
+    }
+
+    /// Build a single-repo Config with the given worktree_root and
+    /// per-repo base_repo_path. The allowlist contains exactly
+    /// `<owner>/<name>`. Cleanup TTL is set in minutes; the loop
+    /// interval defaults to 60 minutes for tests that need a long
+    /// gap to prove "first sweep happens at startup".
+    fn build_test_config(
+        owner: &str,
+        name: &str,
+        base_repo: &std::path::Path,
+        worktree_root: &std::path::Path,
+        ttl_minutes: u64,
+        interval_minutes: u64,
+    ) -> reviewq::config::Config {
+        let yaml = format!(
+            "daemon:\n  \
+               execution:\n    \
+                 worktree_root: \"{wt_root}\"\n  \
+               cleanup:\n    \
+                 ttl_minutes: {ttl_minutes}\n    \
+                 interval_minutes: {interval_minutes}\n\
+             repos:\n  \
+               defaults:\n    \
+                 base_repo_path: \"{base_repo}\"\n  \
+               allowlist:\n    \
+                 - repo: {owner}/{name}\n",
+            wt_root = worktree_root.display(),
+            base_repo = base_repo.display(),
+        );
+        reviewq::config::Config::from_yaml(&yaml).expect("parse test config")
+    }
+
+    // ----------------------------------------------------------------
+    // cleanup_once tests
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn cleanup_once_removes_expired_tracked_worktree() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        let wt_root = tmp.path().join("worktrees");
+        std::fs::create_dir_all(&wt_root).expect("create wt_root");
+
+        let sha = head_sha(&repo);
+        let wt_path = reviewq::worktree::create(&repo, &wt_root, 1, &sha).expect("create wt");
+        assert!(wt_path.exists());
+
+        let db = reviewq::db::Database::open_in_memory().expect("db");
+        enqueue_terminal_job_with_worktree(&db, "owner", "repo", 1, &sha, &wt_path);
+
+        let config = build_test_config("owner", "repo", &repo, &wt_root, 0, 60);
+
+        let removed = cleanup_once(&db, &config).expect("cleanup_once");
+
+        assert!(removed.contains(&wt_path), "tracked wt must be removed");
+        assert!(!wt_path.exists(), "tracked wt dir must be gone");
+
+        let known = db.known_worktree_paths().expect("known");
+        assert!(
+            !known.contains(&wt_path),
+            "DB worktree_path must be cleared after removal"
+        );
+    }
+
+    #[test]
+    fn cleanup_once_preserves_in_flight_worktree_via_protected() {
+        use reviewq::types::{AgentKind, NewJob, RepoId};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        let wt_root = tmp.path().join("worktrees");
+        std::fs::create_dir_all(&wt_root).expect("create wt_root");
+
+        let sha = head_sha(&repo);
+        let wt_path = reviewq::worktree::create(&repo, &wt_root, 1, &sha).expect("create wt");
+
+        let db = reviewq::db::Database::open_in_memory().expect("db");
+        // Enqueue, lease, mark running, store worktree path. Crucially,
+        // do NOT call complete() — the job is still in-flight.
+        let new_job = NewJob {
+            repo: RepoId::new("owner", "repo"),
+            pr_number: 1,
+            head_sha: sha.clone(),
+            agent_kind: AgentKind::Claude,
+            command: Some("echo".into()),
+            prompt_template: None,
+            max_retries: 3,
+        };
+        let job = db.enqueue(new_job).expect("enqueue");
+        let leased = db.lease_next().expect("lease").expect("has job");
+        db.mark_running(leased.id, 1234).expect("mark running");
+        db.store_worktree_path(job.id, &wt_path)
+            .expect("store path");
+
+        // ttl=0 would normally make everything eligible, but the
+        // running job's path is in `protected` so the orphan pass
+        // must skip it.
+        let config = build_test_config("owner", "repo", &repo, &wt_root, 0, 60);
+
+        let removed = cleanup_once(&db, &config).expect("cleanup_once");
+
+        assert!(
+            !removed.contains(&wt_path),
+            "in-flight wt must not be removed: {removed:?}"
+        );
+        assert!(wt_path.exists(), "in-flight wt dir must still exist");
+    }
+
+    #[test]
+    fn cleanup_once_skips_repo_not_in_allowlist() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        let wt_root = tmp.path().join("worktrees");
+        std::fs::create_dir_all(&wt_root).expect("create wt_root");
+
+        let sha = head_sha(&repo);
+        let wt_path = reviewq::worktree::create(&repo, &wt_root, 1, &sha).expect("create wt");
+
+        let db = reviewq::db::Database::open_in_memory().expect("db");
+        // Job is for "owner/repo"...
+        enqueue_terminal_job_with_worktree(&db, "owner", "repo", 1, &sha, &wt_path);
+
+        // ...but the config allowlist only knows about a different repo.
+        // base_repo_for("owner/repo") therefore returns None, and the
+        // row should be skipped (warn) rather than retargeted.
+        let config = build_test_config("other", "other", &repo, &wt_root, 0, 60);
+
+        let removed = cleanup_once(&db, &config).expect("cleanup_once");
+
+        assert!(
+            !removed.contains(&wt_path),
+            "skipped repo wt must not be removed: {removed:?}"
+        );
+        assert!(wt_path.exists(), "wt dir must still exist");
+
+        let known = db.known_worktree_paths().expect("known");
+        assert!(
+            known.contains(&wt_path),
+            "DB row must NOT be cleared when the row was skipped"
+        );
+    }
+
+    #[test]
+    fn cleanup_once_sweeps_orphan_dir_past_ttl() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        let wt_root = tmp.path().join("worktrees");
+        std::fs::create_dir_all(&wt_root).expect("create wt_root");
+
+        // Stray reviewq-* directory not registered in the DB.
+        let orphan = wt_root.join("reviewq-orphan");
+        std::fs::create_dir_all(&orphan).expect("create orphan");
+        std::fs::write(orphan.join("stale.txt"), "old").expect("write stale");
+
+        let db = reviewq::db::Database::open_in_memory().expect("db");
+        let config = build_test_config("owner", "repo", &repo, &wt_root, 0, 60);
+
+        let removed = cleanup_once(&db, &config).expect("cleanup_once");
+
+        assert!(
+            removed.contains(&orphan),
+            "orphan must be swept by orphan pass: {removed:?}"
+        );
+        assert!(!orphan.exists());
+    }
+
+    #[test]
+    fn cleanup_once_clears_db_rows_after_removal() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        let wt_root = tmp.path().join("worktrees");
+        std::fs::create_dir_all(&wt_root).expect("create wt_root");
+
+        let sha = head_sha(&repo);
+        let wt1 = reviewq::worktree::create(&repo, &wt_root, 1, &sha).expect("wt1");
+        let wt2 = reviewq::worktree::create(&repo, &wt_root, 2, &sha).expect("wt2");
+
+        let db = reviewq::db::Database::open_in_memory().expect("db");
+        enqueue_terminal_job_with_worktree(&db, "owner", "repo", 1, &sha, &wt1);
+        enqueue_terminal_job_with_worktree(&db, "owner", "repo", 2, &sha, &wt2);
+
+        let config = build_test_config("owner", "repo", &repo, &wt_root, 0, 60);
+
+        let removed = cleanup_once(&db, &config).expect("cleanup_once");
+        assert_eq!(removed.len(), 2);
+
+        let known = db.known_worktree_paths().expect("known");
+        assert!(
+            known.is_empty(),
+            "all worktree_path columns must be NULL after removal: {known:?}"
+        );
+    }
+
+    #[test]
+    fn cleanup_once_continues_past_partial_failure() {
+        // Two tracked worktrees: one real, one whose path never
+        // existed on disk. `git worktree remove` will fail on the
+        // ghost entry, but the sweep must still remove the real one
+        // and clear only the real one's DB row.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        let wt_root = tmp.path().join("worktrees");
+        std::fs::create_dir_all(&wt_root).expect("create wt_root");
+
+        let sha = head_sha(&repo);
+        let wt_good = reviewq::worktree::create(&repo, &wt_root, 1, &sha).expect("wt good");
+        let wt_ghost = wt_root.join("reviewq-9999"); // never created via git
+
+        let db = reviewq::db::Database::open_in_memory().expect("db");
+        enqueue_terminal_job_with_worktree(&db, "owner", "repo", 1, &sha, &wt_good);
+        enqueue_terminal_job_with_worktree(&db, "owner", "repo", 2, &sha, &wt_ghost);
+
+        let config = build_test_config("owner", "repo", &repo, &wt_root, 0, 60);
+
+        let removed = cleanup_once(&db, &config).expect("cleanup_once");
+
+        assert!(
+            removed.contains(&wt_good),
+            "good wt must still be removed despite ghost failure"
+        );
+        assert!(!wt_good.exists());
+
+        let known = db.known_worktree_paths().expect("known");
+        assert!(
+            !known.contains(&wt_good),
+            "good DB row must be cleared after successful removal"
+        );
+        assert!(
+            known.contains(&wt_ghost),
+            "ghost DB row must NOT be cleared when removal failed"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // worktree_cleanup_loop integration test
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn worktree_cleanup_loop_runs_immediately_on_startup() {
+        // Regression guard for the "sleep at top of loop" bug: with
+        // sleep at the top, intermittently-run daemons would never
+        // sweep because the user shut down before the first interval
+        // elapsed. Setting interval to 60 minutes here means a
+        // top-of-loop sleep would block forever; the test deadline
+        // (2 s) catches that case.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        let wt_root = tmp.path().join("worktrees");
+        std::fs::create_dir_all(&wt_root).expect("create wt_root");
+
+        let sha = head_sha(&repo);
+        let wt_path = reviewq::worktree::create(&repo, &wt_root, 1, &sha).expect("create wt");
+
+        let db = Arc::new(reviewq::db::Database::open_in_memory().expect("db"));
+        enqueue_terminal_job_with_worktree(&db, "owner", "repo", 1, &sha, &wt_path);
+
+        let config = build_test_config("owner", "repo", &repo, &wt_root, 0, 60);
+        let (_tx, config_rx) = watch::channel(Arc::new(config));
+
+        let db_clone = Arc::clone(&db);
+        let handle = tokio::spawn(async move { worktree_cleanup_loop(config_rx, db_clone).await });
+
+        // cleanup_once runs on a spawn_blocking thread, so tokio's
+        // virtual time would not affect it. Poll the filesystem
+        // directly. Generous deadline; the first sweep should
+        // complete in well under a second.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while wt_path.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        handle.abort();
+        let _ = handle.await;
+
+        assert!(
+            !wt_path.exists(),
+            "first iteration must run immediately on startup"
+        );
     }
 }
