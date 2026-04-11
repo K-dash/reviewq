@@ -232,6 +232,8 @@ mod tests {
         Config::from_yaml(
             r#"
 repos:
+  defaults:
+    base_repo_path: /tmp/fake
   allowlist:
     - repo: org/repo
 daemon:
@@ -246,6 +248,8 @@ daemon:
         Config::from_yaml(
             r#"
 repos:
+  defaults:
+    base_repo_path: /tmp/fake
   allowlist:
     - repo: org/repo
       skip_self_authored: false
@@ -364,6 +368,7 @@ daemon:
 repos:
   defaults:
     agent: claude
+    base_repo_path: /tmp/fake
   allowlist:
     - repo: org/repo
       agent: codex
@@ -402,6 +407,7 @@ daemon:
 repos:
   defaults:
     agent: codex
+    base_repo_path: /tmp/fake
   allowlist:
     - repo: org/repo
 daemon:
@@ -439,6 +445,7 @@ daemon:
 repos:
   defaults:
     prompt_template: "global-prompt"
+    base_repo_path: /tmp/fake
   allowlist:
     - repo: org/repo
       prompt_template: "per-repo-prompt"
@@ -472,6 +479,7 @@ daemon:
 repos:
   defaults:
     prompt_template: "global-prompt"
+    base_repo_path: /tmp/fake
   allowlist:
     - repo: org/repo
 daemon:
@@ -584,6 +592,8 @@ daemon:
         Config::from_yaml(
             r#"
 repos:
+  defaults:
+    base_repo_path: /tmp/fake
   allowlist:
     - repo: org/repo
       skip_self_authored: false
@@ -627,6 +637,8 @@ daemon:
         Config::from_yaml(
             r#"
 repos:
+  defaults:
+    base_repo_path: /tmp/fake
   allowlist:
     - repo: org/repo
       review_on_push: false
@@ -853,6 +865,7 @@ daemon:
 repos:
   defaults:
     model: gpt-5.4
+    base_repo_path: /tmp/fake
   allowlist:
     - repo: org/repo
       model: gpt-5.3-codex
@@ -894,6 +907,7 @@ daemon:
 repos:
   defaults:
     model: gpt-5.4
+    base_repo_path: /tmp/fake
   allowlist:
     - repo: org/repo
 daemon:
@@ -1005,6 +1019,8 @@ daemon:
         Config::from_yaml(
             r#"
 repos:
+  defaults:
+    base_repo_path: /tmp/fake
   allowlist:
     - repo: org/repo
       ignore_prs: [1, 42]

@@ -477,6 +477,23 @@ impl Config {
             }
         }
 
+        // Every allowlisted repo must resolve a base_repo_path — either
+        // directly on the entry or inherited from repos.defaults. Without
+        // this, the runner and cleanup loop fall back to the process cwd,
+        // which makes reviewq's behavior silently depend on where the
+        // daemon was started. The filesystem-level check (path exists,
+        // path is a directory) lives in `validate_paths`, which is called
+        // separately by daemon / TUI startup after `expand_paths`.
+        let defaults_base = self.repos.defaults.base_repo_path.is_some();
+        for entry in &self.repos.allowlist {
+            if entry.base_repo_path.is_none() && !defaults_base {
+                return Err(ReviewqError::Config(format!(
+                    "base_repo_path is required for repo '{}': set repos.defaults.base_repo_path or repos.allowlist[].base_repo_path",
+                    entry.repo
+                )));
+            }
+        }
+
         // Validate model names (defaults and per-repo).
         if let Some(ref m) = self.repos.defaults.model
             && !is_valid_model_name(m)
@@ -502,6 +519,42 @@ impl Config {
             ));
         }
 
+        Ok(())
+    }
+
+    /// Verify that every resolved `base_repo_path` exists on disk and is a
+    /// directory. Must be called **after** [`expand_paths`] so tilde paths
+    /// are resolved. Not called from [`from_yaml`] — unit tests that build
+    /// configs from in-memory YAML do not need real directories.
+    ///
+    /// This is called only from the daemon and TUI startup paths. Read-only
+    /// subcommands (`status` / `tail` / `open`) skip this check so a broken
+    /// filesystem path does not stop the user from inspecting job history.
+    pub fn validate_paths(&self) -> Result<()> {
+        for policy in self.repo_policies() {
+            let Some(path) = policy.base_repo_path.as_ref() else {
+                // Structurally invalid — validate() should have caught this.
+                // Guard defensively rather than panicking.
+                return Err(ReviewqError::Config(format!(
+                    "base_repo_path is required for repo '{}'",
+                    policy.id
+                )));
+            };
+            if !path.exists() {
+                return Err(ReviewqError::Config(format!(
+                    "base_repo_path for repo '{}' does not exist: {}",
+                    policy.id,
+                    path.display()
+                )));
+            }
+            if !path.is_dir() {
+                return Err(ReviewqError::Config(format!(
+                    "base_repo_path for repo '{}' is not a directory: {}",
+                    policy.id,
+                    path.display()
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -811,6 +864,8 @@ mod tests {
     fn parse_minimal_config() {
         let yaml = r#"
 repos:
+  defaults:
+    base_repo_path: /tmp/fake
   allowlist:
     - repo: owner/repo
 "#;
@@ -827,6 +882,8 @@ repos:
     fn parse_per_repo_overrides() {
         let yaml = r#"
 repos:
+  defaults:
+    base_repo_path: /tmp/fake
   allowlist:
     - repo: org/repo1
       skip_self_authored: false
@@ -870,6 +927,7 @@ daemon:
 repos:
   defaults:
     agent: codex
+    base_repo_path: /tmp/fake
   allowlist:
     - repo: org/repo1
     - repo: org/repo2
@@ -887,8 +945,13 @@ repos:
 
     #[test]
     fn resolve_falls_back_to_builtin_when_nothing_set() {
+        // `base_repo_path` is required, so set a minimal defaults value.
+        // Every *other* field (agent, model, prompt, skip flags, ignore)
+        // falls back to the built-in defaults.
         let yaml = r#"
 repos:
+  defaults:
+    base_repo_path: /tmp/fake
   allowlist:
     - repo: org/repo
 "#;
@@ -903,7 +966,7 @@ repos:
         assert_eq!(p.agent, AgentKind::Claude);
         assert!(p.prompt_template.is_none());
         assert!(p.model.is_none());
-        assert!(p.base_repo_path.is_none());
+        assert_eq!(p.base_repo_path, Some(PathBuf::from("/tmp/fake")));
         assert!(p.ignore_prs.is_empty());
     }
 
@@ -971,6 +1034,8 @@ repos:
     fn builtin_skip_self_authored_is_true() {
         let yaml = r#"
 repos:
+  defaults:
+    base_repo_path: /tmp/fake
   allowlist:
     - repo: org/repo
 "#;
@@ -982,6 +1047,8 @@ repos:
     fn builtin_review_on_push_is_true() {
         let yaml = r#"
 repos:
+  defaults:
+    base_repo_path: /tmp/fake
   allowlist:
     - repo: org/repo
 "#;
@@ -993,6 +1060,8 @@ repos:
     fn entry_can_disable_review_on_push() {
         let yaml = r#"
 repos:
+  defaults:
+    base_repo_path: /tmp/fake
   allowlist:
     - repo: org/repo
       review_on_push: false
@@ -1005,6 +1074,8 @@ repos:
     fn repo_ids_extracts_ids() {
         let yaml = r#"
 repos:
+  defaults:
+    base_repo_path: /tmp/fake
   allowlist:
     - repo: org/repo1
     - repo: org/repo2
@@ -1040,14 +1111,25 @@ repos:
     }
 
     #[test]
-    fn base_repo_for_returns_none_when_nothing_set() {
+    fn base_repo_for_returns_none_for_unknown_repo() {
+        // The original version of this test documented the "nothing set"
+        // path that returned `None`. With base_repo_path now mandatory,
+        // that state is structurally invalid, so instead assert that an
+        // *unknown* repo id still returns `None` even when the allowlist
+        // has resolved paths.
         let yaml = r#"
 repos:
+  defaults:
+    base_repo_path: /tmp/fake
   allowlist:
     - repo: org/repo
 "#;
         let config = Config::from_yaml(yaml).expect("parse");
-        assert_eq!(config.base_repo_for(&RepoId::new("org", "repo")), None);
+        assert_eq!(
+            config.base_repo_for(&RepoId::new("org", "repo")),
+            Some(PathBuf::from("/tmp/fake"))
+        );
+        assert_eq!(config.base_repo_for(&RepoId::new("org", "unknown")), None);
     }
 
     // -- validation -----------------------------------------------------
@@ -1095,7 +1177,7 @@ repos:
             "a_b-c.d:e",
         ] {
             let yaml = format!(
-                "repos:\n  defaults:\n    model: {name}\n  allowlist:\n    - repo: org/repo\n"
+                "repos:\n  defaults:\n    base_repo_path: /tmp/fake\n    model: {name}\n  allowlist:\n    - repo: org/repo\n"
             );
             Config::from_yaml(&yaml)
                 .unwrap_or_else(|e| panic!("model '{name}' should be valid: {e}"));
@@ -1106,7 +1188,7 @@ repos:
     fn invalid_defaults_model_rejected() {
         for name in ["model name", "model;rm", "$(echo hi)", "mod\"el", ""] {
             let yaml = format!(
-                "repos:\n  defaults:\n    model: \"{name}\"\n  allowlist:\n    - repo: org/repo\n"
+                "repos:\n  defaults:\n    base_repo_path: /tmp/fake\n    model: \"{name}\"\n  allowlist:\n    - repo: org/repo\n"
             );
             assert!(
                 Config::from_yaml(&yaml).is_err(),
@@ -1119,6 +1201,8 @@ repos:
     fn invalid_per_repo_model_rejected() {
         let yaml = r#"
 repos:
+  defaults:
+    base_repo_path: /tmp/fake
   allowlist:
     - repo: org/repo
       model: "bad model"
@@ -1149,6 +1233,8 @@ daemon:
   polling:
     interval_seconds: 0
 repos:
+  defaults:
+    base_repo_path: /tmp/fake
   allowlist:
     - repo: org/repo
 "#;
@@ -1165,6 +1251,8 @@ daemon:
   polling:
     interval_seconds: 60
 repos:
+  defaults:
+    base_repo_path: /tmp/fake
   allowlist:
     - repo: org/repo
 "#;
@@ -1181,6 +1269,8 @@ daemon:
   polling:
     interval_seconds: 60
 repos:
+  defaults:
+    base_repo_path: /tmp/fake
   allowlist:
     - repo: org/repo
 "#,
@@ -1192,6 +1282,8 @@ daemon:
   polling:
     interval_seconds: 120
 repos:
+  defaults:
+    base_repo_path: /tmp/fake
   allowlist:
     - repo: org/repo
 "#,
@@ -1212,6 +1304,8 @@ daemon:
   execution:
     max_concurrency: 5
 repos:
+  defaults:
+    base_repo_path: /tmp/fake
   allowlist:
     - repo: org/repo
 "#,
@@ -1223,6 +1317,8 @@ daemon:
   execution:
     max_concurrency: 20
 repos:
+  defaults:
+    base_repo_path: /tmp/fake
   allowlist:
     - repo: org/repo
 "#,
@@ -1241,6 +1337,8 @@ repos:
         let old = Config::from_yaml(
             r#"
 repos:
+  defaults:
+    base_repo_path: /tmp/fake
   allowlist:
     - repo: org/repo1
 "#,
@@ -1249,6 +1347,8 @@ repos:
         let new = Config::from_yaml(
             r#"
 repos:
+  defaults:
+    base_repo_path: /tmp/fake
   allowlist:
     - repo: org/repo2
 "#,
@@ -1263,6 +1363,8 @@ repos:
         let old = Config::from_yaml(
             r#"
 repos:
+  defaults:
+    base_repo_path: /tmp/fake
   allowlist:
     - repo: org/repo
       review_on_push: true
@@ -1272,6 +1374,8 @@ repos:
         let new = Config::from_yaml(
             r#"
 repos:
+  defaults:
+    base_repo_path: /tmp/fake
   allowlist:
     - repo: org/repo
       review_on_push: false
@@ -1289,6 +1393,7 @@ repos:
 repos:
   defaults:
     agent: claude
+    base_repo_path: /tmp/fake
   allowlist:
     - repo: org/repo
 "#,
@@ -1299,6 +1404,7 @@ repos:
 repos:
   defaults:
     agent: codex
+    base_repo_path: /tmp/fake
   allowlist:
     - repo: org/repo
 "#,
@@ -1323,6 +1429,7 @@ repos:
   defaults:
     model: gpt-5.3-codex
     prompt_template: "old"
+    base_repo_path: /tmp/fake
   allowlist:
     - repo: org/repo
 "#,
@@ -1334,6 +1441,7 @@ repos:
   defaults:
     model: gpt-5.4
     prompt_template: "new"
+    base_repo_path: /tmp/fake
   allowlist:
     - repo: org/repo
 "#,
@@ -1357,6 +1465,8 @@ repos:
         let old = Config::from_yaml(
             r#"
 repos:
+  defaults:
+    base_repo_path: /tmp/fake
   allowlist:
     - repo: org/repo
       model: gpt-5.4
@@ -1366,6 +1476,8 @@ repos:
         let new = Config::from_yaml(
             r#"
 repos:
+  defaults:
+    base_repo_path: /tmp/fake
   allowlist:
     - repo: org/repo
       model: gpt-5.3-codex
@@ -1377,6 +1489,131 @@ repos:
             changes
                 .iter()
                 .any(|c| c.contains("per-repo settings changed"))
+        );
+    }
+
+    // -- base_repo_path mandatory validation ----------------------------
+
+    #[test]
+    fn validate_rejects_missing_base_repo_path() {
+        let yaml = r#"
+repos:
+  allowlist:
+    - repo: org/repo
+"#;
+        let err = Config::from_yaml(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("base_repo_path"),
+            "error should mention base_repo_path, got: {msg}"
+        );
+        assert!(
+            msg.contains("org/repo"),
+            "error should name the offending repo, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_defaults_only_base_repo_path() {
+        let yaml = r#"
+repos:
+  defaults:
+    base_repo_path: /tmp/fake
+  allowlist:
+    - repo: org/repo
+"#;
+        let config = Config::from_yaml(yaml).expect("should parse");
+        assert_eq!(
+            config.repos.defaults.base_repo_path,
+            Some(PathBuf::from("/tmp/fake"))
+        );
+    }
+
+    #[test]
+    fn validate_accepts_per_entry_base_repo_path() {
+        let yaml = r#"
+repos:
+  allowlist:
+    - repo: org/repo
+      base_repo_path: /tmp/entry
+"#;
+        let config = Config::from_yaml(yaml).expect("should parse");
+        assert_eq!(
+            config.repos.allowlist[0].base_repo_path,
+            Some(PathBuf::from("/tmp/entry"))
+        );
+    }
+
+    #[test]
+    fn validate_rejects_missing_base_repo_path_for_one_of_many() {
+        // Defaults are empty. repo-a supplies its own base_repo_path,
+        // but repo-b has nothing to inherit, so validation must point
+        // at repo-b specifically rather than accepting the allowlist
+        // because "at least one entry has a path set."
+        let yaml = r#"
+repos:
+  allowlist:
+    - repo: org/repo-a
+      base_repo_path: /tmp/a
+    - repo: org/repo-b
+"#;
+        let err = Config::from_yaml(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("org/repo-b"),
+            "error should name repo-b specifically, got: {msg}"
+        );
+    }
+
+    // -- validate_paths (filesystem checks) -----------------------------
+
+    #[test]
+    fn validate_paths_accepts_existing_directory() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let yaml = format!(
+            "repos:\n  defaults:\n    base_repo_path: {}\n  allowlist:\n    - repo: org/repo\n",
+            tmp.path().display()
+        );
+        let config = Config::from_yaml(&yaml).expect("parse");
+        config.validate_paths().expect("should accept existing dir");
+    }
+
+    #[test]
+    fn validate_paths_rejects_nonexistent_path() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let missing = tmp.path().join("nowhere");
+        let yaml = format!(
+            "repos:\n  defaults:\n    base_repo_path: {}\n  allowlist:\n    - repo: org/repo\n",
+            missing.display()
+        );
+        let config = Config::from_yaml(&yaml).expect("parse");
+        let err = config.validate_paths().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does not exist") || msg.contains("not a directory"),
+            "error should explain the path problem, got: {msg}"
+        );
+        assert!(
+            msg.contains("org/repo"),
+            "error should name the repo, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_paths_rejects_regular_file() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let file = tmp.path().join("not-a-dir.txt");
+        std::fs::write(&file, b"hello").expect("write file");
+        let yaml = format!(
+            "repos:\n  defaults:\n    base_repo_path: {}\n  allowlist:\n    - repo: org/repo\n",
+            file.display()
+        );
+        let config = Config::from_yaml(&yaml).expect("parse");
+        let err = config.validate_paths().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not a directory") || msg.contains("does not exist"),
+            "error should explain the is_dir check, got: {msg}"
         );
     }
 

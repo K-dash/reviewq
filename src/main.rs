@@ -89,10 +89,21 @@ async fn run(cli: Cli) -> reviewq::error::Result<()> {
             reviewq::cli::open_target(&db, &target)
         }
         Some(Commands::Tui) => {
+            // TUI needs a runnable worktree setup at its back so
+            // `x` (cancel) / `r` (retry) keystrokes don't later
+            // explode inside the runner. Read-only subcommands
+            // (`status` / `tail` / `open`) skip this check so a
+            // broken filesystem path doesn't block post-mortem.
+            config.validate_paths()?;
             let db = reviewq::db::Database::open(&config.daemon.state.sqlite_path)?;
             reviewq::tui::run(&db, &config.daemon.output.dir, &config.daemon.logging.dir)
         }
-        None => run_daemon(config, config_path).await,
+        None => {
+            // Same rationale as the TUI branch: fail fast before
+            // the daemon even begins if `base_repo_path` is wrong.
+            config.validate_paths()?;
+            run_daemon(config, config_path).await
+        }
     }
 }
 
@@ -259,6 +270,18 @@ fn reload_config(
     };
     new_config.expand_paths();
 
+    // Filesystem check for every resolved `base_repo_path`. Missing
+    // or non-directory paths are treated like any other reload error:
+    // we log and keep the old config so the daemon does not die
+    // because the user temporarily moved a clone aside. `warn!`
+    // (not `error!`) because this is an explicitly *recoverable*
+    // condition — the operator may already be fixing it and should
+    // not be paged.
+    if let Err(e) = new_config.validate_paths() {
+        warn!(error = %e, "config reload: validate_paths failed, keeping previous config");
+        return;
+    }
+
     let old_config = config_tx.borrow().clone();
 
     let changes = reviewq::config::Config::diff_summary(&old_config, &new_config);
@@ -320,21 +343,25 @@ fn cleanup_once(
     let worktree_root = config.daemon.execution.effective_worktree_root();
     let ttl_minutes = config.daemon.cleanup.ttl_minutes;
 
-    // Fallback base repo for the orphan pass only. Tracked
-    // worktrees resolve their own base repo per-policy below —
-    // rows for which that resolution fails are skipped, not
-    // silently retargeted at this fallback. The CWD lookup is
-    // a `?` rather than an `expect()` because `cleanup_once`
-    // runs inside `spawn_blocking`, and a panic there would
-    // surface as a `JoinError` which is harder to debug than
-    // a normal `Err` log line.
-    let orphan_base_repo = match config.repos.defaults.base_repo_path.clone() {
-        Some(p) => p,
-        None => std::env::current_dir().map_err(|e| {
-            reviewq::error::ReviewqError::Process(format!(
-                "failed to read current directory for orphan-pass fallback: {e}"
-            ))
-        })?,
+    // Every distinct `base_repo_path` resolved by the policy chain.
+    // `cleanup_by_owner`'s orphan pass runs `git worktree prune`
+    // against each one after reaping stale directories, so every
+    // allowlisted install keeps its `.git/worktrees/` bookkeeping
+    // clean — not just the repo that happened to be picked
+    // arbitrarily (the pre-refactor behavior). Duplicates are
+    // deduplicated here; the policy chain guarantees every entry
+    // has `Some(path)` thanks to `Config::validate`.
+    let orphan_base_repos: Vec<PathBuf> = {
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+        let mut out: Vec<PathBuf> = Vec::new();
+        for policy in config.repo_policies() {
+            if let Some(path) = policy.base_repo_path
+                && seen.insert(path.clone())
+            {
+                out.push(path);
+            }
+        }
+        out
     };
 
     // Snapshot every worktree path the DB currently knows about.
@@ -374,7 +401,7 @@ fn cleanup_once(
         &owned,
         &worktree_root,
         ttl_minutes,
-        &orphan_base_repo,
+        &orphan_base_repos,
         &protected,
     )?;
 
@@ -445,7 +472,12 @@ mod tests {
     use std::io::Write;
 
     fn minimal_yaml() -> &'static str {
-        "repos:\n  allowlist:\n    - repo: org/repo\ndaemon:\n  polling:\n    interval_seconds: 60\n"
+        // `/tmp` is the simplest always-existent, always-a-directory
+        // path that is acceptable to `validate_paths`. Tests that
+        // exercise `reload_config` run through that check too, so a
+        // bogus `/tmp/fake` would be rejected and the "old config
+        // retained" assertions would pass spuriously.
+        "repos:\n  defaults:\n    base_repo_path: /tmp\n  allowlist:\n    - repo: org/repo\ndaemon:\n  polling:\n    interval_seconds: 60\n"
     }
 
     fn write_config(dir: &std::path::Path, yaml: &str) -> PathBuf {
@@ -467,7 +499,7 @@ mod tests {
         // Rewrite with changed polling interval
         write_config(
             dir.path(),
-            "repos:\n  allowlist:\n    - repo: org/repo\ndaemon:\n  polling:\n    interval_seconds: 120\n",
+            "repos:\n  defaults:\n    base_repo_path: /tmp\n  allowlist:\n    - repo: org/repo\ndaemon:\n  polling:\n    interval_seconds: 120\n",
         );
 
         reload_config(&config_path, &config_tx);
@@ -512,6 +544,36 @@ mod tests {
         // Old config should be retained
         let current = config_rx.borrow().clone();
         assert_eq!(current.repos.allowlist.len(), 1);
+    }
+
+    #[test]
+    fn reload_config_path_missing_keeps_old_config() {
+        // Regression guard for the graceful-degradation rule added
+        // alongside the `validate_paths` mandatory-startup check: when
+        // a hot reload produces a structurally-valid config whose
+        // `base_repo_path` has been deleted on disk, the daemon keeps
+        // running on the old config rather than dying.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = write_config(dir.path(), minimal_yaml());
+
+        let mut initial = reviewq::config::Config::load(&config_path).expect("load");
+        initial.expand_paths();
+        let (config_tx, config_rx) = watch::channel(Arc::new(initial));
+
+        // Overwrite with a config whose base_repo_path points at a
+        // path that definitely does not exist. validate() accepts it
+        // (structurally valid), validate_paths() must reject it, and
+        // reload_config must keep the old config.
+        let bad_yaml = "repos:\n  defaults:\n    base_repo_path: /tmp/reviewq-reload-test-nowhere-aaa\n  allowlist:\n    - repo: org/repo\ndaemon:\n  polling:\n    interval_seconds: 120\n";
+        write_config(dir.path(), bad_yaml);
+
+        reload_config(&config_path, &config_tx);
+
+        let current = config_rx.borrow().clone();
+        assert_eq!(
+            current.daemon.polling.interval_seconds, 60,
+            "old config must be retained after validate_paths failure"
+        );
     }
 
     #[test]

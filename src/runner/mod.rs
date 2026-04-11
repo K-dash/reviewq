@@ -3,7 +3,7 @@
 pub mod cancel;
 pub mod process;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use nix::sys::signal;
@@ -12,7 +12,7 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot, watch};
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
-use crate::config::Config;
+use crate::config::{Config, RepoPolicy};
 use crate::error::Result;
 use crate::traits::{Clock, JobStore, ReviewExecutor};
 use crate::types::{Job, JobFilter, JobStatus};
@@ -173,14 +173,16 @@ where
             "leased job for execution"
         );
 
-        // Resolve base_repo from the (already-merged) policy. If neither the
-        // entry nor `repos.defaults` set one, fall back to the process cwd so
-        // the `git -C` invocation still has a valid working directory.
-        let base_repo = policies
-            .iter()
-            .find(|p| p.id == job.repo)
-            .and_then(|p| p.base_repo_path.clone())
-            .unwrap_or_else(|| std::env::current_dir().expect("current directory is accessible"));
+        // Resolve base_repo from the (already-merged) policy. If the repo
+        // was removed from the allowlist by a hot reload between enqueue
+        // and lease, fail the job cleanly rather than panicking. Startup
+        // validation (`Config::validate` + `Config::validate_paths`) is
+        // responsible for rejecting a missing / non-existent path at load
+        // time, so the only way through to this helper is the reload race.
+        let Some(base_repo) = resolve_base_repo_or_fail_job(&*store, &policies, &job) else {
+            drop(permit);
+            continue;
+        };
 
         // Clone Arcs and paths for the spawned task.
         let store = Arc::clone(&store);
@@ -202,6 +204,56 @@ where
     info!("all in-flight jobs completed");
 
     Ok(())
+}
+
+/// Resolve the `base_repo_path` for a leased job, or fail the job cleanly
+/// if the policy cannot be found.
+///
+/// At steady state this always returns `Some(path)` — the validation in
+/// [`Config::validate`] guarantees every allowlisted repo has a
+/// resolvable `base_repo_path`. The failure branch exists for the
+/// *hot-reload race*: between the time a job is queued and the time the
+/// runner leases it, the user can remove the repo from the allowlist via
+/// SIGHUP. When that happens, the leased job has no place to run, and
+/// the cleanest outcome is to mark it `Failed` with an explanatory log
+/// line rather than panic or fall back to `current_dir()` (the old
+/// behavior, which made reviewq's execution silently depend on *where
+/// the daemon was started*).
+///
+/// Returns:
+/// - `Some(path)` — policy found; the caller proceeds with execution.
+/// - `None` — policy missing or has no `base_repo_path`; the job has been
+///   marked `Failed` in the store, the caller must drop its permit and
+///   skip to the next iteration.
+///
+/// Side effects on the `None` branch: one `error!` log line and one
+/// `store.complete(job.id, Failed, None)` call. `store.complete`
+/// failures are logged but not propagated — the caller cannot recover
+/// from a broken store here and must keep the runner loop alive.
+fn resolve_base_repo_or_fail_job<S: JobStore>(
+    store: &S,
+    policies: &[RepoPolicy],
+    job: &Job,
+) -> Option<PathBuf> {
+    let policy = policies.iter().find(|p| p.id == job.repo);
+    match policy.and_then(|p| p.base_repo_path.clone()) {
+        Some(path) => Some(path),
+        None => {
+            error!(
+                job_id = job.id,
+                repo = %job.repo,
+                "repo removed from allowlist after job was leased; marking job Failed"
+            );
+            if let Err(e) = store.complete(job.id, JobStatus::Failed, None) {
+                error!(
+                    job_id = job.id,
+                    error = %e,
+                    "failed to mark job Failed after allowlist removal; runner loop will continue but the job will remain in Leased state until daemon restart or manual DB intervention"
+                );
+            }
+            None
+        }
+    }
 }
 
 /// Execute a single job: mark running → create worktree → run review → complete → cleanup.
@@ -506,6 +558,100 @@ mod tests {
             prompt_template: None,
             max_retries: 3,
         }
+    }
+
+    // -------------------------------------------------------------------
+    // resolve_base_repo_or_fail_job
+    //
+    // The runner no longer falls back to `std::env::current_dir()` when a
+    // policy is missing. Instead, it marks the job Failed and continues
+    // the loop. These tests cover the two branches.
+    // -------------------------------------------------------------------
+
+    fn policy_with_path(owner: &str, name: &str, path: &str) -> RepoPolicy {
+        RepoPolicy {
+            id: RepoId::new(owner, name),
+            skip_self_authored: true,
+            skip_reviewer_check: false,
+            review_on_push: true,
+            agent: AgentKind::Claude,
+            prompt_template: None,
+            model: None,
+            base_repo_path: Some(PathBuf::from(path)),
+            ignore_prs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn resolve_base_repo_or_fail_job_returns_path_when_policy_present() {
+        let db = Database::open_in_memory().expect("db");
+        let job = db.enqueue(sample_job()).expect("enqueue");
+        let leased = db.lease_next().expect("lease").expect("has job");
+
+        let policies = vec![policy_with_path("owner", "repo", "/tmp/fake")];
+        let result = resolve_base_repo_or_fail_job(&db, &policies, &leased);
+
+        assert_eq!(result, Some(PathBuf::from("/tmp/fake")));
+
+        // Job row must still be in its leased state — the helper is pure
+        // in the success path and must not mutate the store.
+        let jobs = db.list_jobs(&JobFilter::default()).expect("list");
+        let row = jobs.iter().find(|j| j.id == job.id).expect("find");
+        assert_eq!(row.status, JobStatus::Leased);
+    }
+
+    #[test]
+    fn resolve_base_repo_or_fail_job_marks_failed_when_policy_missing() {
+        let db = Database::open_in_memory().expect("db");
+        let job = db.enqueue(sample_job()).expect("enqueue");
+        let leased = db.lease_next().expect("lease").expect("has job");
+
+        // Simulate a hot reload that removed the repo from the allowlist.
+        let policies: Vec<RepoPolicy> = Vec::new();
+        let result = resolve_base_repo_or_fail_job(&db, &policies, &leased);
+
+        assert!(
+            result.is_none(),
+            "helper must return None on missing policy"
+        );
+
+        let jobs = db.list_jobs(&JobFilter::default()).expect("list");
+        let row = jobs.iter().find(|j| j.id == job.id).expect("find");
+        assert_eq!(
+            row.status,
+            JobStatus::Failed,
+            "job must be marked Failed when policy is missing"
+        );
+    }
+
+    #[test]
+    fn resolve_base_repo_or_fail_job_marks_failed_when_policy_has_no_path() {
+        // Defensive branch: `validate()` should prevent a policy with
+        // `base_repo_path = None` from reaching the runner, but the
+        // helper still needs to handle it gracefully because the compiler
+        // does not know about that invariant.
+        let db = Database::open_in_memory().expect("db");
+        let job = db.enqueue(sample_job()).expect("enqueue");
+        let leased = db.lease_next().expect("lease").expect("has job");
+
+        let policies = vec![RepoPolicy {
+            id: RepoId::new("owner", "repo"),
+            skip_self_authored: true,
+            skip_reviewer_check: false,
+            review_on_push: true,
+            agent: AgentKind::Claude,
+            prompt_template: None,
+            model: None,
+            base_repo_path: None,
+            ignore_prs: Vec::new(),
+        }];
+
+        let result = resolve_base_repo_or_fail_job(&db, &policies, &leased);
+
+        assert!(result.is_none());
+        let jobs = db.list_jobs(&JobFilter::default()).expect("list");
+        let row = jobs.iter().find(|j| j.id == job.id).expect("find");
+        assert_eq!(row.status, JobStatus::Failed);
     }
 
     #[test]
