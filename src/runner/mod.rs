@@ -8,14 +8,57 @@ use std::sync::Arc;
 
 use nix::sys::signal;
 use nix::unistd::Pid;
-use tokio::sync::{Notify, Semaphore, oneshot, watch};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot, watch};
 use tokio::task::JoinSet;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
 use crate::error::Result;
 use crate::traits::{Clock, JobStore, ReviewExecutor};
 use crate::types::{Job, JobFilter, JobStatus};
+
+/// Outcome of [`acquire_permit_or_wake`].
+///
+/// The runner's main loop awaits a concurrency slot while also listening
+/// for wake signals and shutdown requests. This enum distinguishes the
+/// three possible exits so the caller can react appropriately.
+enum PermitOutcome {
+    /// A semaphore permit was acquired; a job may now be leased.
+    Acquired(OwnedSemaphorePermit),
+    /// A wake signal arrived before any permit became available. The
+    /// caller should loop back to re-run its cancel sweep and stale-lease
+    /// recovery before attempting to acquire again. This is what lets a
+    /// pending cancel request be processed promptly even when every slot
+    /// is occupied by a long-running job.
+    Woken,
+    /// Shutdown was requested; the caller should exit its loop.
+    Shutdown,
+}
+
+/// Wait for a concurrency permit without becoming deaf to wake/shutdown.
+///
+/// The previous implementation only selected on `acquire_owned()` and
+/// `shutdown_rx.changed()`, so a SIGUSR1 that arrived while every slot
+/// was busy left queued cancel requests stuck in CANCELING until a
+/// running job finished. Routing the wake signal through here lets the
+/// main loop interleave cancel sweeps with permit acquisition.
+async fn acquire_permit_or_wake(
+    semaphore: Arc<Semaphore>,
+    wake: &Notify,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> PermitOutcome {
+    tokio::select! {
+        result = semaphore.acquire_owned() => match result {
+            Ok(permit) => PermitOutcome::Acquired(permit),
+            // The runner never closes its semaphore, so this branch is
+            // only reachable in pathological cases; treat it as shutdown
+            // so the caller breaks out of its loop gracefully.
+            Err(_) => PermitOutcome::Shutdown,
+        },
+        _ = wake.notified() => PermitOutcome::Woken,
+        _ = shutdown_rx.changed() => PermitOutcome::Shutdown,
+    }
+}
 
 /// Run the job execution loop.
 ///
@@ -79,17 +122,20 @@ where
             }
         }
 
-        // Acquire concurrency permit, but also listen for shutdown so we
-        // don't block here indefinitely when a shutdown is requested.
-        let permit = tokio::select! {
-            result = semaphore.clone().acquire_owned() => {
-                result.map_err(|e| {
-                    crate::error::ReviewqError::Runner(format!("semaphore closed: {e}"))
-                })?
+        // Acquire a concurrency permit, but also listen for wake signals
+        // and shutdown so we don't block here indefinitely. Routing the
+        // wake signal through here is what lets a queued cancel request
+        // be swept even when every execution slot is busy — without it,
+        // the cancel sweep above would only run once a running job
+        // finished, leaving jobs stuck in CANCELING for minutes.
+        let permit = match acquire_permit_or_wake(semaphore.clone(), &wake, &mut shutdown_rx).await
+        {
+            PermitOutcome::Acquired(permit) => permit,
+            PermitOutcome::Woken => {
+                debug!("wake signal received while awaiting permit, re-running cancel sweep");
+                continue;
             }
-            _ = shutdown_rx.changed() => {
-                break;
-            }
+            PermitOutcome::Shutdown => break,
         };
 
         let job = match store.lease_next() {
@@ -477,5 +523,82 @@ mod tests {
         assert_eq!(recovered.status, JobStatus::Queued);
         assert_eq!(recovered.retry_count, 1);
         assert!(recovered.pid.is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // acquire_permit_or_wake
+    //
+    // Regression tests for the bug where a queued cancel request stayed in
+    // CANCELING until a running job finished because the main loop was
+    // blocked on `semaphore.acquire_owned()` with no branch listening for
+    // the wake signal. The helper below lets the loop react to wake and
+    // shutdown while it waits for a free concurrency slot.
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn acquire_permit_or_wake_returns_acquired_when_slot_free() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let wake = Arc::new(Notify::new());
+        let (_tx, mut shutdown_rx) = watch::channel(false);
+
+        let outcome = acquire_permit_or_wake(semaphore, &wake, &mut shutdown_rx).await;
+        assert!(matches!(outcome, PermitOutcome::Acquired(_)));
+    }
+
+    #[tokio::test]
+    async fn acquire_permit_or_wake_returns_woken_when_all_slots_busy() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let hold = semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("hold permit");
+        let wake = Arc::new(Notify::new());
+        let (_tx, mut shutdown_rx) = watch::channel(false);
+
+        let sem = semaphore.clone();
+        let wake_inner = wake.clone();
+        let handle = tokio::spawn(async move {
+            acquire_permit_or_wake(sem, &wake_inner, &mut shutdown_rx).await
+        });
+
+        // Give the spawned task time to enter the select!.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        wake.notify_one();
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_millis(500), handle)
+            .await
+            .expect("did not return promptly on wake")
+            .expect("task panicked");
+        assert!(matches!(outcome, PermitOutcome::Woken));
+        drop(hold);
+    }
+
+    #[tokio::test]
+    async fn acquire_permit_or_wake_returns_shutdown_when_shutdown_requested() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let hold = semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("hold permit");
+        let wake = Arc::new(Notify::new());
+        let (tx, mut shutdown_rx) = watch::channel(false);
+
+        let sem = semaphore.clone();
+        let wake_inner = wake.clone();
+        let handle = tokio::spawn(async move {
+            acquire_permit_or_wake(sem, &wake_inner, &mut shutdown_rx).await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        tx.send(true).expect("send shutdown");
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_millis(500), handle)
+            .await
+            .expect("did not return promptly on shutdown")
+            .expect("task panicked");
+        assert!(matches!(outcome, PermitOutcome::Shutdown));
+        drop(hold);
     }
 }
